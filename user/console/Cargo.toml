@@ -1,0 +1,11 @@
+[package]
+name = "console"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "console"
+path = "src/main.rs"
+
+[dependencies]
+libkenix = { path = "../libkenix" }

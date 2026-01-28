@@ -90,9 +90,12 @@ extern "C" {
     // Console server ELF (created first, gets task ID 1)
     static __console_elf_start: u8;
     static __console_elf_end: u8;
-    // Init program ELF (created second, gets task ID 2+)
+    // Init program ELF (created second, gets task ID 2)
     static __init_elf_start: u8;
     static __init_elf_end: u8;
+    // VFS server ELF (created third, gets task ID 3)
+    static __vfs_elf_start: u8;
+    static __vfs_elf_end: u8;
 }
 
 struct Uart {
@@ -292,6 +295,22 @@ pub extern "C" fn kernel_main() -> ! {
         println!("  Created init task (id={}) - runs in EL0", id.0);
     } else {
         println!("  ERROR: Failed to create init task!");
+    }
+    println!();
+
+    // Create VFS server (task ID 3)
+    println!("Creating VFS server...");
+    let vfs_start = unsafe { &__vfs_elf_start as *const u8 };
+    let vfs_end = unsafe { &__vfs_elf_end as *const u8 };
+    let vfs_size = vfs_end as usize - vfs_start as usize;
+    let vfs_data = unsafe { core::slice::from_raw_parts(vfs_start, vfs_size) };
+
+    println!("  VFS ELF at {:#010x}, size {} bytes", vfs_start as usize, vfs_size);
+
+    if let Some(id) = sched::create_user_task_from_elf("vfs", vfs_data) {
+        println!("  Created VFS server (id={}) - runs in EL0", id.0);
+    } else {
+        println!("  ERROR: Failed to create VFS server!");
     }
     println!();
 

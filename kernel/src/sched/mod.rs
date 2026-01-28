@@ -12,7 +12,7 @@
 
 pub mod task;
 
-pub use task::{TaskId, TaskState, Message, IpcState, KERNEL_STACK_SIZE};
+pub use task::{TaskId, TaskState, Message, IpcState, KERNEL_STACK_SIZE, FileDescriptor, FdKind, MAX_FDS};
 
 use crate::mm::{self, PhysAddr, AddressSpace, PageFlags};
 use crate::exception::ExceptionContext;
@@ -462,6 +462,7 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
         task.ipc = task::IpcState::empty(); // Reset IPC state for reused slots
+        task.init_stdio(); // Initialize stdin/stdout/stderr
 
         // Calculate kernel stack top (16-byte aligned)
         let kernel_stack_top = kernel_stack_base.0 + KERNEL_STACK_SIZE;
@@ -684,6 +685,7 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
         task.ipc = task::IpcState::empty(); // Reset IPC state for reused slots
+        task.init_stdio(); // Initialize stdin/stdout/stderr
 
         // Calculate kernel stack top (16-byte aligned)
         let kernel_stack_top = kernel_stack_base.0 + KERNEL_STACK_SIZE;

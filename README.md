@@ -37,8 +37,8 @@ make run-kernel
 
 ```
 kenix/
-├── boot/           # UEFI bootloader
-├── kernel/         # Microkernel core
+├── boot/               # UEFI bootloader
+├── kernel/             # Microkernel core
 │   └── src/
 │       ├── main.rs        # Kernel entry point
 │       ├── mm/            # Memory management (paging, frames)
@@ -50,12 +50,23 @@ kenix/
 │       ├── gic.rs         # ARM GIC driver
 │       ├── timer.rs       # ARM timer driver
 │       └── elf.rs         # ELF loader
-├── user/           # User-space programs
-│   ├── init.c            # Init process
-│   ├── console.c         # Console server
-│   ├── ipc.h             # IPC syscall wrappers
-│   └── shm.h             # SHM syscall wrappers
-├── journal/        # Development notes
+├── user/               # User-space programs (all Rust)
+│   ├── libkenix/          # Shared runtime library
+│   │   ├── Cargo.toml
+│   │   └── src/lib.rs        # Syscalls, IPC, SHM wrappers
+│   ├── console/           # Console server
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs       # UART driver, IPC message loop
+│   ├── init/              # Init process
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs       # System tests, VFS client
+│   ├── vfs/               # VFS server
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs       # RAM filesystem
+│   ├── user.ld            # Shared linker script
+│   ├── aarch64-kenix-user.json  # Custom target spec
+│   └── Cargo.toml         # Workspace root
+├── journal/            # Development notes
 └── Makefile
 ```
 
@@ -74,6 +85,7 @@ kenix/
 - [x] User-space tasks (EL0)
 - [x] ELF loader
 - [x] Syscall interface
+- [x] Pure Rust user-space (libkenix)
 
 ### IPC
 - [x] Synchronous IPC (call/recv/reply)
@@ -83,10 +95,19 @@ kenix/
 
 ### Servers
 - [x] Console server (UART)
-- [ ] VFS server
+- [x] VFS server (ramfs)
 - [ ] Block device driver
 - [ ] RAM disk
 - [ ] FAT32 filesystem
+
+### File Descriptors
+- [x] Per-task fd table
+- [x] stdin/stdout/stderr
+- [x] read() syscall
+- [x] write() syscall
+- [x] close() syscall
+- [ ] dup/dup2
+- [ ] pipe
 
 ### Memory Management
 - [ ] Demand paging

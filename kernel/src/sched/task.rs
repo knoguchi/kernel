@@ -11,6 +11,97 @@ use crate::mm::PhysAddr;
 /// Maximum number of tasks in the system
 pub const MAX_TASKS: usize = 64;
 
+/// Maximum number of file descriptors per task
+pub const MAX_FDS: usize = 32;
+
+/// Console server task ID (well-known, created first after idle)
+pub const CONSOLE_SERVER_TID: TaskId = TaskId(1);
+
+/// File descriptor kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdKind {
+    /// Not in use
+    None,
+    /// Console (stdin/stdout/stderr)
+    Console,
+    /// Pipe (future)
+    Pipe,
+    /// VFS-managed file (future)
+    File,
+}
+
+/// File descriptor flags
+#[derive(Debug, Clone, Copy)]
+pub struct FdFlags {
+    pub readable: bool,
+    pub writable: bool,
+}
+
+impl FdFlags {
+    pub const fn read_only() -> Self {
+        Self { readable: true, writable: false }
+    }
+    pub const fn write_only() -> Self {
+        Self { readable: false, writable: true }
+    }
+    pub const fn read_write() -> Self {
+        Self { readable: true, writable: true }
+    }
+}
+
+/// File descriptor entry
+#[derive(Debug, Clone, Copy)]
+pub struct FileDescriptor {
+    pub kind: FdKind,
+    pub flags: FdFlags,
+    /// Server task ID (for IPC-based I/O)
+    pub server: TaskId,
+    /// Server-side handle (vnode, pipe id, etc.)
+    pub handle: u64,
+}
+
+impl FileDescriptor {
+    pub const fn empty() -> Self {
+        Self {
+            kind: FdKind::None,
+            flags: FdFlags { readable: false, writable: false },
+            server: TaskId(0),
+            handle: 0,
+        }
+    }
+
+    pub const fn console_stdin() -> Self {
+        Self {
+            kind: FdKind::Console,
+            flags: FdFlags::read_only(),
+            server: CONSOLE_SERVER_TID,
+            handle: 0,
+        }
+    }
+
+    pub const fn console_stdout() -> Self {
+        Self {
+            kind: FdKind::Console,
+            flags: FdFlags::write_only(),
+            server: CONSOLE_SERVER_TID,
+            handle: 1,
+        }
+    }
+
+    pub const fn console_stderr() -> Self {
+        Self {
+            kind: FdKind::Console,
+            flags: FdFlags::write_only(),
+            server: CONSOLE_SERVER_TID,
+            handle: 2,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.kind != FdKind::None
+    }
+}
+
 /// Kernel stack size per task (16KB)
 pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
 
@@ -181,11 +272,14 @@ pub struct Task {
     pub name: [u8; 16],
     /// IPC state (message passing)
     pub ipc: IpcState,
+    /// File descriptor table
+    pub fds: [FileDescriptor; MAX_FDS],
 }
 
 impl Task {
     /// Create a new uninitialized task slot
     pub const fn empty() -> Self {
+        const EMPTY_FD: FileDescriptor = FileDescriptor::empty();
         Self {
             id: TaskId(0),
             state: TaskState::Free,
@@ -198,6 +292,44 @@ impl Task {
             next: None,
             name: [0; 16],
             ipc: IpcState::empty(),
+            fds: [EMPTY_FD; MAX_FDS],
+        }
+    }
+
+    /// Initialize standard file descriptors (stdin, stdout, stderr)
+    /// Call this when creating a user task
+    pub fn init_stdio(&mut self) {
+        self.fds[0] = FileDescriptor::console_stdin();
+        self.fds[1] = FileDescriptor::console_stdout();
+        self.fds[2] = FileDescriptor::console_stderr();
+    }
+
+    /// Get a file descriptor by number
+    pub fn get_fd(&self, fd: usize) -> Option<&FileDescriptor> {
+        if fd < MAX_FDS && self.fds[fd].is_valid() {
+            Some(&self.fds[fd])
+        } else {
+            None
+        }
+    }
+
+    /// Allocate a new file descriptor, returns the fd number
+    pub fn alloc_fd(&mut self) -> Option<usize> {
+        for i in 0..MAX_FDS {
+            if !self.fds[i].is_valid() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Close a file descriptor
+    pub fn close_fd(&mut self, fd: usize) -> bool {
+        if fd < MAX_FDS && self.fds[fd].is_valid() {
+            self.fds[fd] = FileDescriptor::empty();
+            true
+        } else {
+            false
         }
     }
 

@@ -10,9 +10,16 @@ __console_elf_start:
 .incbin "../user/console.elf"
 __console_elf_end:
 
-// Init program ELF
+// Init program ELF (task ID 2)
 .global __init_elf_start
 .global __init_elf_end
 __init_elf_start:
 .incbin "../user/init.elf"
 __init_elf_end:
+
+// VFS server ELF (task ID 3)
+.global __vfs_elf_start
+.global __vfs_elf_end
+__vfs_elf_start:
+.incbin "../user/vfs.elf"
+__vfs_elf_end:

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "libkenix",
+    "console",
+    "init",
+    "vfs",
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"      # Optimize for size
+lto = true
