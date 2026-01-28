@@ -80,6 +80,8 @@ pub mod syscall {
     pub const SYS_SHMMAP: u64 = 11;
     pub const SYS_SHMUNMAP: u64 = 12;
     pub const SYS_SHMGRANT: u64 = 13;
+    pub const SYS_GETPID: u64 = 20;
+    pub const SYS_SPAWN: u64 = 21;
     pub const SYS_CLOSE: u64 = 57;
     pub const SYS_READ: u64 = 63;
     pub const SYS_WRITE: u64 = 64;
@@ -152,6 +154,42 @@ pub mod syscall {
                 options(nostack)
             );
         }
+    }
+
+    /// Get current task ID
+    pub fn getpid() -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                out("x0") ret,
+                in("x8") SYS_GETPID,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Spawn a new task from an ELF image
+    ///
+    /// # Arguments
+    /// * `elf_data` - Slice containing the ELF binary
+    ///
+    /// # Returns
+    /// * On success: task ID of the new task (>= 0)
+    /// * On failure: negative error code
+    pub fn spawn(elf_data: &[u8]) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") elf_data.as_ptr() => ret,
+                in("x1") elf_data.len(),
+                in("x8") SYS_SPAWN,
+                options(nostack)
+            );
+        }
+        ret
     }
 }
 

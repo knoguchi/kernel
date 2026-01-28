@@ -66,6 +66,9 @@ kenix/
 │   ├── user.ld            # Shared linker script
 │   ├── aarch64-kenix-user.json  # Custom target spec
 │   └── Cargo.toml         # Workspace root
+├── docs/               # Documentation
+│   ├── syscalls.md        # System call reference
+│   └── ipc-protocols.md   # IPC message formats
 ├── journal/            # Development notes
 └── Makefile
 ```

@@ -32,6 +32,8 @@ pub const SYS_SHMGRANT: u16 = 13;   // Grant another task access to shared memor
 
 /// Syscall numbers - Kenix-specific
 pub const SYS_YIELD: u16 = 0;    // Voluntarily yield CPU
+pub const SYS_GETPID: u16 = 20;  // Get current task ID
+pub const SYS_SPAWN: u16 = 21;   // Create new task from ELF
 
 /// Syscall numbers - POSIX-compatible file I/O
 pub const SYS_READ: u16 = 63;    // Read from file descriptor
@@ -41,8 +43,11 @@ pub const SYS_EXIT: u16 = 93;    // Terminate process
 
 /// Error codes (Linux-compatible)
 pub const ESUCCESS: i64 = 0;   // Success
+pub const EAGAIN: i64 = -11;   // Resource temporarily unavailable
+pub const ENOMEM: i64 = -12;   // Out of memory
 pub const EBADF: i64 = -9;     // Bad file descriptor
 pub const EFAULT: i64 = -14;   // Bad address
+pub const EINVAL: i64 = -22;   // Invalid argument
 pub const ENOSYS: i64 = -38;   // Function not implemented
 
 /// Handle a system call
@@ -160,6 +165,16 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         SYS_EXIT => {
             let exit_code = ctx.gpr[0] as i32;
             ctx.gpr[0] = sys_exit(exit_code) as u64;
+        }
+
+        SYS_GETPID => {
+            ctx.gpr[0] = sys_getpid() as u64;
+        }
+
+        SYS_SPAWN => {
+            let elf_ptr = ctx.gpr[0] as usize;
+            let elf_len = ctx.gpr[1] as usize;
+            ctx.gpr[0] = sys_spawn(elf_ptr, elf_len) as u64;
         }
 
         _ => {
@@ -318,5 +333,57 @@ fn sys_close(fd: usize) -> i64 {
         } else {
             EBADF
         }
+    }
+}
+
+/// SYS_GETPID - Get current task ID
+fn sys_getpid() -> i64 {
+    match sched::current() {
+        Some(id) => id.0 as i64,
+        None => EINVAL,
+    }
+}
+
+/// Maximum ELF size we'll accept for spawn (1MB should be plenty for user programs)
+const MAX_ELF_SIZE: usize = 1024 * 1024;
+
+/// SYS_SPAWN - Create a new task from an ELF image
+///
+/// # Arguments
+/// * `elf_ptr` - Pointer to ELF data in user space
+/// * `elf_len` - Length of ELF data in bytes
+///
+/// # Returns
+/// * On success: task ID of the new task (>= 0)
+/// * On failure: negative error code
+fn sys_spawn(elf_ptr: usize, elf_len: usize) -> i64 {
+    // Validate arguments
+    if elf_len == 0 || elf_len > MAX_ELF_SIZE {
+        return EINVAL;
+    }
+
+    // Basic validation that pointer looks like user space (not kernel)
+    // User space is mapped at low addresses (< 0x8000_0000 in our setup)
+    if elf_ptr >= 0x8000_0000 {
+        return EFAULT;
+    }
+
+    // Check for overflow
+    if elf_ptr.checked_add(elf_len).is_none() {
+        return EFAULT;
+    }
+
+    // Create a slice from user memory
+    // Safety: We've validated the pointer is in user space range.
+    // The actual memory access safety depends on the user having this mapped.
+    // If it's not mapped, we'll get a page fault (which is handled).
+    let elf_data = unsafe {
+        core::slice::from_raw_parts(elf_ptr as *const u8, elf_len)
+    };
+
+    // Create the task using the existing ELF loader
+    match sched::create_user_task_from_elf("spawned", elf_data) {
+        Some(task_id) => task_id.0 as i64,
+        None => ENOMEM,
     }
 }
