@@ -12,16 +12,16 @@
 
 pub mod task;
 
-pub use task::{TaskId, TaskState, KERNEL_STACK_SIZE};
+pub use task::{TaskId, TaskState, Message, IpcState, KERNEL_STACK_SIZE};
 
 use crate::mm::{self, PhysAddr, AddressSpace, PageFlags};
 use crate::exception::ExceptionContext;
+use crate::elf::{ElfFile, PF_W, PF_X};
 use task::{TASKS, DEFAULT_TIME_SLICE};
 
 /// User virtual address space constants
-/// User code is mapped at the start of the first 2MB block (virtual 0x00000000)
-/// The actual entry point depends on the physical frame offset
-const USER_CODE_VADDR_BASE: usize = 0x0000_0000;  // Start of virtual space
+/// User code is mapped at 0x00100000 (1MB) to match user.ld linker script
+const USER_CODE_VADDR_BASE: usize = 0x0010_0000;  // 1MB - matches user.ld
 const USER_STACK_VADDR_BASE: usize = 0x0020_0000; // 2MB (separate 2MB block)
 
 // External assembly functions
@@ -105,13 +105,17 @@ impl Scheduler {
         if let Some(current_id) = self.current {
             unsafe {
                 let task = &mut TASKS[current_id.0];
-                if task.time_slice > 0 {
-                    task.time_slice -= 1;
-                }
 
-                // Reschedule if time slice expired and there are other ready tasks
-                if task.time_slice == 0 && self.ready_head.is_some() {
-                    return true;
+                // Only decrement time slice for running tasks (not blocked ones)
+                if task.state == TaskState::Running {
+                    if task.time_slice > 0 {
+                        task.time_slice -= 1;
+                    }
+
+                    // Reschedule if time slice expired and there are other ready tasks
+                    if task.time_slice == 0 && self.ready_head.is_some() {
+                        return true;
+                    }
                 }
             }
         }
@@ -134,13 +138,18 @@ impl Scheduler {
         let current_id = self.current;
 
         // Save current task's context and put it back in ready queue
+        // (but only if it was Running - blocked tasks stay blocked)
         if let Some(id) = current_id {
             let task = &mut TASKS[id.0];
             // Store the SP that points to the exception context
             task.kernel_stack_top = ctx as *const _ as usize;
-            task.state = TaskState::Ready;
-            task.time_slice = DEFAULT_TIME_SLICE;
-            self.enqueue(id);
+
+            // Only re-enqueue if the task was running (not IPC blocked)
+            if task.state == TaskState::Running {
+                task.state = TaskState::Ready;
+                task.time_slice = DEFAULT_TIME_SLICE;
+                self.enqueue(id);
+            }
         }
 
         // Get next task to run
@@ -181,6 +190,54 @@ impl Scheduler {
             unsafe {
                 TASKS[current_id.0].time_slice = 0;
             }
+        }
+    }
+
+    /// Context switch when current task is blocking (IPC)
+    ///
+    /// The caller has already set the current task's state to a blocked state.
+    /// We save the context and switch to the next ready task without
+    /// re-enqueuing the current task.
+    ///
+    /// # Safety
+    /// Must be called from an exception handler with ctx pointing to the saved context.
+    pub unsafe fn context_switch_blocking(&mut self, ctx: &mut ExceptionContext) {
+        let current_id = self.current;
+
+        // Save current task's context (but don't re-enqueue - it's blocked)
+        if let Some(id) = current_id {
+            let task = &mut TASKS[id.0];
+            task.kernel_stack_top = ctx as *const _ as usize;
+            // State is already set by caller (SendBlocked, RecvBlocked, etc.)
+        }
+
+        // Get next task to run
+        let next_id = self.dequeue().unwrap_or(self.idle_task);
+
+        let next_task = &mut TASKS[next_id.0];
+        next_task.state = TaskState::Running;
+        next_task.time_slice = DEFAULT_TIME_SLICE;
+        self.current = Some(next_id);
+        self.switch_count += 1;
+
+        // Switch to new task's stack
+        if current_id != Some(next_id) {
+            // Switch page table if needed
+            if next_task.page_table.0 != 0 {
+                let ttbr0 = next_task.page_table.0 as u64;
+                core::arch::asm!(
+                    "msr ttbr0_el1, {0}",
+                    "isb",
+                    "tlbi vmalle1",
+                    "dsb ish",
+                    "isb",
+                    in(reg) ttbr0,
+                    options(nostack)
+                );
+            }
+
+            let new_sp = next_task.kernel_stack_top;
+            switch_context_and_restore(new_sp);
         }
     }
 
@@ -271,6 +328,7 @@ pub fn create_task(name: &str, entry_point: fn()) -> Option<TaskId> {
         task.entry_point = entry_addr;
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
+        task.ipc = task::IpcState::empty(); // Reset IPC state for reused slots
 
         // Calculate stack top (16-byte aligned)
         let stack_top = stack_base.0 + KERNEL_STACK_SIZE;
@@ -403,6 +461,7 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
         task.entry_point = user_entry_point;
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
+        task.ipc = task::IpcState::empty(); // Reset IPC state for reused slots
 
         // Calculate kernel stack top (16-byte aligned)
         let kernel_stack_top = kernel_stack_base.0 + KERNEL_STACK_SIZE;
@@ -439,6 +498,407 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
     Some(task_id)
 }
 
+/// Create a user-mode task from an ELF binary
+///
+/// This function parses the ELF file, maps each PT_LOAD segment with
+/// appropriate permissions, and sets up the task to start at the ELF entry point.
+///
+/// # Arguments
+/// * `name` - Task name for debugging
+/// * `elf_data` - Raw ELF file data
+///
+/// # Returns
+/// The TaskId if successful, None if parsing or allocation failed
+pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> {
+    // Parse ELF header
+    let elf = match ElfFile::parse(elf_data) {
+        Ok(e) => e,
+        Err(_e) => {
+            return None;
+        }
+    };
+
+    let task_id = task::find_free_slot()?;
+
+    // Create user address space (includes kernel mappings for syscalls)
+    let mut addr_space = unsafe { AddressSpace::new_for_user()? };
+
+    // Collect info about all PT_LOAD segments to determine which 2MB blocks we need
+    // Track which 2MB blocks need to be mapped and their combined flags
+    // For simplicity with 2MB granularity, we'll use a single block for all user code
+    // and copy all segments to the appropriate offsets within that block.
+
+    // Find the range of all segments
+    let mut min_vaddr = usize::MAX;
+    let mut max_vaddr = 0usize;
+    let mut has_executable = false;
+    let mut has_writable = false;
+
+    for phdr in elf.load_segments() {
+        let vaddr = phdr.p_vaddr as usize;
+        let memsz = phdr.p_memsz as usize;
+        if memsz == 0 {
+            continue;
+        }
+        min_vaddr = min_vaddr.min(vaddr);
+        max_vaddr = max_vaddr.max(vaddr + memsz);
+        if phdr.p_flags & PF_X != 0 {
+            has_executable = true;
+        }
+        if phdr.p_flags & PF_W != 0 {
+            has_writable = true;
+        }
+    }
+
+    if min_vaddr == usize::MAX {
+        // No segments to load
+        return None;
+    }
+
+    // Calculate the 2MB block that contains all segments
+    let block_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
+
+    // Allocate a physical frame for user code
+    let code_frame = mm::alloc_frame()?;
+
+    // Zero the frame first
+    unsafe {
+        core::ptr::write_bytes(code_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+    }
+
+    // Copy all segments to the appropriate offsets in the frame
+    for phdr in elf.load_segments() {
+        let vaddr = phdr.p_vaddr as usize;
+        let filesz = phdr.p_filesz as usize;
+        let memsz = phdr.p_memsz as usize;
+
+        if memsz == 0 {
+            continue;
+        }
+
+        // Get segment data from ELF
+        let segment_data = elf.segment_data(phdr).ok()?;
+
+        // Calculate offset within the physical frame
+        // The frame will be mapped at block_base, so offset is vaddr - block_base
+        let offset_in_block = vaddr - block_base;
+
+        // Make sure we don't overflow the frame
+        if offset_in_block + filesz > mm::frame::PAGE_SIZE {
+            // Segment extends beyond our frame, truncate
+            let copy_size = mm::frame::PAGE_SIZE.saturating_sub(offset_in_block);
+            if copy_size > 0 && copy_size <= segment_data.len() {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        segment_data.as_ptr(),
+                        (code_frame.0 + offset_in_block) as *mut u8,
+                        copy_size,
+                    );
+                }
+            }
+        } else {
+            // Copy full segment
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    segment_data.as_ptr(),
+                    (code_frame.0 + offset_in_block) as *mut u8,
+                    filesz,
+                );
+            }
+        }
+    }
+
+    // Determine page flags based on combined segment flags
+    // If any segment is executable, we need execute permission
+    // If any segment is writable, we need write permission
+    // For now, with 2MB granularity, we use user_code (RX) if executable,
+    // otherwise user_data (RW) if writable, otherwise read-only
+    let flags = if has_executable {
+        // Note: With 2MB pages, we can't have separate RX and RW regions
+        // within the same block. We'll make it executable for now.
+        // Proper separation requires 4KB page support.
+        PageFlags::user_code()
+    } else if has_writable {
+        PageFlags::user_data()
+    } else {
+        PageFlags::user_code() // Read-only
+    };
+
+    // Calculate the 2MB-aligned physical base for the block
+    let phys_base_2mb = PhysAddr(code_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    // Calculate the offset of our frame within the 2MB block
+    let code_frame_offset = code_frame.0 - phys_base_2mb.0;
+
+    // Map the 2MB block at virtual address 0
+    // The code will be at virtual address code_frame_offset within this block
+    unsafe {
+        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+            return None;
+        }
+    }
+
+    // Allocate and map user stack (2MB block)
+    let stack_frame = mm::alloc_frame()?;
+    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+
+    unsafe {
+        // Zero the stack frame
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
+            return None;
+        }
+    }
+
+    // User stack pointer: top of the allocated frame
+    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+
+    // Entry point: ELF entry + frame offset within 2MB block
+    // The ELF is linked at 0, and we copied it to the start of the frame.
+    // The frame is at offset code_frame_offset within the mapped 2MB block.
+    // So the actual entry point is code_frame_offset + elf.entry_point()
+    let user_entry_point = code_frame_offset + elf.entry_point() as usize;
+
+    // Allocate kernel stack for syscalls/interrupts (4 pages = 16KB)
+    let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
+    let mut kernel_stack_base = PhysAddr(0);
+
+    for i in 0..stack_pages {
+        if let Some(frame) = mm::alloc_frame() {
+            if i == 0 {
+                kernel_stack_base = frame;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    unsafe {
+        let task = &mut TASKS[task_id.0];
+        task.id = task_id;
+        task.state = TaskState::Ready;
+        task.set_name(name);
+        task.kernel_stack_base = kernel_stack_base;
+        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        task.entry_point = user_entry_point;
+        task.time_slice = DEFAULT_TIME_SLICE;
+        task.next = None;
+        task.ipc = task::IpcState::empty(); // Reset IPC state for reused slots
+
+        // Calculate kernel stack top (16-byte aligned)
+        let kernel_stack_top = kernel_stack_base.0 + KERNEL_STACK_SIZE;
+
+        // Set up a fake ExceptionContext at the top of the kernel stack
+        let ctx_addr = kernel_stack_top - EXCEPTION_CONTEXT_SIZE;
+        let ctx = ctx_addr as *mut ExceptionContext;
+
+        // Zero the context first
+        core::ptr::write_bytes(ctx, 0, 1);
+
+        // Set up the context for EL0 entry
+        (*ctx).elr = user_entry_point as u64;
+        (*ctx).spsr = 0x000;  // EL0t with all interrupts enabled
+        (*ctx).sp = user_stack_top as u64;
+
+        // The task's saved SP points to this fake context
+        task.kernel_stack_top = ctx_addr;
+
+        // Enqueue to ready queue
+        SCHEDULER.enqueue(task_id);
+
+        // Prevent AddressSpace from being dropped
+        core::mem::forget(addr_space);
+    }
+
+    Some(task_id)
+}
+
+/// UART base address for QEMU virt machine (console server needs this)
+const UART_MMIO_BASE: usize = 0x0900_0000;
+
+/// Create the console server from ELF with UART MMIO access
+///
+/// This is a specialized function for the console server that maps the UART
+/// MMIO region into the task's address space so it can do direct I/O.
+///
+/// # Arguments
+/// * `name` - Task name for debugging
+/// * `elf_data` - Raw ELF file data
+///
+/// # Returns
+/// The TaskId if successful, None if parsing or allocation failed
+pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> {
+    // Parse ELF header
+    let elf = match ElfFile::parse(elf_data) {
+        Ok(e) => e,
+        Err(_e) => {
+            return None;
+        }
+    };
+
+    let task_id = task::find_free_slot()?;
+
+    // Create user address space
+    let mut addr_space = unsafe { AddressSpace::new_for_user()? };
+
+    // Find the range of all segments (same as create_user_task_from_elf)
+    let mut min_vaddr = usize::MAX;
+    let mut max_vaddr = 0usize;
+    let mut has_executable = false;
+    let mut has_writable = false;
+
+    for phdr in elf.load_segments() {
+        let vaddr = phdr.p_vaddr as usize;
+        let memsz = phdr.p_memsz as usize;
+        if memsz == 0 {
+            continue;
+        }
+        min_vaddr = min_vaddr.min(vaddr);
+        max_vaddr = max_vaddr.max(vaddr + memsz);
+        if phdr.p_flags & PF_X != 0 {
+            has_executable = true;
+        }
+        if phdr.p_flags & PF_W != 0 {
+            has_writable = true;
+        }
+    }
+
+    if min_vaddr == usize::MAX {
+        return None;
+    }
+
+    let block_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
+
+    // Allocate a physical frame for user code
+    let code_frame = mm::alloc_frame()?;
+
+    unsafe {
+        core::ptr::write_bytes(code_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+    }
+
+    // Copy all segments
+    for phdr in elf.load_segments() {
+        let vaddr = phdr.p_vaddr as usize;
+        let filesz = phdr.p_filesz as usize;
+        let memsz = phdr.p_memsz as usize;
+
+        if memsz == 0 {
+            continue;
+        }
+
+        let segment_data = elf.segment_data(phdr).ok()?;
+        let offset_in_block = vaddr - block_base;
+
+        if offset_in_block + filesz > mm::frame::PAGE_SIZE {
+            let copy_size = mm::frame::PAGE_SIZE.saturating_sub(offset_in_block);
+            if copy_size > 0 && copy_size <= segment_data.len() {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        segment_data.as_ptr(),
+                        (code_frame.0 + offset_in_block) as *mut u8,
+                        copy_size,
+                    );
+                }
+            }
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    segment_data.as_ptr(),
+                    (code_frame.0 + offset_in_block) as *mut u8,
+                    filesz,
+                );
+            }
+        }
+    }
+
+    let flags = if has_executable {
+        PageFlags::user_code()
+    } else if has_writable {
+        PageFlags::user_data()
+    } else {
+        PageFlags::user_code()
+    };
+
+    let phys_base_2mb = PhysAddr(code_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let code_frame_offset = code_frame.0 - phys_base_2mb.0;
+
+    // Map the code block
+    unsafe {
+        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+            return None;
+        }
+    }
+
+    // Map UART MMIO region for console server
+    // The UART at 0x09000000 is within the 2MB block starting at 0x08000000.
+    // We map the entire 2MB block containing the UART with device memory attributes.
+    // Virtual 0x08000000 -> Physical 0x08000000 (so UART at 0x09000000 works)
+    unsafe {
+        let uart_block_base = UART_MMIO_BASE & !(BLOCK_SIZE_2MB - 1); // 0x08000000
+        if !addr_space.map_2mb(uart_block_base, PhysAddr(uart_block_base), PageFlags::user_device()) {
+            return None;
+        }
+    }
+
+    // Allocate and map user stack
+    let stack_frame = mm::alloc_frame()?;
+    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+
+    unsafe {
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
+            return None;
+        }
+    }
+
+    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    let user_entry_point = code_frame_offset + elf.entry_point() as usize;
+
+    // Allocate kernel stack
+    let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
+    let mut kernel_stack_base = PhysAddr(0);
+
+    for i in 0..stack_pages {
+        if let Some(frame) = mm::alloc_frame() {
+            if i == 0 {
+                kernel_stack_base = frame;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    unsafe {
+        let task = &mut TASKS[task_id.0];
+        task.id = task_id;
+        task.state = TaskState::Ready;
+        task.set_name(name);
+        task.kernel_stack_base = kernel_stack_base;
+        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        task.entry_point = user_entry_point;
+        task.time_slice = DEFAULT_TIME_SLICE;
+        task.next = None;
+        task.ipc = task::IpcState::empty();
+
+        let kernel_stack_top = kernel_stack_base.0 + KERNEL_STACK_SIZE;
+        let ctx_addr = kernel_stack_top - EXCEPTION_CONTEXT_SIZE;
+        let ctx = ctx_addr as *mut ExceptionContext;
+
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = user_entry_point as u64;
+        (*ctx).spsr = 0x000;
+        (*ctx).sp = user_stack_top as u64;
+
+        task.kernel_stack_top = ctx_addr;
+
+        SCHEDULER.enqueue(task_id);
+        core::mem::forget(addr_space);
+    }
+
+    Some(task_id)
+}
+
 /// Start the scheduler - just enable timer, tasks will switch on interrupt
 ///
 /// Call this after init() and create_task() calls. The current execution
@@ -467,6 +927,25 @@ pub fn yield_cpu() {
     unsafe {
         SCHEDULER.yield_cpu();
     }
+}
+
+/// Add a task to the ready queue (public interface for IPC)
+pub fn enqueue_task(task_id: TaskId) {
+    unsafe {
+        SCHEDULER.enqueue(task_id);
+    }
+}
+
+/// Perform a blocking context switch (task is already marked as blocked)
+///
+/// Unlike `context_switch` which re-enqueues the current task as Ready,
+/// this assumes the caller has already set the current task's state
+/// to a blocked state (SendBlocked, RecvBlocked, ReplyBlocked).
+///
+/// # Safety
+/// Must be called from exception context with ctx pointing to saved context.
+pub unsafe fn context_switch_blocking(ctx: &mut ExceptionContext) {
+    SCHEDULER.context_switch_blocking(ctx);
 }
 
 /// Exit the current task

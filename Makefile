@@ -16,11 +16,17 @@ boot:
 	mkdir -p esp/EFI/BOOT
 	cp target/aarch64-unknown-uefi/release/kenix-boot.efi esp/EFI/BOOT/BOOTAA64.EFI
 
-# Build user-space init program using clang and Rust's LLVM tools
+# Build user-space programs using clang and Rust's LLVM tools
+# The kernel loads ELF directly, no need for raw binary conversion
 user:
-	clang --target=aarch64-unknown-none -c -o user/init.o user/init.s
-	$(RUST_LLD) -flavor gnu -T user/user.ld -o user/init.elf user/init.o
-	$(RUST_OBJCOPY) -O binary user/init.elf user/init.bin
+	# Build init program
+	clang --target=aarch64-unknown-none -c -o user/crt0.o user/crt0.s
+	clang --target=aarch64-unknown-none -ffreestanding -nostdlib -O2 -c -o user/init.o user/init.c
+	$(RUST_LLD) -flavor gnu -T user/user.ld -o user/init.elf user/crt0.o user/init.o
+	# Build console server
+	clang --target=aarch64-unknown-none -c -o user/crt0_console.o user/crt0_console.s
+	clang --target=aarch64-unknown-none -ffreestanding -nostdlib -O2 -c -o user/console.o user/console.c
+	$(RUST_LLD) -flavor gnu -T user/user.ld -o user/console.elf user/crt0_console.o user/console.o
 
 kernel: user
 	cd kernel && cargo +nightly build --release --target aarch64-kenix.json -Zbuild-std=core,alloc
@@ -47,7 +53,8 @@ run-kernel: kernel
 
 clean:
 	rm -rf esp kernel.elf
-	rm -f user/init.o user/init.elf user/init.bin
+	rm -f user/crt0.o user/init.o user/init.elf
+	rm -f user/crt0_console.o user/console.o user/console.elf
 	cd boot && cargo clean
 	cd kernel && cargo clean
 

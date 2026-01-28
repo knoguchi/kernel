@@ -12,6 +12,8 @@ mod gic;
 mod timer;
 mod sched;
 mod syscall;
+mod elf;
+mod ipc;
 
 // Memory intrinsics required by compiler
 #[no_mangle]
@@ -84,8 +86,12 @@ const RAM_END: usize = 0x8000_0000; // 1GB RAM
 
 extern "C" {
     static __kernel_end: u8;
-    static __user_code_embedded_start: u8;
-    static __user_code_embedded_end: u8;
+    // Console server ELF (created first, gets task ID 1)
+    static __console_elf_start: u8;
+    static __console_elf_end: u8;
+    // Init program ELF (created second, gets task ID 2+)
+    static __init_elf_start: u8;
+    static __init_elf_end: u8;
 }
 
 struct Uart {
@@ -244,24 +250,44 @@ pub extern "C" fn kernel_main() -> ! {
     println!("Initializing scheduler...");
     unsafe { sched::init(); }
     println!("  Created idle task (id=0)");
-
-    // Create test tasks (kernel mode)
-    if let Some(id) = sched::create_task("task_a", task_a) {
-        println!("  Created task_a (id={})", id.0);
-    }
-    if let Some(id) = sched::create_task("task_b", task_b) {
-        println!("  Created task_b (id={})", id.0);
-    }
-
-    // Create user-mode init task
     println!();
-    println!("Creating user init task...");
-    let user_code_paddr = unsafe { &__user_code_embedded_start as *const u8 as usize };
-    let user_code_end = unsafe { &__user_code_embedded_end as *const u8 as usize };
-    let user_code_size = user_code_end - user_code_paddr;
-    println!("  User code at {:#010x}, size {} bytes", user_code_paddr, user_code_size);
 
-    if let Some(id) = sched::create_user_task("init", mm::PhysAddr(user_code_paddr), user_code_size) {
+    // Create console server (task ID 1) - must be first!
+    println!("Creating console server...");
+    let console_start = unsafe { &__console_elf_start as *const u8 };
+    let console_end = unsafe { &__console_elf_end as *const u8 };
+    let console_size = console_end as usize - console_start as usize;
+    let console_data = unsafe { core::slice::from_raw_parts(console_start, console_size) };
+
+    println!("  Console ELF at {:#010x}, size {} bytes", console_start as usize, console_size);
+
+    if let Some(id) = sched::create_console_server_from_elf("console", console_data) {
+        println!("  Created console server (id={}) - runs in EL0 with UART access", id.0);
+    } else {
+        println!("  ERROR: Failed to create console server!");
+    }
+    println!();
+
+    // Create init task from ELF
+    println!("Creating init task...");
+    let init_start = unsafe { &__init_elf_start as *const u8 };
+    let init_end = unsafe { &__init_elf_end as *const u8 };
+    let init_size = init_end as usize - init_start as usize;
+    let init_data = unsafe { core::slice::from_raw_parts(init_start, init_size) };
+
+    println!("  Init ELF at {:#010x}, size {} bytes", init_start as usize, init_size);
+
+    // Parse ELF to show info
+    if let Ok(elf_file) = elf::ElfFile::parse(init_data) {
+        println!("  Entry point: {:#010x}", elf_file.entry_point());
+        println!("  PT_LOAD segments: {}", elf_file.load_segment_count());
+        for (i, phdr) in elf_file.load_segments().enumerate() {
+            println!("    Segment {}: vaddr={:#010x}, filesz={}, memsz={}, flags={}",
+                i, phdr.p_vaddr, phdr.p_filesz, phdr.p_memsz, elf::flags_to_str(phdr.p_flags));
+        }
+    }
+
+    if let Some(id) = sched::create_user_task_from_elf("init", init_data) {
         println!("  Created init task (id={}) - runs in EL0", id.0);
     } else {
         println!("  ERROR: Failed to create init task!");

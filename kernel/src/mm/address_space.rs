@@ -66,6 +66,16 @@ impl PageFlags {
             user: false,
         }
     }
+
+    /// User-accessible device memory (for servers that need MMIO access)
+    pub const fn user_device() -> Self {
+        Self {
+            mattr: MATTR_DEVICE,
+            writable: true,
+            executable: false,
+            user: true,
+        }
+    }
 }
 
 /// Per-task address space
@@ -267,18 +277,24 @@ fn make_block_entry(paddr: u64, flags: PageFlags) -> u64 {
     // Address (2MB aligned)
     entry |= paddr & 0x0000_FFFF_FFE0_0000;
 
-    // Access permissions
+    // Access permissions (AP[2:1] bits at position [7:6])
+    // AArch64 AP encoding for stage 1:
+    //   00: EL1 R/W, EL0 no access
+    //   01: EL1 R/W, EL0 R/W
+    //   10: EL1 R/O, EL0 no access
+    //   11: EL1 R/O, EL0 R/O
     if flags.user {
-        // AP[2:1] = 01 for user read-only, 00 for user read-write
-        if !flags.writable {
-            entry |= 0b01 << 6; // Read-only
+        if flags.writable {
+            entry |= 0b01 << 6; // EL0/EL1 read-write
+        } else {
+            entry |= 0b11 << 6; // EL0/EL1 read-only
         }
-        // For user-accessible, AP[2:1] = 01 (EL0 read-only) or 00 (EL0/1 read-write)
     } else {
-        // Kernel-only
+        // Kernel-only (EL0 no access)
         if !flags.writable {
             entry |= 0b10 << 6; // EL1 read-only
         }
+        // writable kernel: AP = 00 (EL1 R/W, EL0 no access)
     }
 
     // Execute permissions

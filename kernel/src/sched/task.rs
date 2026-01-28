@@ -4,6 +4,7 @@
 //! - Kernel stack (for syscalls and interrupts)
 //! - Page table (address space)
 //! - Saved context (registers)
+//! - IPC state (message passing)
 
 use crate::mm::PhysAddr;
 
@@ -28,6 +29,14 @@ impl TaskId {
     pub const fn as_usize(&self) -> usize {
         self.0
     }
+
+    /// Special value meaning "any task" for receive operations
+    pub const ANY: TaskId = TaskId(usize::MAX);
+
+    /// Check if this is the "any" sentinel value
+    pub const fn is_any(&self) -> bool {
+        self.0 == usize::MAX
+    }
 }
 
 /// Task state
@@ -40,10 +49,81 @@ pub enum TaskState {
     Ready = 1,
     /// Task is currently running
     Running = 2,
-    /// Task is blocked (waiting for I/O, IPC, etc.)
-    Blocked = 3,
+    /// Task is blocked waiting for receiver to accept message
+    SendBlocked = 3,
+    /// Task is blocked waiting for a sender
+    RecvBlocked = 4,
+    /// Task is blocked waiting for reply (after sys_call)
+    ReplyBlocked = 5,
     /// Task has terminated
-    Terminated = 4,
+    Terminated = 6,
+}
+
+/// IPC Message structure
+///
+/// Messages are small (fit in registers) for fast path, with optional
+/// buffer pointer for larger data transfers.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Message {
+    /// Message type/opcode (e.g., MSG_WRITE, MSG_EXIT)
+    pub tag: u64,
+    /// 4 words of inline data (32 bytes)
+    pub data: [u64; 4],
+}
+
+impl Message {
+    /// Create an empty message
+    pub const fn empty() -> Self {
+        Self {
+            tag: 0,
+            data: [0; 4],
+        }
+    }
+
+    /// Create a message with tag and data
+    pub const fn new(tag: u64, data: [u64; 4]) -> Self {
+        Self { tag, data }
+    }
+}
+
+/// IPC state for a task
+#[derive(Debug, Clone, Copy)]
+pub struct IpcState {
+    /// Head of queue of tasks waiting to send to this task
+    pub sender_queue_head: Option<TaskId>,
+    /// Tail of queue of tasks waiting to send to this task
+    pub sender_queue_tail: Option<TaskId>,
+
+    /// Link for being in another task's sender queue
+    pub sender_next: Option<TaskId>,
+
+    /// Task we're waiting for a reply from (for sys_call)
+    pub reply_to: Option<TaskId>,
+
+    /// Task that called us (for sys_reply)
+    pub caller: Option<TaskId>,
+
+    /// Source task ID filter for receive (-1 = any)
+    pub recv_from: Option<TaskId>,
+
+    /// Pending message (when sender is blocked or message received)
+    pub pending_msg: Message,
+}
+
+impl IpcState {
+    /// Create empty IPC state
+    pub const fn empty() -> Self {
+        Self {
+            sender_queue_head: None,
+            sender_queue_tail: None,
+            sender_next: None,
+            reply_to: None,
+            caller: None,
+            recv_from: None,
+            pending_msg: Message::empty(),
+        }
+    }
 }
 
 /// Saved CPU context for context switching
@@ -99,6 +179,8 @@ pub struct Task {
     pub next: Option<TaskId>,
     /// Task name for debugging
     pub name: [u8; 16],
+    /// IPC state (message passing)
+    pub ipc: IpcState,
 }
 
 impl Task {
@@ -115,6 +197,7 @@ impl Task {
             time_slice: DEFAULT_TIME_SLICE,
             next: None,
             name: [0; 16],
+            ipc: IpcState::empty(),
         }
     }
 
@@ -168,4 +251,98 @@ pub fn get_task_mut(id: TaskId) -> Option<&'static mut Task> {
     } else {
         None
     }
+}
+
+/// Add a task to another task's sender queue
+///
+/// # Safety
+/// Caller must ensure task IDs are valid and not already in a queue.
+pub unsafe fn enqueue_sender(receiver_id: TaskId, sender_id: TaskId) {
+    let receiver = &mut TASKS[receiver_id.0];
+    let sender = &mut TASKS[sender_id.0];
+
+    sender.ipc.sender_next = None;
+
+    if let Some(tail_id) = receiver.ipc.sender_queue_tail {
+        TASKS[tail_id.0].ipc.sender_next = Some(sender_id);
+        receiver.ipc.sender_queue_tail = Some(sender_id);
+    } else {
+        // Queue was empty
+        receiver.ipc.sender_queue_head = Some(sender_id);
+        receiver.ipc.sender_queue_tail = Some(sender_id);
+    }
+}
+
+/// Remove and return the first task from a task's sender queue
+///
+/// # Safety
+/// Caller must ensure task ID is valid.
+pub unsafe fn dequeue_sender(receiver_id: TaskId) -> Option<TaskId> {
+    let receiver = &mut TASKS[receiver_id.0];
+
+    if let Some(head_id) = receiver.ipc.sender_queue_head {
+        let head = &mut TASKS[head_id.0];
+        receiver.ipc.sender_queue_head = head.ipc.sender_next;
+        head.ipc.sender_next = None;
+
+        if receiver.ipc.sender_queue_head.is_none() {
+            receiver.ipc.sender_queue_tail = None;
+        }
+        Some(head_id)
+    } else {
+        None
+    }
+}
+
+/// Remove a specific task from a receiver's sender queue
+///
+/// Returns true if the task was found and removed.
+///
+/// # Safety
+/// Caller must ensure task IDs are valid.
+pub unsafe fn remove_from_sender_queue(receiver_id: TaskId, sender_id: TaskId) -> bool {
+    let receiver = &mut TASKS[receiver_id.0];
+
+    let mut prev: Option<TaskId> = None;
+    let mut current = receiver.ipc.sender_queue_head;
+
+    while let Some(curr_id) = current {
+        if curr_id == sender_id {
+            let curr_task = &mut TASKS[curr_id.0];
+            let next = curr_task.ipc.sender_next;
+            curr_task.ipc.sender_next = None;
+
+            if let Some(prev_id) = prev {
+                TASKS[prev_id.0].ipc.sender_next = next;
+            } else {
+                receiver.ipc.sender_queue_head = next;
+            }
+
+            if receiver.ipc.sender_queue_tail == Some(sender_id) {
+                receiver.ipc.sender_queue_tail = prev;
+            }
+            return true;
+        }
+        prev = current;
+        current = TASKS[curr_id.0].ipc.sender_next;
+    }
+    false
+}
+
+/// Find a sender in the queue matching the filter (or any if filter is None)
+///
+/// # Safety
+/// Caller must ensure task ID is valid.
+pub unsafe fn find_sender(receiver_id: TaskId, from_filter: Option<TaskId>) -> Option<TaskId> {
+    let receiver = &TASKS[receiver_id.0];
+    let mut current = receiver.ipc.sender_queue_head;
+
+    while let Some(curr_id) = current {
+        // If no filter or filter matches, return this sender
+        if from_filter.is_none() || from_filter == Some(curr_id) {
+            return Some(curr_id);
+        }
+        current = TASKS[curr_id.0].ipc.sender_next;
+    }
+    None
 }
