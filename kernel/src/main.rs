@@ -84,6 +84,8 @@ const RAM_END: usize = 0x8000_0000; // 1GB RAM
 
 extern "C" {
     static __kernel_end: u8;
+    static __user_code_embedded_start: u8;
+    static __user_code_embedded_end: u8;
 }
 
 struct Uart {
@@ -243,12 +245,26 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe { sched::init(); }
     println!("  Created idle task (id=0)");
 
-    // Create test tasks
+    // Create test tasks (kernel mode)
     if let Some(id) = sched::create_task("task_a", task_a) {
         println!("  Created task_a (id={})", id.0);
     }
     if let Some(id) = sched::create_task("task_b", task_b) {
         println!("  Created task_b (id={})", id.0);
+    }
+
+    // Create user-mode init task
+    println!();
+    println!("Creating user init task...");
+    let user_code_paddr = unsafe { &__user_code_embedded_start as *const u8 as usize };
+    let user_code_end = unsafe { &__user_code_embedded_end as *const u8 as usize };
+    let user_code_size = user_code_end - user_code_paddr;
+    println!("  User code at {:#010x}, size {} bytes", user_code_paddr, user_code_size);
+
+    if let Some(id) = sched::create_user_task("init", mm::PhysAddr(user_code_paddr), user_code_size) {
+        println!("  Created init task (id={}) - runs in EL0", id.0);
+    } else {
+        println!("  ERROR: Failed to create init task!");
     }
     println!();
 

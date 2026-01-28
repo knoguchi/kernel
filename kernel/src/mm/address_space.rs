@@ -111,6 +111,72 @@ impl AddressSpace {
         Some(addr_space)
     }
 
+    /// Create a new address space for a user process
+    ///
+    /// This creates fresh L2 tables for user space and copies kernel mappings
+    /// (device and RAM) so that syscalls and interrupts can execute kernel code.
+    /// User code/data will be mapped separately via map_2mb().
+    ///
+    /// # Safety
+    /// Requires the kernel page tables to be initialized
+    pub unsafe fn new_for_user() -> Option<Self> {
+        // Allocate L1 table
+        let l1_frame = alloc_frame()?;
+
+        // Zero the L1 table
+        let l1_ptr = l1_frame.0 as *mut u64;
+        for i in 0..ENTRIES_PER_TABLE {
+            ptr::write_volatile(l1_ptr.add(i), 0);
+        }
+
+        let mut addr_space = Self {
+            ttbr0: l1_frame,
+            l2_tables: [None; 4],
+        };
+
+        // Get kernel page tables
+        let kernel_ttbr0 = read_ttbr0_el1();
+        let kernel_l1_ptr = kernel_ttbr0 as *const u64;
+
+        // Allocate new L2 tables and copy kernel mappings
+        // L1[0] covers 0x00000000 - 0x40000000 (device region + user space)
+        // L1[1] covers 0x40000000 - 0x80000000 (RAM)
+
+        // For L1[0]: Create new L2 table, copy device mappings (GIC, UART)
+        let l2_0_frame = alloc_frame()?;
+        let l2_0_ptr = l2_0_frame.0 as *mut u64;
+        for i in 0..ENTRIES_PER_TABLE {
+            ptr::write_volatile(l2_0_ptr.add(i), 0);
+        }
+
+        // Get kernel's L2 device table and copy device entries
+        let kernel_l1_0_entry = ptr::read_volatile(kernel_l1_ptr.add(0));
+        if (kernel_l1_0_entry & 0b11) == 0b11 {
+            // It's a table descriptor, get the L2 table address
+            let kernel_l2_0_addr = (kernel_l1_0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+            // Copy device entries (GIC at index 64, UART at index 72)
+            // Actually, copy all entries to preserve any device mappings
+            for i in 0..ENTRIES_PER_TABLE {
+                let entry = ptr::read_volatile(kernel_l2_0_addr.add(i));
+                ptr::write_volatile(l2_0_ptr.add(i), entry);
+            }
+        }
+
+        // Set L1[0] to point to our new L2 table
+        let l1_0_entry = PageTableEntry::table(l2_0_frame.0 as u64);
+        ptr::write_volatile(l1_ptr.add(0), l1_0_entry.as_u64());
+        addr_space.l2_tables[0] = Some(l2_0_frame);
+
+        // For L1[1]: Copy the kernel RAM L2 table (or just copy L1 entry for 1GB block)
+        // The kernel uses L2 tables for RAM too, so let's just copy the L1 entry directly
+        // This shares the kernel's L2 table (read-only for our purposes)
+        let kernel_l1_1_entry = ptr::read_volatile(kernel_l1_ptr.add(1));
+        ptr::write_volatile(l1_ptr.add(1), kernel_l1_1_entry);
+        // Note: We don't track this in l2_tables since it's shared with kernel
+
+        Some(addr_space)
+    }
+
     /// Get the TTBR0 value for this address space
     pub fn ttbr0(&self) -> u64 {
         self.ttbr0.0 as u64

@@ -30,6 +30,13 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* Embedded user-space init program */
+    .user_code : ALIGN(4K) {
+        __user_code_start = .;
+        KEEP(*(.user_code))
+        __user_code_end = .;
+    }
+
     /* Stack: 64KB, grows downward */
     . = ALIGN(16);
     _stack_bottom = .;

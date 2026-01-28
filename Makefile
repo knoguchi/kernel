@@ -1,7 +1,13 @@
-.PHONY: all boot kernel clean run
+.PHONY: all boot kernel user clean run
 
 QEMU = qemu-system-aarch64
-OVMF = QEMU_EFI.fd
+# Use QEMU's bundled UEFI firmware (Homebrew location)
+OVMF = /opt/homebrew/share/qemu/edk2-aarch64-code.fd
+
+# Use Rust's LLVM tools for cross-compilation
+RUST_LLVM_BIN = $(shell find ~/.rustup/toolchains -path "*nightly*" -name "rust-lld" -type f 2>/dev/null | head -1 | xargs dirname)
+RUST_LLD = $(RUST_LLVM_BIN)/rust-lld
+RUST_OBJCOPY = $(RUST_LLVM_BIN)/llvm-objcopy
 
 all: boot kernel
 
@@ -10,7 +16,13 @@ boot:
 	mkdir -p esp/EFI/BOOT
 	cp target/aarch64-unknown-uefi/release/kenix-boot.efi esp/EFI/BOOT/BOOTAA64.EFI
 
-kernel:
+# Build user-space init program using clang and Rust's LLVM tools
+user:
+	clang --target=aarch64-unknown-none -c -o user/init.o user/init.s
+	$(RUST_LLD) -flavor gnu -T user/user.ld -o user/init.elf user/init.o
+	$(RUST_OBJCOPY) -O binary user/init.elf user/init.bin
+
+kernel: user
 	cd kernel && cargo +nightly build --release --target aarch64-kenix.json -Zbuild-std=core,alloc
 	cp target/aarch64-kenix/release/kenix-kernel kernel.elf
 
@@ -35,10 +47,9 @@ run-kernel: kernel
 
 clean:
 	rm -rf esp kernel.elf
+	rm -f user/init.o user/init.elf user/init.bin
 	cd boot && cargo clean
 	cd kernel && cargo clean
 
-# download OVMF firmware
-fetch-ovmf:
-	curl -LO https://retrage.github.io/edk2-nightly/bin/RELEASEAVRCH64_QEMU_EFI.fd
-	mv RELEASEAVRCH64_QEMU_EFI.fd $(OVMF)
+# Note: UEFI firmware is provided by QEMU (Homebrew) at /opt/homebrew/share/qemu/
+# For other installations, set OVMF to the path of your edk2-aarch64-code.fd

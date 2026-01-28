@@ -46,9 +46,9 @@ kenix/
 
 - [x] UEFI boot
 - [x] UART output
-- [ ] physical memory management
-- [ ] paging
-- [ ] exception handler
+- [x] physical memory management
+- [x] paging
+- [x] exception handler
 - [ ] IPC
-- [ ] scheduler
-- [ ] userspace
+- [x] scheduler
+- [x] userspace

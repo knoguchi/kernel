@@ -14,9 +14,15 @@ pub mod task;
 
 pub use task::{TaskId, TaskState, KERNEL_STACK_SIZE};
 
-use crate::mm::{self, PhysAddr};
+use crate::mm::{self, PhysAddr, AddressSpace, PageFlags};
 use crate::exception::ExceptionContext;
 use task::{TASKS, DEFAULT_TIME_SLICE};
+
+/// User virtual address space constants
+/// User code is mapped at the start of the first 2MB block (virtual 0x00000000)
+/// The actual entry point depends on the physical frame offset
+const USER_CODE_VADDR_BASE: usize = 0x0000_0000;  // Start of virtual space
+const USER_STACK_VADDR_BASE: usize = 0x0020_0000; // 2MB (separate 2MB block)
 
 // External assembly functions
 extern "C" {
@@ -290,6 +296,144 @@ pub fn create_task(name: &str, entry_point: fn()) -> Option<TaskId> {
 
         // Enqueue to ready queue
         SCHEDULER.enqueue(task_id);
+    }
+
+    Some(task_id)
+}
+
+/// 2MB block size for page mapping
+const BLOCK_SIZE_2MB: usize = 2 * 1024 * 1024;
+
+/// Create a user-mode task that runs in EL0
+///
+/// # Arguments
+/// * `name` - Task name for debugging
+/// * `code_paddr` - Physical address of the user code
+/// * `code_size` - Size of the user code in bytes
+///
+/// # Returns
+/// The TaskId if successful, None if allocation failed
+pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> Option<TaskId> {
+    let task_id = task::find_free_slot()?;
+
+    // Create user address space (includes kernel mappings for syscalls)
+    let mut addr_space = unsafe { AddressSpace::new_for_user()? };
+
+    // For 2MB block mapping, we need to work with 2MB-aligned physical addresses.
+    // Allocate enough frames to cover a 2MB region and copy user code to the start.
+    // This is wasteful but necessary with 2MB granularity.
+    //
+    // Strategy: Allocate multiple 4KB frames to form a 2MB region.
+    // For simplicity, we'll just allocate frames starting from the first one
+    // and use the 2MB-aligned base of that first frame.
+
+    // Allocate the first frame
+    let first_frame = mm::alloc_frame()?;
+
+    // Calculate the 2MB-aligned base containing this frame
+    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let offset_in_block = first_frame.0 - phys_base_2mb.0;
+
+    // For a proper solution, we'd need to ensure we own all pages in the 2MB block.
+    // For now, we'll copy user code to the frame we allocated and use its offset.
+
+    unsafe {
+        // Zero the frame first
+        core::ptr::write_bytes(first_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        // Copy user code to this frame
+        core::ptr::copy_nonoverlapping(
+            code_paddr.0 as *const u8,
+            first_frame.0 as *mut u8,
+            code_size.min(mm::frame::PAGE_SIZE),
+        );
+    }
+
+    // Map the 2MB block at virtual address 0x00000000
+    // The user code will be at virtual offset_in_block (matching physical layout)
+    unsafe {
+        if !addr_space.map_2mb(USER_CODE_VADDR_BASE, phys_base_2mb, PageFlags::user_code()) {
+            return None;
+        }
+    }
+
+    // Entry point is at the offset within the 2MB block
+    // Virtual offset_in_block maps to physical first_frame
+    let user_entry_point = USER_CODE_VADDR_BASE + offset_in_block;
+
+    // Allocate and map user stack (2MB block)
+    let stack_frame = mm::alloc_frame()?;
+    // Calculate 2MB-aligned base for stack
+    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+
+    unsafe {
+        // Zero the stack frame
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
+            return None;
+        }
+    }
+
+    // User stack pointer: use the actual frame we allocated, offset from the virtual base
+    // Stack grows down, so start at the top of the 4KB frame
+    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+
+    // Allocate kernel stack for syscalls/interrupts (4 pages = 16KB)
+    let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
+    let mut kernel_stack_base = PhysAddr(0);
+
+    for i in 0..stack_pages {
+        if let Some(frame) = mm::alloc_frame() {
+            if i == 0 {
+                kernel_stack_base = frame;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    unsafe {
+        let task = &mut TASKS[task_id.0];
+        task.id = task_id;
+        task.state = TaskState::Ready;
+        task.set_name(name);
+        task.kernel_stack_base = kernel_stack_base;
+        // Store the page table physical address
+        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        task.entry_point = user_entry_point;
+        task.time_slice = DEFAULT_TIME_SLICE;
+        task.next = None;
+
+        // Calculate kernel stack top (16-byte aligned)
+        let kernel_stack_top = kernel_stack_base.0 + KERNEL_STACK_SIZE;
+
+        // Set up a fake ExceptionContext at the top of the kernel stack
+        // When we switch to this task, RESTORE_CONTEXT will pop this and ERET to EL0
+        let ctx_addr = kernel_stack_top - EXCEPTION_CONTEXT_SIZE;
+        let ctx = ctx_addr as *mut ExceptionContext;
+
+        // Zero the context first
+        core::ptr::write_bytes(ctx, 0, 1);
+
+        // Set up the context for EL0 entry
+        (*ctx).elr = user_entry_point as u64;  // Entry point in user space
+
+        // SPSR for EL0t mode (user mode, thread stack pointer)
+        // Bits: D=0, A=0, I=0, F=0, M[4:0]=0b00000 (EL0t)
+        (*ctx).spsr = 0x000;  // EL0t with all interrupts enabled
+
+        // User stack pointer
+        (*ctx).sp = user_stack_top as u64;
+
+        // The task's saved SP points to this fake context
+        task.kernel_stack_top = ctx_addr;
+
+        // Enqueue to ready queue
+        SCHEDULER.enqueue(task_id);
+
+        // Prevent AddressSpace from being dropped (we need to keep the page tables alive)
+        // The page table pointer is stored in task.page_table
+        core::mem::forget(addr_space);
     }
 
     Some(task_id)

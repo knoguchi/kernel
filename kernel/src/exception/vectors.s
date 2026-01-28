@@ -18,7 +18,8 @@
 // Total: 288 bytes (0x120)
 // ============================================================================
 
-.macro SAVE_CONTEXT
+// Macro to save context (with EL parameter for EL0 vs EL1 handling)
+.macro SAVE_CONTEXT_EL el
     // Allocate stack frame
     sub     sp, sp, #288
 
@@ -42,8 +43,12 @@
     // Save x30 (lr)
     str     x30, [sp, #0xf0]
 
-    // Save original sp (before we allocated the frame)
+    // Save SP - for EL0 exceptions, save SP_EL0; for EL1, save SP before frame allocation
+    .if \el == 0
+    mrs     x0, sp_el0
+    .else
     add     x0, sp, #288
+    .endif
     str     x0, [sp, #0xf8]
 
     // Save exception registers
@@ -56,6 +61,11 @@
     stp     x0, x1, [sp, #0x110]
 .endm
 
+// Original SAVE_CONTEXT for compatibility (defaults to EL1 behavior)
+.macro SAVE_CONTEXT
+    SAVE_CONTEXT_EL 1
+.endm
+
 .macro RESTORE_CONTEXT
     // Restore exception registers
     ldp     x0, x1, [sp, #0x100]
@@ -63,6 +73,15 @@
     msr     spsr_el1, x1
 
     // Note: esr_el1 and far_el1 are read-only, no need to restore
+
+    // Load saved SP value for EL0 return
+    // Check if returning to EL0 (M[3:0] of SPSR == 0)
+    and     x2, x1, #0xF
+    cbnz    x2, 1f
+    // Returning to EL0 - restore SP_EL0 from saved context
+    ldr     x2, [sp, #0xf8]
+    msr     sp_el0, x2
+1:
 
     // Restore x30 (lr)
     ldr     x30, [sp, #0xf0]
@@ -190,7 +209,7 @@ el1_serror_handler:
 
 // EL0 Sync handler
 el0_sync_handler:
-    SAVE_CONTEXT
+    SAVE_CONTEXT_EL 0
     mov     x0, sp
     mov     x1, #0              // exception type: sync
     bl      handle_el0_sync
@@ -198,7 +217,7 @@ el0_sync_handler:
 
 // EL0 IRQ handler
 el0_irq_handler:
-    SAVE_CONTEXT
+    SAVE_CONTEXT_EL 0
     mov     x0, sp
     mov     x1, #1              // exception type: irq
     bl      handle_el0_irq
@@ -206,7 +225,7 @@ el0_irq_handler:
 
 // EL0 FIQ handler
 el0_fiq_handler:
-    SAVE_CONTEXT
+    SAVE_CONTEXT_EL 0
     mov     x0, sp
     mov     x1, #2              // exception type: fiq
     bl      handle_el0_fiq
@@ -214,7 +233,7 @@ el0_fiq_handler:
 
 // EL0 SError handler
 el0_serror_handler:
-    SAVE_CONTEXT
+    SAVE_CONTEXT_EL 0
     mov     x0, sp
     mov     x1, #3              // exception type: serror
     bl      handle_el0_serror

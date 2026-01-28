@@ -10,7 +10,11 @@ fn main() {
         ("src/boot.s", "boot.o"),
         ("src/exception/vectors.s", "vectors.o"),
         ("src/sched/switch.s", "switch.o"),
+        ("src/user_code.s", "user_code.o"),
     ];
+
+    // user_code.s includes the user binary
+    println!("cargo:rerun-if-changed=../user/init.bin");
 
     let mut object_files = Vec::new();
 

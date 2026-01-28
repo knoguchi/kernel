@@ -280,16 +280,18 @@ extern "C" fn handle_el0_irq(ctx: &mut ExceptionContext, _exc_type: u64) {
 
     if irq == TIMER_IRQ {
         timer::acknowledge_and_reset();
-
         // Check if we need to reschedule
-        if sched::tick() {
+        let needs_switch = sched::tick();
+        // IMPORTANT: Send EOI before context switch because switch_context_and_restore
+        // never returns (it does ERET directly)
+        gic::end_of_interrupt(irq);
+        if needs_switch {
             unsafe { sched::context_switch(ctx); }
         }
     } else {
         exception_println!("Unhandled IRQ: {}", irq);
+        gic::end_of_interrupt(irq);
     }
-
-    gic::end_of_interrupt(irq);
 }
 
 #[no_mangle]
