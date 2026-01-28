@@ -2,6 +2,7 @@
 // Runs in EL0 (user mode) and uses IPC to communicate with services
 
 #include "ipc.h"
+#include "shm.h"
 
 // Console server task ID (created first, so it's task 1)
 // Task 0 is idle, task 1 is console, task 2 is init (us)
@@ -36,14 +37,11 @@ static void memcpy(void *dst, const void *src, unsigned long n) {
     while (n--) *d++ = *s++;
 }
 
-// Print a string to console server via IPC
-// For strings up to 32 bytes, we copy them inline into the message data.
-// This avoids cross-address-space pointer issues.
+// Print a short string (up to 24 bytes) via inline IPC
 static void print(const char *s) {
     unsigned long len = strlen(s);
 
     // data[0] = length, data[1-3] hold up to 24 bytes of string data
-    // For larger strings, we'd need shared memory
     Message msg = {
         .tag = MSG_WRITE,
         .data = {len, 0, 0, 0}
@@ -57,10 +55,67 @@ static void print(const char *s) {
     sys_call(CONSOLE_SERVER, &msg);
 }
 
+// Print a long string via shared memory IPC
+// shm: Shared memory region ID (already created and granted to console)
+// buf: Mapped shared memory buffer
+// s: String to print
+static void print_shm(ShmId shm, char *buf, const char *s) {
+    unsigned long len = strlen(s);
+
+    // Copy string to shared memory buffer
+    memcpy(buf, s, len);
+
+    // Send SHM write message
+    Message msg = {
+        .tag = MSG_SHM_WRITE,
+        .data = {shm, 0, len, 0}  // shm_id, offset, length
+    };
+
+    sys_call(CONSOLE_SERVER, &msg);
+}
+
 int main(void) {
-    print("Hello via IPC!\n");        // 15 chars + newline = 16
-    print("Init running in EL0\n");   // 19 chars + newline = 20
-    print("IPC works!\n");            // 10 chars + newline = 11
+    // Test basic inline IPC first
+    print("Hello via IPC!\n");
+    print("Init running in EL0\n");
+    print("IPC works!\n");
+
+#if 1  // Set to 1 to test SHM, 0 to skip
+    // Create shared memory for long strings
+    long shm_id = sys_shmcreate(4096);  // 4KB buffer
+    if (shm_id < 0) {
+        print("SHM create failed!\n");
+        exit_legacy(1);
+    }
+
+    // Grant console server (task 1) access
+    if (sys_shmgrant(shm_id, CONSOLE_SERVER) < 0) {
+        print("SHM grant failed!\n");
+        exit_legacy(1);
+    }
+
+    // Map the shared memory
+    char *shm_buf = (char*)sys_shmmap(shm_id, (void*)0);
+    if ((long)shm_buf < 0) {
+        print("SHM map failed!\n");
+        exit_legacy(1);
+    }
+
+    // Now we can print long strings via shared memory!
+    print_shm(shm_id, shm_buf,
+        "This is a much longer string that exceeds the 24-byte inline limit "
+        "and demonstrates shared memory IPC working correctly!\n");
+
+    print_shm(shm_id, shm_buf,
+        "Shared memory enables efficient transfer of large data between "
+        "tasks without copying through the kernel message registers.\n");
+
+    // Clean up
+    sys_shmunmap(shm_id);
+
+    print("SHM test complete!\n");
+#endif
+
     exit_legacy(0);
     return 0;
 }

@@ -107,6 +107,23 @@ impl PageTableEntry {
     pub fn raw(&self) -> u64 {
         self.0
     }
+
+    /// Check if entry is a table descriptor (bits [1:0] == 0b11 for non-L3)
+    /// In L2, this means it points to an L3 table
+    pub fn is_table(&self) -> bool {
+        self.is_valid() && (self.0 & 0b10) != 0
+    }
+
+    /// Check if entry is a block descriptor (bits [1:0] == 0b01)
+    /// In L2, this means a 2MB block mapping
+    pub fn is_block(&self) -> bool {
+        self.is_valid() && (self.0 & 0b10) == 0
+    }
+
+    /// Get the physical address from a table descriptor
+    pub fn table_addr(&self) -> u64 {
+        self.0 & 0x0000_FFFF_FFFF_F000
+    }
 }
 
 /// 512 entries per table (4KB aligned, 4KB size)
@@ -150,6 +167,19 @@ pub fn l1_index(va: usize) -> usize {
 pub fn l2_index(va: usize) -> usize {
     (va >> 21) & 0x1FF
 }
+
+/// Extract L3 index from virtual address (bits [20:12])
+/// Each L3 entry covers 4KB
+#[inline]
+pub fn l3_index(va: usize) -> usize {
+    (va >> 12) & 0x1FF
+}
+
+/// Number of entries per L3 table (same as other levels)
+pub const ENTRIES_PER_L3: usize = 512;
+
+/// Size of a 4KB page
+pub const PAGE_SIZE_4KB: usize = 4096;
 
 // Compile-time checks
 const _: () = assert!(core::mem::size_of::<PageTable>() == PAGE_SIZE);

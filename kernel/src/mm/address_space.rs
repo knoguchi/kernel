@@ -4,8 +4,8 @@
 //! - Separate user-space mappings (TTBR0_EL1)
 //! - Shared kernel mappings (copied from kernel page table)
 
-use super::frame::{alloc_frame, free_frame, PhysAddr};
-use super::paging::{PageTableEntry, MATTR_NORMAL, MATTR_DEVICE, ENTRIES_PER_TABLE, l1_index, l2_index};
+use super::frame::{alloc_frame, free_frame, PhysAddr, PAGE_SIZE};
+use super::paging::{PageTableEntry, MATTR_NORMAL, MATTR_DEVICE, ENTRIES_PER_TABLE, l1_index, l2_index, l3_index};
 use core::ptr;
 
 /// Page flags for mapping
@@ -76,14 +76,34 @@ impl PageFlags {
             user: true,
         }
     }
+
+    /// User code and data (RWX) - used when 2MB blocks contain both
+    /// executable code and writable data sections.
+    /// Note: W+X is less secure but required for 2MB granularity with mixed segments
+    pub const fn user_code_data() -> Self {
+        Self {
+            mattr: MATTR_NORMAL,
+            writable: true,
+            executable: true,
+            user: true,
+        }
+    }
 }
+
+/// Maximum L1 entries we track (4GB address space)
+const MAX_L1_ENTRIES: usize = 4;
 
 /// Per-task address space
 pub struct AddressSpace {
     /// L1 page table physical address (TTBR0_EL1)
     ttbr0: PhysAddr,
     /// L2 tables (up to 4 for 4GB address space with 1GB per L1 entry)
-    l2_tables: [Option<PhysAddr>; 4],
+    l2_tables: [Option<PhysAddr>; MAX_L1_ENTRIES],
+    /// L3 tables: indexed by [l1_idx][l2_idx]
+    /// Only allocated when 4KB mapping is needed in that 2MB region
+    /// Using a flat array to avoid nested arrays issue with const init
+    /// Index = l1_idx * 512 + l2_idx
+    l3_tables: [Option<PhysAddr>; MAX_L1_ENTRIES * ENTRIES_PER_TABLE],
 }
 
 impl AddressSpace {
@@ -101,9 +121,10 @@ impl AddressSpace {
             ptr::write_volatile(l1_ptr.add(i), 0);
         }
 
-        let mut addr_space = Self {
+        let addr_space = Self {
             ttbr0: l1_frame,
-            l2_tables: [None; 4],
+            l2_tables: [None; MAX_L1_ENTRIES],
+            l3_tables: [None; MAX_L1_ENTRIES * ENTRIES_PER_TABLE],
         };
 
         // Clone kernel mappings from the current TTBR0
@@ -141,7 +162,8 @@ impl AddressSpace {
 
         let mut addr_space = Self {
             ttbr0: l1_frame,
-            l2_tables: [None; 4],
+            l2_tables: [None; MAX_L1_ENTRIES],
+            l3_tables: [None; MAX_L1_ENTRIES * ENTRIES_PER_TABLE],
         };
 
         // Get kernel page tables
@@ -245,10 +267,116 @@ impl AddressSpace {
             ptr::write_volatile(l2_ptr.add(l2_idx), 0);
         }
     }
+
+    /// Helper to compute flat index for l3_tables array
+    #[inline]
+    fn l3_table_index(l1_idx: usize, l2_idx: usize) -> usize {
+        l1_idx * ENTRIES_PER_TABLE + l2_idx
+    }
+
+    /// Map a single 4KB page at the given virtual address
+    ///
+    /// This allocates an L3 table if needed and creates a 4KB page mapping.
+    /// Cannot mix with 2MB block mappings in the same 2MB region.
+    ///
+    /// # Safety
+    /// The caller must ensure the physical address is valid
+    pub unsafe fn map_4kb(&mut self, vaddr: usize, paddr: PhysAddr, flags: PageFlags) -> bool {
+        let l1_idx = l1_index(vaddr);
+        let l2_idx = l2_index(vaddr);
+        let l3_idx = l3_index(vaddr);
+
+        // Bounds check
+        if l1_idx >= MAX_L1_ENTRIES {
+            return false;
+        }
+
+        // Ensure we have an L2 table for this L1 index
+        if self.l2_tables[l1_idx].is_none() {
+            // Allocate a new L2 table
+            if let Some(l2_frame) = alloc_frame() {
+                let l2_ptr = l2_frame.0 as *mut u64;
+                for i in 0..ENTRIES_PER_TABLE {
+                    ptr::write_volatile(l2_ptr.add(i), 0);
+                }
+
+                // Update L1 entry to point to new L2 table
+                let l1_ptr = self.ttbr0.0 as *mut u64;
+                let l1_entry = PageTableEntry::table(l2_frame.0 as u64);
+                ptr::write_volatile(l1_ptr.add(l1_idx), l1_entry.as_u64());
+
+                self.l2_tables[l1_idx] = Some(l2_frame);
+            } else {
+                return false;
+            }
+        }
+
+        let l2_frame = self.l2_tables[l1_idx].unwrap();
+        let l2_ptr = l2_frame.0 as *mut u64;
+
+        // Read current L2 entry
+        let l2_entry_val = ptr::read_volatile(l2_ptr.add(l2_idx));
+
+        // Check if L2 entry is already a 2MB block (can't mix with 4KB pages)
+        // Valid bit set (bit 0) and block type (bit 1 = 0)
+        if l2_entry_val != 0 && (l2_entry_val & 0b10) == 0 {
+            // It's a valid block descriptor, can't add 4KB pages here
+            return false;
+        }
+
+        // Ensure L3 table exists for this 2MB region
+        let l3_table_idx = Self::l3_table_index(l1_idx, l2_idx);
+        if self.l3_tables[l3_table_idx].is_none() {
+            let l3_frame = alloc_frame();
+            if l3_frame.is_none() {
+                return false;
+            }
+            let l3_frame = l3_frame.unwrap();
+
+            // Zero the L3 table
+            ptr::write_bytes(l3_frame.0 as *mut u8, 0, PAGE_SIZE);
+            self.l3_tables[l3_table_idx] = Some(l3_frame);
+
+            // Update L2 entry to point to L3 table
+            let l2_table_entry = PageTableEntry::table(l3_frame.0 as u64);
+            ptr::write_volatile(l2_ptr.add(l2_idx), l2_table_entry.as_u64());
+        }
+
+        // Write L3 entry (4KB page descriptor)
+        let l3_frame = self.l3_tables[l3_table_idx].unwrap();
+        let l3_ptr = l3_frame.0 as *mut u64;
+        let entry = make_page_entry(paddr.0 as u64, flags);
+        ptr::write_volatile(l3_ptr.add(l3_idx), entry);
+
+        true
+    }
+
+    /// Unmap a single 4KB page at the given virtual address
+    pub unsafe fn unmap_4kb(&mut self, vaddr: usize) {
+        let l1_idx = l1_index(vaddr);
+        let l2_idx = l2_index(vaddr);
+        let l3_idx = l3_index(vaddr);
+
+        if l1_idx >= MAX_L1_ENTRIES {
+            return;
+        }
+
+        let l3_table_idx = Self::l3_table_index(l1_idx, l2_idx);
+        if let Some(l3_frame) = self.l3_tables[l3_table_idx] {
+            let l3_ptr = l3_frame.0 as *mut u64;
+            ptr::write_volatile(l3_ptr.add(l3_idx), 0); // Invalid entry
+        }
+    }
 }
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        // Free L3 tables
+        for l3 in self.l3_tables.iter() {
+            if let Some(frame) = l3 {
+                free_frame(*frame);
+            }
+        }
         // Free L2 tables
         for l2 in self.l2_tables.iter() {
             if let Some(frame) = l2 {
@@ -303,6 +431,49 @@ fn make_block_entry(paddr: u64, flags: PageFlags) -> u64 {
     }
     if !flags.executable || !flags.user {
         entry |= UXN; // No user execute
+    }
+
+    entry
+}
+
+/// Create a 4KB page descriptor with the given flags (for L3 entries)
+///
+/// L3 page descriptors use bits [1:0] = 0b11 (valid + page type)
+fn make_page_entry(paddr: u64, flags: PageFlags) -> u64 {
+    const VALID: u64 = 1 << 0;
+    const PAGE: u64 = 1 << 1;  // L3 page type (bit 1 = 1)
+    const AF: u64 = 1 << 10;
+    const SH_INNER: u64 = 0b11 << 8;
+    const UXN: u64 = 1 << 54;
+    const PXN: u64 = 1 << 53;
+
+    let mut entry = VALID | PAGE | AF | SH_INNER;
+
+    // Memory attribute index
+    entry |= flags.mattr << 2;
+
+    // Address (4KB aligned)
+    entry |= paddr & 0x0000_FFFF_FFFF_F000;
+
+    // Access permissions (same encoding as block entries)
+    if flags.user {
+        if flags.writable {
+            entry |= 0b01 << 6; // EL0/EL1 read-write
+        } else {
+            entry |= 0b11 << 6; // EL0/EL1 read-only
+        }
+    } else {
+        if !flags.writable {
+            entry |= 0b10 << 6; // EL1 read-only
+        }
+    }
+
+    // Execute permissions
+    if !flags.executable || flags.user {
+        entry |= PXN;
+    }
+    if !flags.executable || !flags.user {
+        entry |= UXN;
     }
 
     entry

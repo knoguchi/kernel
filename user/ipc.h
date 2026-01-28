@@ -15,9 +15,10 @@ typedef unsigned long TaskId;
 #define SYS_REPLY 4
 
 // Message tags for built-in services
-#define MSG_WRITE 1
-#define MSG_EXIT  2
-#define MSG_YIELD 3
+#define MSG_WRITE     1   // Inline write (up to 24 bytes in data[1-3])
+#define MSG_EXIT      2   // Exit notification
+#define MSG_YIELD     3   // Yield hint
+#define MSG_SHM_WRITE 4   // Write via shared memory: data[0]=shm_id, data[1]=offset, data[2]=len
 
 // IPC result codes
 #define IPC_OK             0

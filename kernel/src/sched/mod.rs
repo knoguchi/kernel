@@ -611,12 +611,12 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     // Determine page flags based on combined segment flags
     // If any segment is executable, we need execute permission
     // If any segment is writable, we need write permission
-    // For now, with 2MB granularity, we use user_code (RX) if executable,
-    // otherwise user_data (RW) if writable, otherwise read-only
-    let flags = if has_executable {
-        // Note: With 2MB pages, we can't have separate RX and RW regions
-        // within the same block. We'll make it executable for now.
-        // Proper separation requires 4KB page support.
+    // With 2MB granularity, we may need both R+W+X if segments are mixed
+    let flags = if has_executable && has_writable {
+        // Need both execute and write - use RWX
+        // Note: W+X is less secure but required for 2MB granularity with mixed segments
+        PageFlags::user_code_data()
+    } else if has_executable {
         PageFlags::user_code()
     } else if has_writable {
         PageFlags::user_data()
@@ -811,7 +811,12 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
         }
     }
 
-    let flags = if has_executable {
+    // Determine page flags based on combined segment flags
+    // With 2MB granularity, we may need both R+W+X if segments are mixed
+    let flags = if has_executable && has_writable {
+        // Need both execute and write - use RWX
+        PageFlags::user_code_data()
+    } else if has_executable {
         PageFlags::user_code()
     } else if has_writable {
         PageFlags::user_data()

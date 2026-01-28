@@ -1,10 +1,11 @@
 pub mod frame;
-mod paging;
+pub mod paging;
 mod mmu;
 pub mod address_space;
 
 pub use frame::{alloc_frame, free_frame, total_pages, free_pages, PhysAddr};
 pub use address_space::{AddressSpace, PageFlags};
+pub use paging::{l1_index, l2_index, l3_index, PageTableEntry, ENTRIES_PER_TABLE};
 
 /// Initialize the physical memory allocator
 #[inline(never)]

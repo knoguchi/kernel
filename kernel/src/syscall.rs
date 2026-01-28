@@ -16,12 +16,19 @@
 use crate::exception::ExceptionContext;
 use crate::sched::{self, TaskId, Message};
 use crate::ipc;
+use crate::shm;
 
 /// Syscall numbers - IPC (Kenix microkernel)
 pub const SYS_SEND: u16 = 1;     // Send message, block until received
 pub const SYS_RECV: u16 = 2;     // Receive message, block until available
 pub const SYS_CALL: u16 = 3;     // Send + wait for reply (RPC)
 pub const SYS_REPLY: u16 = 4;    // Reply to caller
+
+/// Syscall numbers - Shared Memory
+pub const SYS_SHMCREATE: u16 = 10;  // Create shared memory region
+pub const SYS_SHMMAP: u16 = 11;     // Map shared memory into current task
+pub const SYS_SHMUNMAP: u16 = 12;   // Unmap shared memory from current task
+pub const SYS_SHMGRANT: u16 = 13;   // Grant another task access to shared memory
 
 /// Syscall numbers - Legacy (Linux-compatible)
 pub const SYS_YIELD: u16 = 0;    // Kenix-specific
@@ -97,6 +104,33 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             let msg = Message::new(ctx.gpr[0], [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]]);
             let result = ipc::sys_reply(msg);
             ctx.gpr[0] = result as u64;
+        }
+
+        // Shared memory syscalls
+        // SYS_SHMCREATE: x0=size → returns shm_id in x0
+        SYS_SHMCREATE => {
+            let size = ctx.gpr[0] as usize;
+            ctx.gpr[0] = shm::sys_shmcreate(size) as u64;
+        }
+
+        // SYS_SHMMAP: x0=shm_id, x1=vaddr_hint → returns vaddr in x0
+        SYS_SHMMAP => {
+            let shm_id = ctx.gpr[0] as usize;
+            let vaddr_hint = ctx.gpr[1] as usize;
+            ctx.gpr[0] = shm::sys_shmmap(shm_id, vaddr_hint) as u64;
+        }
+
+        // SYS_SHMUNMAP: x0=shm_id → returns result in x0
+        SYS_SHMUNMAP => {
+            let shm_id = ctx.gpr[0] as usize;
+            ctx.gpr[0] = shm::sys_shmunmap(shm_id) as u64;
+        }
+
+        // SYS_SHMGRANT: x0=shm_id, x1=task_id → returns result in x0
+        SYS_SHMGRANT => {
+            let shm_id = ctx.gpr[0] as usize;
+            let task_id = ctx.gpr[1] as usize;
+            ctx.gpr[0] = shm::sys_shmgrant(shm_id, task_id) as u64;
         }
 
         // Legacy syscalls (kept for transition period)

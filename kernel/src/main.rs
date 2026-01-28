@@ -14,6 +14,7 @@ mod sched;
 mod syscall;
 mod elf;
 mod ipc;
+mod shm;
 
 // Memory intrinsics required by compiler
 #[no_mangle]

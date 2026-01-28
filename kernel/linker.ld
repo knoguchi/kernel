@@ -37,10 +37,10 @@ SECTIONS
         __user_code_end = .;
     }
 
-    /* Stack: 64KB, grows downward */
+    /* Stack: 256KB, grows downward (increased from 64KB to prevent overflow) */
     . = ALIGN(16);
     _stack_bottom = .;
-    . += 64K;
+    . += 256K;
     _stack_top = .;
 
     /* Kernel end symbol - aligned to page boundary */
