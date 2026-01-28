@@ -6,6 +6,7 @@ use core::panic::PanicInfo;
 use core::fmt::Write;
 use spin::Mutex;
 
+mod exception;
 mod mm;
 
 // Memory intrinsics required by compiler
@@ -209,6 +210,17 @@ pub extern "C" fn kernel_main() -> ! {
     println!("  UART: Device-nGnRnE");
     println!("  RAM: Normal Write-Back cacheable");
     println!();
+
+    // Set up exception vectors
+    println!("Setting up exception vectors...");
+    unsafe { exception::init(); }
+    println!("  VBAR_EL1: {:#018x}", exception::vbar_el1());
+    println!("Exception handling ready!");
+    println!();
+
+    // Uncomment to test exception handling:
+    // println!("Testing exception handler with null pointer access...");
+    // unsafe { core::ptr::read_volatile(0 as *const u8); }
 
     println!("TODO:");
     println!("  - IPC");

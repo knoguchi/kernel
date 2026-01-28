@@ -9,6 +9,12 @@ SECTIONS
         *(.text*)
     }
 
+    .vectors : ALIGN(0x800) {
+        __exception_vectors_start = .;
+        *(.text.vectors)
+        __exception_vectors_end = .;
+    }
+
     .rodata : ALIGN(4K) {
         *(.rodata*)
     }
