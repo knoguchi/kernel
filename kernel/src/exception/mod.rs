@@ -7,6 +7,11 @@ mod context;
 
 pub use context::ExceptionContext;
 
+use crate::gic::{self, TIMER_IRQ, IRQ_SPURIOUS};
+use crate::timer;
+use crate::sched;
+use crate::syscall;
+
 extern "C" {
     /// Exception vector table defined in vectors.s
     static exception_vectors: u8;
@@ -177,14 +182,26 @@ extern "C" fn handle_el1_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
 }
 
 #[no_mangle]
-extern "C" fn handle_el1_irq(_ctx: &mut ExceptionContext, _exc_type: u64) {
-    exception_println!();
-    exception_println!("!!! KERNEL IRQ - NOT IMPLEMENTED !!!");
-    exception_println!("GIC driver required for interrupt handling");
-    exception_println!();
+extern "C" fn handle_el1_irq(ctx: &mut ExceptionContext, _exc_type: u64) {
+    let irq = gic::acknowledge();
 
-    loop {
-        core::hint::spin_loop();
+    if irq == IRQ_SPURIOUS {
+        return;
+    }
+
+    if irq == TIMER_IRQ {
+        timer::acknowledge_and_reset();
+        // Check if we need to reschedule
+        let needs_switch = sched::tick();
+        // IMPORTANT: Send EOI before context switch because switch_context_and_restore
+        // never returns (it does ERET directly)
+        gic::end_of_interrupt(irq);
+        if needs_switch {
+            unsafe { sched::context_switch(ctx); }
+        }
+    } else {
+        exception_println!("Unhandled IRQ: {}", irq);
+        gic::end_of_interrupt(irq);
     }
 }
 
@@ -220,13 +237,7 @@ extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
     if ctx.is_svc() {
         // System call from userspace
         let syscall_num = ctx.svc_number();
-
-        // For now, return -ENOSYS (function not implemented)
-        // Syscall return value goes in x0
-        ctx.gpr[0] = (-38i64) as u64; // -ENOSYS
-
-        // Log syscall attempt (remove in production)
-        exception_println!("Syscall #{} from EL0 - returning ENOSYS", syscall_num);
+        syscall::handle_syscall(ctx, syscall_num);
     } else if ctx.is_data_abort() {
         exception_println!();
         exception_println!("USER DATA ABORT!");
@@ -259,16 +270,26 @@ extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
 }
 
 #[no_mangle]
-extern "C" fn handle_el0_irq(_ctx: &mut ExceptionContext, _exc_type: u64) {
-    // Same handler as EL1 IRQ for now
-    exception_println!();
-    exception_println!("!!! USER IRQ - NOT IMPLEMENTED !!!");
-    exception_println!("GIC driver required for interrupt handling");
-    exception_println!();
+extern "C" fn handle_el0_irq(ctx: &mut ExceptionContext, _exc_type: u64) {
+    // Handle IRQ same as EL1 (timer tick may trigger reschedule)
+    let irq = gic::acknowledge();
 
-    loop {
-        core::hint::spin_loop();
+    if irq == IRQ_SPURIOUS {
+        return;
     }
+
+    if irq == TIMER_IRQ {
+        timer::acknowledge_and_reset();
+
+        // Check if we need to reschedule
+        if sched::tick() {
+            unsafe { sched::context_switch(ctx); }
+        }
+    } else {
+        exception_println!("Unhandled IRQ: {}", irq);
+    }
+
+    gic::end_of_interrupt(irq);
 }
 
 #[no_mangle]

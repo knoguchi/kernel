@@ -9,6 +9,7 @@ fn main() {
     let asm_files = [
         ("src/boot.s", "boot.o"),
         ("src/exception/vectors.s", "vectors.o"),
+        ("src/sched/switch.s", "switch.o"),
     ];
 
     let mut object_files = Vec::new();

@@ -8,6 +8,10 @@ use spin::Mutex;
 
 mod exception;
 mod mm;
+mod gic;
+mod timer;
+mod sched;
+mod syscall;
 
 // Memory intrinsics required by compiler
 #[no_mangle]
@@ -218,16 +222,71 @@ pub extern "C" fn kernel_main() -> ! {
     println!("Exception handling ready!");
     println!();
 
-    // Uncomment to test exception handling:
-    // println!("Testing exception handler with null pointer access...");
-    // unsafe { core::ptr::read_volatile(0 as *const u8); }
+    // Initialize GIC
+    println!("Initializing GIC...");
+    unsafe { gic::init(); }
+    println!("  GICD at {:#010x}, GICC at {:#010x}", 0x0800_0000u32, 0x0801_0000u32);
+    println!();
 
-    println!("TODO:");
-    println!("  - IPC");
-    println!("  - Scheduler");
+    // Initialize timer
+    println!("Initializing timer...");
+    unsafe { timer::init(); }
+    println!("  Frequency: {} Hz", timer::frequency());
+    println!("  Tick interval: 10ms");
+    println!();
 
+    // Enable timer IRQ in GIC
+    gic::enable_irq(gic::TIMER_IRQ);
+
+    // Initialize scheduler
+    println!("Initializing scheduler...");
+    unsafe { sched::init(); }
+    println!("  Created idle task (id=0)");
+
+    // Create test tasks
+    if let Some(id) = sched::create_task("task_a", task_a) {
+        println!("  Created task_a (id={})", id.0);
+    }
+    if let Some(id) = sched::create_task("task_b", task_b) {
+        println!("  Created task_b (id={})", id.0);
+    }
+    println!();
+
+    // Start timer (10ms tick)
+    timer::start(10);
+
+    // Start scheduler and enable interrupts
+    println!("Starting scheduler...");
+    sched::start();
+
+    // This is now the "idle task" - just loop waiting for interrupts
+    // Timer interrupts will preemptively switch to other tasks
     loop {
-        core::hint::spin_loop();
+        unsafe {
+            core::arch::asm!("wfi", options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// Test task A - prints 'A' repeatedly
+fn task_a() {
+    loop {
+        print!("A");
+        // Small delay
+        for _ in 0..100000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Test task B - prints 'B' repeatedly
+fn task_b() {
+    loop {
+        print!("B");
+        // Small delay
+        for _ in 0..100000 {
+            core::hint::spin_loop();
+        }
     }
 }
 

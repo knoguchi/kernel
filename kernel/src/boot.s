@@ -7,6 +7,12 @@ _start:
     and     x0, x0, #3
     cbnz    x0, park
 
+    // Enable FP/SIMD access (CPACR_EL1.FPEN = 0b11)
+    // The Rust compiler may generate SIMD instructions
+    mov     x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
+
     // Set up stack pointer (stack grows down, place at kernel load address)
     ldr     x0, =_stack_top
     mov     sp, x0

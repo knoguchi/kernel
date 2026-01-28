@@ -1,6 +1,10 @@
 // AArch64 Exception Vector Table for Kenix Microkernel
 // Vector table must be 2KB (0x800) aligned
 // Each entry is 128 bytes (0x80), 16 entries total
+//
+// NOTE: Each vector entry only has 128 bytes, which is not enough for
+// the full save/restore sequence. So each entry just branches to the
+// actual handler code located after the vector table.
 
 // ============================================================================
 // Context save/restore macros
@@ -89,6 +93,7 @@
 
 // ============================================================================
 // Exception Vector Table
+// Each entry is exactly 128 bytes (0x80) and just branches to the handler
 // ============================================================================
 
 .section .text.vectors
@@ -96,116 +101,125 @@
 .global exception_vectors
 exception_vectors:
 
-// ============================================================================
-// Current EL with SP_EL0 (not used - stub handlers)
-// ============================================================================
+// Current EL with SP_EL0 (offset 0x000 - 0x180)
 .balign 0x80
-el1_sp0_sync:
-    b       exception_stub
+    b       exception_stub          // 0x000: Sync
+.balign 0x80
+    b       exception_stub          // 0x080: IRQ
+.balign 0x80
+    b       exception_stub          // 0x100: FIQ
+.balign 0x80
+    b       exception_stub          // 0x180: SError
 
+// Current EL with SP_ELx (offset 0x200 - 0x380)
 .balign 0x80
-el1_sp0_irq:
-    b       exception_stub
+    b       el1_sync_handler        // 0x200: Sync
+.balign 0x80
+    b       el1_irq_handler         // 0x280: IRQ
+.balign 0x80
+    b       el1_fiq_handler         // 0x300: FIQ
+.balign 0x80
+    b       el1_serror_handler      // 0x380: SError
 
+// Lower EL, AArch64 (offset 0x400 - 0x580)
 .balign 0x80
-el1_sp0_fiq:
-    b       exception_stub
+    b       el0_sync_handler        // 0x400: Sync
+.balign 0x80
+    b       el0_irq_handler         // 0x480: IRQ
+.balign 0x80
+    b       el0_fiq_handler         // 0x500: FIQ
+.balign 0x80
+    b       el0_serror_handler      // 0x580: SError
 
+// Lower EL, AArch32 (offset 0x600 - 0x780)
 .balign 0x80
-el1_sp0_serror:
-    b       exception_stub
+    b       exception_stub          // 0x600: Sync
+.balign 0x80
+    b       exception_stub          // 0x680: IRQ
+.balign 0x80
+    b       exception_stub          // 0x700: FIQ
+.balign 0x80
+    b       exception_stub          // 0x780: SError
 
 // ============================================================================
-// Current EL with SP_ELx (kernel exceptions)
+// Actual exception handlers (outside the vector table)
 // ============================================================================
-.balign 0x80
-el1_sync:
+
+.section .text
+
+// switch_context_and_restore: Called from Rust context_switch
+// x0 = new SP (pointing to the new task's ExceptionContext)
+// This function does NOT return - it switches stack and does ERET
+.global switch_context_and_restore
+switch_context_and_restore:
+    mov     sp, x0
+    RESTORE_CONTEXT
+    // RESTORE_CONTEXT ends with ERET, so we never return
+
+// EL1 Sync handler
+el1_sync_handler:
     SAVE_CONTEXT
     mov     x0, sp              // ctx pointer
     mov     x1, #0              // exception type: sync
     bl      handle_el1_sync
     RESTORE_CONTEXT
 
-.balign 0x80
-el1_irq:
+// EL1 IRQ handler
+el1_irq_handler:
     SAVE_CONTEXT
     mov     x0, sp
     mov     x1, #1              // exception type: irq
     bl      handle_el1_irq
     RESTORE_CONTEXT
 
-.balign 0x80
-el1_fiq:
+// EL1 FIQ handler
+el1_fiq_handler:
     SAVE_CONTEXT
     mov     x0, sp
     mov     x1, #2              // exception type: fiq
     bl      handle_el1_fiq
     RESTORE_CONTEXT
 
-.balign 0x80
-el1_serror:
+// EL1 SError handler
+el1_serror_handler:
     SAVE_CONTEXT
     mov     x0, sp
     mov     x1, #3              // exception type: serror
     bl      handle_el1_serror
     RESTORE_CONTEXT
 
-// ============================================================================
-// Lower EL, AArch64 (userspace exceptions)
-// ============================================================================
-.balign 0x80
-el0_sync:
+// EL0 Sync handler
+el0_sync_handler:
     SAVE_CONTEXT
     mov     x0, sp
     mov     x1, #0              // exception type: sync
     bl      handle_el0_sync
     RESTORE_CONTEXT
 
-.balign 0x80
-el0_irq:
+// EL0 IRQ handler
+el0_irq_handler:
     SAVE_CONTEXT
     mov     x0, sp
     mov     x1, #1              // exception type: irq
     bl      handle_el0_irq
     RESTORE_CONTEXT
 
-.balign 0x80
-el0_fiq:
+// EL0 FIQ handler
+el0_fiq_handler:
     SAVE_CONTEXT
     mov     x0, sp
     mov     x1, #2              // exception type: fiq
     bl      handle_el0_fiq
     RESTORE_CONTEXT
 
-.balign 0x80
-el0_serror:
+// EL0 SError handler
+el0_serror_handler:
     SAVE_CONTEXT
     mov     x0, sp
     mov     x1, #3              // exception type: serror
     bl      handle_el0_serror
     RESTORE_CONTEXT
 
-// ============================================================================
-// Lower EL, AArch32 (not used - stub handlers)
-// ============================================================================
-.balign 0x80
-el0_32_sync:
-    b       exception_stub
-
-.balign 0x80
-el0_32_irq:
-    b       exception_stub
-
-.balign 0x80
-el0_32_fiq:
-    b       exception_stub
-
-.balign 0x80
-el0_32_serror:
-    b       exception_stub
-
-// ============================================================================
-// Stub handler for unused vectors
-// ============================================================================
+// Stub for unused vectors
 exception_stub:
     b       exception_stub      // Infinite loop
