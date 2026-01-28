@@ -1,0 +1,8 @@
+[package]
+name = "kenix-boot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uefi = { version = "0.32", features = ["alloc", "logger", "panic_handler", "global_allocator"] }
+log = "0.4"

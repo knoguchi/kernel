@@ -1,0 +1,317 @@
+# Kenix - a kernel in Rust
+
+## Day 0
+# Goal
+- UEFI boot
+- micro kernel
+- BSD-style design
+
+# Target
+- QEMU virt (AArch64)
+- Raspberry Pi (future)
+
+# Project tree
+- boot/    - UEFI bootloader (future)
+- kernel/  - microkernel core
+
+---
+
+## Background: UEFI and Boot Process
+
+### What is UEFI?
+UEFI (Unified Extensible Firmware Interface) is the modern replacement for
+legacy BIOS. It provides:
+- Pre-boot environment with drivers and services
+- Support for GPT partitioning (>2TB disks)
+- Secure Boot capability
+- Architecture-independent boot process
+
+### UEFI Firmware for QEMU
+For QEMU AArch64, UEFI firmware comes from the EDK2 (EFI Development Kit 2)
+project, an open-source reference implementation:
+- Project: https://github.com/tianocore/edk2
+- Pre-built: `QEMU_EFI.fd` for AArch64
+- Download: https://releases.linaro.org/components/kernel/uefi-linaro/
+
+UEFI firmware is NOT part of QEMU itself - it must be provided separately.
+
+### Boot Sequence Options
+
+**Option 1: UEFI Boot (via EFI application)**
+```
+Power On
+    ↓
+QEMU loads QEMU_EFI.fd firmware
+    ↓
+UEFI initializes hardware, memory map
+    ↓
+UEFI searches ESP (EFI System Partition) for bootloader
+    ↓
+Bootloader (PE/COFF format) loads kernel
+    ↓
+Kernel receives memory map, framebuffer info via boot services
+    ↓
+Kernel calls ExitBootServices(), takes control
+```
+
+**Option 2: Direct Kernel Load (current approach)**
+```
+Power On
+    ↓
+QEMU's -kernel flag loads ELF directly to 0x40080000
+    ↓
+CPU jumps to _start (entry point from ELF header)
+    ↓
+boot.s: sets up stack, clears BSS
+    ↓
+boot.s: calls kernel_main()
+```
+
+We use Option 2 for development - faster iteration, no bootloader needed.
+
+### Binary Formats
+- **UEFI applications**: PE/COFF format (Windows executable format)
+- **Bare-metal kernels**: ELF format (standard for Unix-like systems)
+- Mach-O (macOS format) is NOT supported by UEFI or QEMU -kernel
+
+---
+
+## QEMU virt Machine Physical Memory Map
+
+```
+Address Range              Size      Description
+─────────────────────────────────────────────────────────
+0x0000_0000 - 0x0800_0000  128 MB    Flash (firmware)
+0x0800_0000 - 0x0900_0000   16 MB    Reserved
+0x0900_0000 - 0x0900_1000    4 KB    PL011 UART (serial console)
+0x0901_0000 - 0x0902_0000   64 KB    RTC (Real Time Clock)
+0x0a00_0000 - 0x0b00_0000   16 MB    Platform devices
+0x0c00_0000 - 0x0e00_0000   32 MB    Secure RAM
+0x1000_0000 - 0x2000_0000  256 MB    PCIe MMIO
+0x4000_0000 - 0x8000_0000    1 GB    RAM (configurable via -m)
+─────────────────────────────────────────────────────────
+
+Within RAM:
+0x4000_0000                          RAM start
+0x4008_0000                          Kernel load address (-kernel)
+0x4008_XXXX                          Kernel code + data
+0x400X_XXXX                          __kernel_end (from linker)
+    ... free physical memory ...
+0x8000_0000                          RAM end (with -m 1G)
+```
+
+### PL011 UART Registers (at 0x0900_0000)
+```
+Offset    Register    Description
+──────────────────────────────────
+0x000     DR          Data Register (read/write chars)
+0x018     FR          Flag Register (TX full, RX empty)
+0x030     CR          Control Register (enable TX/RX)
+```
+
+Note: Raspberry Pi uses different UART base addresses:
+- RPi 3/4: 0x3F201000 (BCM2837) or 0xFE201000 (BCM2711)
+
+---
+
+## Why Rust for Kernel Development?
+
+Rust is uniquely suited for operating system development, providing C-level
+control with modern safety guarantees.
+
+### Low-Level Capabilities
+
+**1. No Standard Library (`#![no_std]`)**
+Rust can run without any runtime or standard library:
+```rust
+#![no_std]
+#![no_main]
+```
+This means no heap allocator, no threads, no I/O - just raw machine access.
+
+**2. Direct Memory Access**
+Rust can read/write any memory address via raw pointers:
+```rust
+// Write to UART data register
+unsafe {
+    core::ptr::write_volatile(0x0900_0000 as *mut u8, b'H');
+}
+
+// Read from hardware register
+let flags = unsafe {
+    core::ptr::read_volatile(0x0900_0018 as *const u32)
+};
+```
+
+**3. Inline Assembly**
+Full control over CPU instructions when needed:
+```rust
+use core::arch::asm;
+
+// Read CPU register
+let mpidr: u64;
+unsafe {
+    asm!("mrs {}, mpidr_el1", out(reg) mpidr);
+}
+
+// Memory barrier
+unsafe {
+    asm!("dmb sy");
+}
+```
+
+**4. Custom Entry Points**
+Replace the default entry point with your own:
+```rust
+#[no_mangle]
+pub extern "C" fn kernel_main() -> ! {
+    // Kernel code here
+    loop {}
+}
+```
+
+**5. Linker Control**
+Custom linker scripts define memory layout:
+```ld
+SECTIONS {
+    . = 0x40080000;     /* Load address */
+    .text : { *(.text*) }
+    .rodata : { *(.rodata*) }
+    .data : { *(.data*) }
+    .bss : {
+        __bss_start = .;
+        *(.bss*)
+        __bss_end = .;
+    }
+}
+```
+
+**6. Memory Intrinsics**
+Provide implementations that the compiler expects:
+```rust
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+    for i in 0..n {
+        *dest.add(i) = c as u8;
+    }
+    dest
+}
+```
+
+### Safety vs Performance
+
+Rust's `unsafe` blocks let you opt out of safety checks when needed:
+- Safe Rust: Compiler enforces memory safety
+- Unsafe Rust: Direct hardware access, raw pointers, FFI
+
+The key insight: most kernel code CAN be safe Rust. Only hardware interfaces
+and critical data structures need `unsafe`.
+
+### Toolchain Setup
+
+For bare-metal AArch64:
+```toml
+# rust-toolchain.toml
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview"]
+targets = ["aarch64-unknown-none"]
+```
+
+The `aarch64-unknown-none` target:
+- No OS (`none`)
+- No standard library
+- Generates pure AArch64 code
+
+---
+
+## Running the Kernel
+
+### Build
+```bash
+cargo build --release
+# Creates target/aarch64-unknown-none/release/kernel
+```
+
+### Run with QEMU
+```bash
+qemu-system-aarch64 \
+    -M virt \
+    -cpu cortex-a72 \
+    -m 1G \
+    -kernel kernel.elf \
+    -serial stdio \
+    -display none
+```
+
+Flags explained:
+- `-M virt` - QEMU's generic ARM virtual machine
+- `-cpu cortex-a72` - ARMv8-A 64-bit CPU
+- `-m 1G` - 1GB RAM
+- `-kernel` - Load ELF directly (no bootloader)
+- `-serial stdio` - UART output to terminal
+
+### Day 0 Output
+```
+❯ qemu-system-aarch64 -M virt -cpu cortex-a72 -m 1G -kernel kernel.elf -serial stdio
+
+=================================
+  Kenix Microkernel v0.1.0
+  AArch64 / QEMU virt
+=================================
+
+Kernel started successfully!
+```
+
+At this point: kernel boots, prints to UART, and enters infinite loop. No
+memory management, no interrupts, no processes - just proof that the
+toolchain works.
+
+---
+
+## Day 1 - Physical Memory Allocator
+
+Implemented bitmap-based physical page frame allocator.
+
+### Design
+- Page size: 4KB
+- 1GB RAM = 262,144 pages = 32KB bitmap
+- O(1) free count via `used_count` tracking
+- `next_free` hint for fast allocation
+
+### Files added
+- `kernel/src/mm/mod.rs` - module interface
+- `kernel/src/mm/frame.rs` - frame allocator implementation
+- `kernel/src/boot.s` - assembly startup (stack, BSS clear)
+- `kernel/build.rs` - compiles boot assembly
+- `kernel/linker.ld` - added `__kernel_end` symbol, 64KB stack
+
+### Challenges
+- Bare-metal AArch64 required MMIO writes as sync points to prevent
+  compiler optimization issues with static mut access
+- Had to provide `memset`/`memcpy` intrinsics for no_std environment
+- PL011 UART needed explicit enable before use
+
+### Output
+```
+Initializing physical memory allocator...
+  Memory: 0x40000000 - 0x80000000 (1024 MB)
+  Kernel ends at: 0x4009f000
+......  Total pages: 262144
+  Free pages: 261985
+
+Allocating test frames...
+  Frame 0: 0x4009f000
+  Frame 1: 0x400a0000
+  Frame 2: 0x400a1000
+
+Freeing test frames...
+  Free pages after freeing: 261985
+
+Physical memory allocator ready!
+```
+
+### Next
+- Virtual memory / paging
+- IPC
+- Scheduler

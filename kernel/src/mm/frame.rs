@@ -1,0 +1,204 @@
+/// Page size: 4KB
+pub const PAGE_SIZE: usize = 4096;
+
+/// Maximum number of pages (1GB / 4KB = 262144)
+const MAX_PAGES: usize = 262144;
+
+/// Bitmap size in bytes (262144 / 8 = 32768 = 32KB)
+const BITMAP_SIZE: usize = MAX_PAGES / 8;
+
+/// Physical address newtype wrapper
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysAddr(pub usize);
+
+impl PhysAddr {
+    pub const fn new(addr: usize) -> Self {
+        Self(addr)
+    }
+
+    pub const fn as_usize(&self) -> usize {
+        self.0
+    }
+}
+
+/// Bitmap-based physical frame allocator
+pub struct FrameAllocator {
+    bitmap: [u8; BITMAP_SIZE],
+    memory_start: usize,
+    memory_end: usize,
+    next_free: usize,
+    used_count: usize,
+    initialized: bool,
+}
+
+impl FrameAllocator {
+    /// Create a new uninitialized frame allocator
+    pub const fn new() -> Self {
+        Self {
+            bitmap: [0; BITMAP_SIZE],
+            memory_start: 0,
+            memory_end: 0,
+            next_free: 0,
+            used_count: 0,
+            initialized: false,
+        }
+    }
+
+
+    /// Allocate a single physical frame
+    pub fn alloc(&mut self) -> Option<PhysAddr> {
+        if !self.initialized {
+            return None;
+        }
+
+        let total_pages = (self.memory_end - self.memory_start) / PAGE_SIZE;
+
+        // Start searching from next_free hint
+        for i in self.next_free..total_pages {
+            if !self.get_bit(i) {
+                self.set_bit(i, true);
+                self.next_free = i + 1;
+                self.used_count += 1;
+                return Some(PhysAddr::new(self.memory_start + i * PAGE_SIZE));
+            }
+        }
+
+        // Wrap around and search from beginning
+        for i in 0..self.next_free {
+            if !self.get_bit(i) {
+                self.set_bit(i, true);
+                self.next_free = i + 1;
+                self.used_count += 1;
+                return Some(PhysAddr::new(self.memory_start + i * PAGE_SIZE));
+            }
+        }
+
+        None // Out of memory
+    }
+
+    /// Free a physical frame
+    pub fn free(&mut self, addr: PhysAddr) {
+        if !self.initialized {
+            return;
+        }
+
+        let addr = addr.as_usize();
+        if addr < self.memory_start || addr >= self.memory_end {
+            return; // Invalid address
+        }
+
+        let page_index = (addr - self.memory_start) / PAGE_SIZE;
+
+        // Only decrement if page was actually allocated
+        if self.get_bit(page_index) {
+            self.set_bit(page_index, false);
+            self.used_count -= 1;
+        }
+
+        // Update hint if this freed page is before current hint
+        if page_index < self.next_free {
+            self.next_free = page_index;
+        }
+    }
+
+    /// Get the number of free pages (O(1))
+    pub fn free_count(&self) -> usize {
+        if !self.initialized {
+            return 0;
+        }
+        self.total_pages() - self.used_count
+    }
+
+    /// Get total number of pages
+    pub fn total_pages(&self) -> usize {
+        if !self.initialized {
+            return 0;
+        }
+        (self.memory_end - self.memory_start) / PAGE_SIZE
+    }
+
+    /// Get a bit from the bitmap (true = allocated)
+    fn get_bit(&self, index: usize) -> bool {
+        let byte_index = index / 8;
+        let bit_offset = index % 8;
+        (self.bitmap[byte_index] & (1 << bit_offset)) != 0
+    }
+
+    /// Set a bit in the bitmap
+    fn set_bit(&mut self, index: usize, value: bool) {
+        let byte_index = index / 8;
+        let bit_offset = index % 8;
+        if value {
+            self.bitmap[byte_index] |= 1 << bit_offset;
+        } else {
+            self.bitmap[byte_index] &= !(1 << bit_offset);
+        }
+    }
+}
+
+/// Global frame allocator instance
+/// Safety: Single-core during boot, no locking needed yet
+static mut ALLOCATOR: FrameAllocator = FrameAllocator::new();
+
+/// Sync point using MMIO write
+/// Required to prevent optimization issues on bare-metal AArch64
+#[inline(never)]
+fn sync_point() {
+    // Write a character to UART - acts as memory sync point
+    unsafe {
+        core::ptr::write_volatile(0x0900_0030 as *mut u32, 0x101);
+        core::ptr::write_volatile(0x0900_0000 as *mut u8, b'.');
+    }
+}
+
+/// Initialize the global allocator directly
+#[inline(never)]
+pub fn init_allocator(memory_start: usize, memory_end: usize, kernel_end: usize) {
+    sync_point(); // 1
+
+    // Work directly with the static via raw pointer
+    let alloc_ptr = core::ptr::addr_of_mut!(ALLOCATOR);
+    sync_point(); // 2
+
+    unsafe {
+        (*alloc_ptr).memory_start = memory_start;
+        sync_point(); // 3
+        (*alloc_ptr).memory_end = memory_end;
+        sync_point(); // 4
+
+        // Calculate how many pages the kernel occupies
+        let kernel_pages = (kernel_end - memory_start + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        // Mark kernel pages as allocated - set full bytes when possible
+        let full_bytes = kernel_pages / 8;
+        for i in 0..full_bytes {
+            (*alloc_ptr).bitmap[i] = 0xFF;
+        }
+        sync_point();
+
+        (*alloc_ptr).next_free = kernel_pages;
+        (*alloc_ptr).used_count = kernel_pages;
+        (*alloc_ptr).initialized = true;
+        sync_point();
+    }
+}
+
+/// Allocate a frame from the global allocator
+pub fn alloc_frame() -> Option<PhysAddr> {
+    unsafe { ALLOCATOR.alloc() }
+}
+
+/// Free a frame to the global allocator
+pub fn free_frame(addr: PhysAddr) {
+    unsafe { ALLOCATOR.free(addr) }
+}
+
+/// Get total pages
+pub fn total_pages() -> usize {
+    unsafe { ALLOCATOR.total_pages() }
+}
+
+/// Get free pages count
+pub fn free_pages() -> usize {
+    unsafe { ALLOCATOR.free_count() }
+}
