@@ -197,8 +197,20 @@ pub extern "C" fn kernel_main() -> ! {
     println!();
     println!("Physical memory allocator ready!");
     println!();
+
+    // Enable MMU with identity mapping
+    println!("Enabling MMU...");
+    unsafe {
+        mm::enable_mmu(|msg, addr| {
+            println!("{}{:#010x}", msg, addr);
+        });
+    }
+    println!("MMU enabled - identity mapping active");
+    println!("  UART: Device-nGnRnE");
+    println!("  RAM: Normal Write-Back cacheable");
+    println!();
+
     println!("TODO:");
-    println!("  - Virtual memory / paging");
     println!("  - IPC");
     println!("  - Scheduler");
 
