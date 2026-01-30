@@ -54,20 +54,34 @@ pub const SYS_IRQ_WAIT: u16 = 31;      // Wait for IRQ to fire
 pub const SYS_IRQ_ACK: u16 = 32;       // Acknowledge IRQ
 
 /// Syscall numbers - POSIX-compatible file I/O
+pub const SYS_DUP: u16 = 23;     // Duplicate file descriptor
+pub const SYS_DUP3: u16 = 24;    // Duplicate fd to specific number (dup2 equivalent)
+pub const SYS_CHDIR: u16 = 49;   // Change working directory
+pub const SYS_GETCWD: u16 = 17;  // Get current working directory
+pub const SYS_OPENAT: u16 = 56;  // Open file relative to directory fd
 pub const SYS_CLOSE: u16 = 57;   // Close file descriptor
 pub const SYS_PIPE: u16 = 59;    // Create pipe
+pub const SYS_GETDENTS64: u16 = 61;  // Get directory entries
 pub const SYS_READ: u16 = 63;    // Read from file descriptor
 pub const SYS_WRITE: u16 = 64;   // Write to file descriptor
+pub const SYS_FSTAT: u16 = 80;   // Get file status
 pub const SYS_EXIT: u16 = 93;    // Terminate process
+pub const SYS_WAIT4: u16 = 260;  // Wait for child process
+pub const SYS_BRK: u16 = 214;    // Change data segment size
 
 /// Error codes (Linux-compatible)
 pub const ESUCCESS: i64 = 0;   // Success
+pub const ENOENT: i64 = -2;    // No such file or directory
+pub const ECHILD: i64 = -10;   // No child processes
 pub const EAGAIN: i64 = -11;   // Resource temporarily unavailable
 pub const ENOMEM: i64 = -12;   // Out of memory
 pub const EBADF: i64 = -9;     // Bad file descriptor
 pub const EFAULT: i64 = -14;   // Bad address
+pub const ENOTDIR: i64 = -20;  // Not a directory
 pub const EINVAL: i64 = -22;   // Invalid argument
+pub const EMFILE: i64 = -24;   // Too many open files
 pub const ENOSYS: i64 = -38;   // Function not implemented
+pub const ENAMETOOLONG: i64 = -36;  // File name too long
 
 /// Handle a system call
 ///
@@ -194,6 +208,71 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         SYS_CLOSE => {
             let fd = ctx.gpr[0] as usize;
             ctx.gpr[0] = sys_close(ctx, fd) as u64;
+        }
+
+        // SYS_DUP: x0=oldfd → returns new_fd in x0
+        SYS_DUP => {
+            let oldfd = ctx.gpr[0] as usize;
+            ctx.gpr[0] = sys_dup(oldfd) as u64;
+        }
+
+        // SYS_DUP3: x0=oldfd, x1=newfd, x2=flags → returns new_fd in x0
+        SYS_DUP3 => {
+            let oldfd = ctx.gpr[0] as usize;
+            let newfd = ctx.gpr[1] as usize;
+            let _flags = ctx.gpr[2] as u32;  // O_CLOEXEC not implemented yet
+            ctx.gpr[0] = sys_dup2(oldfd, newfd) as u64;
+        }
+
+        // SYS_OPENAT: x0=dirfd, x1=pathname, x2=flags, x3=mode → returns fd in x0
+        SYS_OPENAT => {
+            let _dirfd = ctx.gpr[0] as i32;  // AT_FDCWD = -100
+            let pathname = ctx.gpr[1] as usize;
+            let flags = ctx.gpr[2] as u32;
+            let _mode = ctx.gpr[3] as u32;
+            ctx.gpr[0] = sys_open(ctx, pathname, flags) as u64;
+        }
+
+        // SYS_GETCWD: x0=buf, x1=size → returns buf address or error
+        SYS_GETCWD => {
+            let buf = ctx.gpr[0] as usize;
+            let size = ctx.gpr[1] as usize;
+            ctx.gpr[0] = sys_getcwd(buf, size) as u64;
+        }
+
+        // SYS_CHDIR: x0=path → returns 0 or error
+        SYS_CHDIR => {
+            let path = ctx.gpr[0] as usize;
+            ctx.gpr[0] = sys_chdir(path) as u64;
+        }
+
+        // SYS_FSTAT: x0=fd, x1=statbuf → returns 0 or error
+        SYS_FSTAT => {
+            let fd = ctx.gpr[0] as usize;
+            let statbuf = ctx.gpr[1] as usize;
+            ctx.gpr[0] = sys_fstat(ctx, fd, statbuf) as u64;
+        }
+
+        // SYS_GETDENTS64: x0=fd, x1=dirent_buf, x2=count → returns bytes read
+        SYS_GETDENTS64 => {
+            let fd = ctx.gpr[0] as usize;
+            let buf = ctx.gpr[1] as usize;
+            let count = ctx.gpr[2] as usize;
+            ctx.gpr[0] = sys_getdents64(ctx, fd, buf, count) as u64;
+        }
+
+        // SYS_WAIT4: x0=pid, x1=wstatus, x2=options, x3=rusage → returns pid or error
+        SYS_WAIT4 => {
+            let pid = ctx.gpr[0] as i32;
+            let wstatus = ctx.gpr[1] as usize;
+            let options = ctx.gpr[2] as u32;
+            ctx.gpr[0] = sys_wait4(ctx, pid, wstatus, options) as u64;
+        }
+
+        // SYS_BRK: x0=addr → returns new brk or current brk
+        SYS_BRK => {
+            let addr = ctx.gpr[0] as usize;
+            ctx.gpr[0] = sys_brk(addr) as u64;
         }
 
         // SYS_PIPE: returns read_fd in x0, write_fd in x1
@@ -731,5 +810,514 @@ fn sys_wait_notify(ctx: &mut ExceptionContext, expected_bits: u64) -> i64 {
         task.notify_pending &= !matched;
         task.notify_waiting = 0;
         matched as i64
+    }
+}
+
+// ============================================================================
+// New POSIX-compatible syscalls
+// ============================================================================
+
+/// SYS_DUP - Duplicate a file descriptor
+///
+/// Returns the lowest available fd number that is a copy of oldfd.
+fn sys_dup(oldfd: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EBADF,
+    };
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // Validate oldfd
+        if oldfd >= sched::MAX_FDS || task.fds[oldfd].kind == FdKind::None {
+            return EBADF;
+        }
+
+        // Find lowest available fd
+        let newfd = match task.alloc_fd() {
+            Some(fd) => fd,
+            None => return EMFILE,
+        };
+
+        // Copy the fd entry
+        task.fds[newfd] = task.fds[oldfd];
+
+        newfd as i64
+    }
+}
+
+/// SYS_DUP2/DUP3 - Duplicate a file descriptor to a specific number
+///
+/// If newfd is already open, it is closed first.
+fn sys_dup2(oldfd: usize, newfd: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EBADF,
+    };
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // Validate oldfd
+        if oldfd >= sched::MAX_FDS || task.fds[oldfd].kind == FdKind::None {
+            return EBADF;
+        }
+
+        // Validate newfd range
+        if newfd >= sched::MAX_FDS {
+            return EBADF;
+        }
+
+        // If oldfd == newfd, just return newfd
+        if oldfd == newfd {
+            return newfd as i64;
+        }
+
+        // Close newfd if it's open (silently ignore errors)
+        if task.fds[newfd].kind != FdKind::None {
+            task.fds[newfd] = FileDescriptor::empty();
+        }
+
+        // Copy the fd entry
+        task.fds[newfd] = task.fds[oldfd];
+
+        newfd as i64
+    }
+}
+
+/// VFS server task ID
+const VFS_TID: TaskId = TaskId(3);
+
+/// VFS IPC message tags
+const VFS_OPEN: u64 = 100;
+const VFS_STAT: u64 = 104;
+const VFS_READDIR: u64 = 105;
+
+/// Open flags (Linux-compatible)
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_RDWR: u32 = 2;
+pub const O_CREAT: u32 = 0o100;
+pub const O_TRUNC: u32 = 0o1000;
+pub const O_APPEND: u32 = 0o2000;
+pub const O_DIRECTORY: u32 = 0o200000;
+
+/// Pending syscall variants for VFS operations
+#[derive(Debug, Clone, Copy)]
+pub enum PendingVfsSyscall {
+    None,
+    Open { flags: u32 },
+    Stat { statbuf: usize },
+    Getdents { buf: usize, count: usize },
+}
+
+/// SYS_OPENAT - Open a file
+///
+/// Opens a file and returns a file descriptor.
+fn sys_open(ctx: &mut ExceptionContext, pathname: usize, flags: u32) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EBADF,
+    };
+
+    // Read pathname from user memory (max 255 chars)
+    let path_bytes = unsafe {
+        let mut len = 0;
+        while len < 255 {
+            let c = core::ptr::read_volatile((pathname + len) as *const u8);
+            if c == 0 {
+                break;
+            }
+            len += 1;
+        }
+        core::slice::from_raw_parts(pathname as *const u8, len)
+    };
+
+    if path_bytes.is_empty() {
+        return ENOENT;
+    }
+
+    // Allocate fd first (before IPC)
+    let fd = unsafe {
+        let task = &mut TASKS[current_id.0];
+        match task.alloc_fd() {
+            Some(fd) => fd,
+            None => return EMFILE,
+        }
+    };
+
+    // Create SHM for path transfer
+    let shm_id_i64 = shm::sys_shmcreate(256);
+    if shm_id_i64 < 0 {
+        return ENOMEM;
+    }
+    let shm_id = shm_id_i64 as usize;
+
+    // Map SHM and copy path
+    let shm_addr = shm::sys_shmmap(shm_id, 0);
+    if shm_addr < 0 {
+        return ENOMEM;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            shm_addr as *mut u8,
+            path_bytes.len(),
+        );
+        // Null-terminate
+        core::ptr::write_volatile((shm_addr as usize + path_bytes.len()) as *mut u8, 0);
+    }
+
+    // Grant VFS access
+    shm::sys_shmgrant(shm_id, VFS_TID.0);
+
+    // Set up pending syscall
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::VfsOpen {
+            fd,
+            flags,
+            shm_id,
+        };
+    }
+
+    // Send VFS_OPEN request
+    // data[0] = shm_id, data[1] = path_len, data[2] = flags
+    let msg = Message::new(VFS_OPEN, [shm_id as u64, path_bytes.len() as u64, flags as u64, 0]);
+    ipc::sys_call(ctx, VFS_TID, msg);
+
+    0 // Placeholder - actual return set by complete_pending_syscall
+}
+
+/// SYS_GETCWD - Get current working directory
+fn sys_getcwd(buf: usize, size: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EFAULT,
+    };
+
+    if size == 0 {
+        return EINVAL;
+    }
+
+    unsafe {
+        let task = &TASKS[current_id.0];
+
+        // Find cwd length
+        let mut cwd_len = 0;
+        while cwd_len < sched::MAX_PATH_LEN && task.cwd[cwd_len] != 0 {
+            cwd_len += 1;
+        }
+
+        // Check buffer size (need space for null terminator)
+        if size <= cwd_len {
+            return ENAMETOOLONG;
+        }
+
+        // Copy to user buffer
+        core::ptr::copy_nonoverlapping(
+            task.cwd.as_ptr(),
+            buf as *mut u8,
+            cwd_len + 1, // Include null terminator
+        );
+
+        buf as i64
+    }
+}
+
+/// SYS_CHDIR - Change current working directory
+fn sys_chdir(path: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EFAULT,
+    };
+
+    // Read path from user memory
+    let mut path_len = 0;
+    unsafe {
+        while path_len < sched::MAX_PATH_LEN - 1 {
+            let c = core::ptr::read_volatile((path + path_len) as *const u8);
+            if c == 0 {
+                break;
+            }
+            path_len += 1;
+        }
+    }
+
+    if path_len == 0 {
+        return ENOENT;
+    }
+
+    // For now, just update cwd without validating the path exists
+    // A proper implementation would call VFS to verify the directory
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // Copy new path
+        core::ptr::copy_nonoverlapping(
+            path as *const u8,
+            task.cwd.as_mut_ptr(),
+            path_len,
+        );
+        task.cwd[path_len] = 0; // Null-terminate
+    }
+
+    ESUCCESS
+}
+
+/// Linux stat structure (simplified for AArch64)
+#[repr(C)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub __pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
+    pub __pad2: i32,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __unused: [i32; 2],
+}
+
+/// File type bits for st_mode
+pub const S_IFMT: u32 = 0o170000;   // File type mask
+pub const S_IFDIR: u32 = 0o040000;  // Directory
+pub const S_IFREG: u32 = 0o100000;  // Regular file
+
+/// SYS_FSTAT - Get file status
+fn sys_fstat(ctx: &mut ExceptionContext, fd: usize, statbuf: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EBADF,
+    };
+
+    // Validate fd
+    let fd_entry = unsafe {
+        let task = &TASKS[current_id.0];
+        if fd >= sched::MAX_FDS || task.fds[fd].kind == FdKind::None {
+            return EBADF;
+        }
+        task.fds[fd]
+    };
+
+    // For console fds, return a simple stat
+    if fd_entry.kind == FdKind::Console {
+        unsafe {
+            let stat = statbuf as *mut Stat;
+            (*stat) = core::mem::zeroed();
+            (*stat).st_mode = 0o020666; // Character device
+            (*stat).st_blksize = 4096;
+        }
+        return ESUCCESS;
+    }
+
+    // For pipes
+    if fd_entry.kind == FdKind::PipeRead || fd_entry.kind == FdKind::PipeWrite {
+        unsafe {
+            let stat = statbuf as *mut Stat;
+            (*stat) = core::mem::zeroed();
+            (*stat).st_mode = 0o010666; // FIFO/pipe
+            (*stat).st_blksize = 4096;
+        }
+        return ESUCCESS;
+    }
+
+    // For VFS files, send IPC to VFS
+    // Set up pending syscall
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::VfsStat { statbuf };
+    }
+
+    // Send VFS_STAT request with vnode handle
+    let msg = Message::new(VFS_STAT, [fd_entry.handle, 0, 0, 0]);
+    ipc::sys_call(ctx, VFS_TID, msg);
+
+    0 // Placeholder
+}
+
+/// Linux dirent64 structure
+#[repr(C)]
+pub struct Dirent64 {
+    pub d_ino: u64,
+    pub d_off: i64,
+    pub d_reclen: u16,
+    pub d_type: u8,
+    pub d_name: [u8; 256], // Variable length, but we reserve space
+}
+
+/// Directory entry types
+pub const DT_UNKNOWN: u8 = 0;
+pub const DT_REG: u8 = 8;
+pub const DT_DIR: u8 = 4;
+
+/// SYS_GETDENTS64 - Get directory entries
+fn sys_getdents64(ctx: &mut ExceptionContext, fd: usize, buf: usize, count: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EBADF,
+    };
+
+    // Validate fd
+    let fd_entry = unsafe {
+        let task = &TASKS[current_id.0];
+        if fd >= sched::MAX_FDS || task.fds[fd].kind == FdKind::None {
+            return EBADF;
+        }
+        task.fds[fd]
+    };
+
+    // Only works for directories (File kind with directory flag)
+    if fd_entry.kind != FdKind::File {
+        return ENOTDIR;
+    }
+
+    // Create SHM for data transfer
+    let shm_id_i64 = shm::sys_shmcreate(count);
+    if shm_id_i64 < 0 {
+        return ENOMEM;
+    }
+    let shm_id = shm_id_i64 as usize;
+
+    // Grant VFS access
+    shm::sys_shmgrant(shm_id, VFS_TID.0);
+
+    // Set up pending syscall
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::VfsGetdents {
+            buf,
+            count,
+            shm_id,
+        };
+    }
+
+    // Send VFS_READDIR request
+    // data[0] = vnode handle, data[1] = shm_id, data[2] = count
+    let msg = Message::new(VFS_READDIR, [fd_entry.handle, shm_id as u64, count as u64, 0]);
+    ipc::sys_call(ctx, VFS_TID, msg);
+
+    0 // Placeholder
+}
+
+/// Wait options
+pub const WNOHANG: u32 = 1;
+pub const WUNTRACED: u32 = 2;
+
+/// SYS_WAIT4 - Wait for child process
+fn sys_wait4(ctx: &mut ExceptionContext, pid: i32, wstatus: usize, options: u32) -> i64 {
+    use sched::task::MAX_TASKS;
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return ECHILD,
+    };
+
+    unsafe {
+        // Find a terminated child
+        let mut found_child: Option<TaskId> = None;
+        let mut has_children = false;
+
+        for i in 0..MAX_TASKS {
+            let task = &TASKS[i];
+            if task.parent == Some(current_id) {
+                has_children = true;
+
+                // Check if this child matches the pid filter
+                let matches = if pid == -1 {
+                    true // Any child
+                } else if pid > 0 {
+                    i == pid as usize
+                } else {
+                    true // TODO: process groups not implemented
+                };
+
+                if matches && task.state == TaskState::Terminated {
+                    found_child = Some(TaskId(i));
+                    break;
+                }
+            }
+        }
+
+        if !has_children {
+            return ECHILD;
+        }
+
+        if let Some(child_id) = found_child {
+            // Reap the child
+            let child = &mut TASKS[child_id.0];
+            let exit_code = child.exit_code;
+
+            // Write status if pointer provided
+            if wstatus != 0 {
+                // Linux encodes exit code as (code << 8)
+                let status = (exit_code as u32) << 8;
+                core::ptr::write_volatile(wstatus as *mut i32, status as i32);
+            }
+
+            // Free the child task slot
+            child.state = TaskState::Free;
+            child.parent = None;
+
+            return child_id.0 as i64;
+        }
+
+        // No terminated child found
+        if options & WNOHANG != 0 {
+            return 0; // Non-blocking, no child ready
+        }
+
+        // Block waiting for child
+        let task = &mut TASKS[current_id.0];
+        task.state = TaskState::WaitBlocked;
+        sched::context_switch_blocking(ctx);
+
+        // When we wake up, try again (recursive would be cleaner but let's avoid stack growth)
+        // For now, just return ECHILD - proper implementation needs a loop or retry
+        ECHILD
+    }
+}
+
+/// SYS_BRK - Change data segment size
+fn sys_brk(addr: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return ENOMEM,
+    };
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        if addr == 0 {
+            // Query current brk
+            return task.heap_brk as i64;
+        }
+
+        // Don't allow shrinking below the default
+        if addr < sched::DEFAULT_HEAP_START {
+            return task.heap_brk as i64;
+        }
+
+        // Don't allow growing into stack region (2MB)
+        if addr >= 0x0020_0000 {
+            return task.heap_brk as i64;
+        }
+
+        // Update brk
+        // Note: A proper implementation would allocate physical pages and map them
+        // For now we just track the value (memory was already mapped at task creation)
+        task.heap_brk = addr;
+        addr as i64
     }
 }

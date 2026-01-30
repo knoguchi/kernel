@@ -469,6 +469,119 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             // Just return success
             (0, None)
         }
+        PendingSyscall::VfsOpen { fd, flags, shm_id } => {
+            let vnode = reply.tag as i64;
+
+            // Clean up SHM used for path
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            // Check if VFS returned an error
+            if vnode < 0 {
+                // Release the pre-allocated fd
+                let caller_task = &mut TASKS[caller_id.0];
+                caller_task.close_fd(fd);
+                return (vnode, None); // Return the error code
+            }
+
+            // Set up the file descriptor
+            let caller_task = &mut TASKS[caller_id.0];
+            let is_dir = (reply.data[0] & 1) != 0; // VFS tells us if it's a directory
+
+            caller_task.fds[fd] = FileDescriptor {
+                kind: FdKind::File,
+                flags: FdFlags {
+                    readable: (flags & 3) != 1, // Not O_WRONLY
+                    writable: (flags & 3) != 0, // Not O_RDONLY
+                },
+                server: TaskId(3), // VFS_TID
+                handle: vnode as u64,
+            };
+
+            let _ = is_dir; // We track this in handle for now
+            (fd as i64, None)
+        }
+        PendingSyscall::VfsStat { statbuf } => {
+            let result = reply.tag as i64;
+
+            if result == 0 {
+                // VFS returns stat info in reply.data
+                // data[0] = size, data[1] = mode, data[2] = inode
+                let caller_task = &TASKS[caller_id.0];
+                let caller_ttbr0 = caller_task.page_table.0 as u64;
+
+                // Switch to caller's address space to write stat
+                let saved_ttbr0: u64;
+                core::arch::asm!(
+                    "mrs {0}, ttbr0_el1",
+                    "msr ttbr0_el1, {1}",
+                    "isb", "dsb sy", "tlbi vmalle1is", "dsb sy", "isb",
+                    out(reg) saved_ttbr0,
+                    in(reg) caller_ttbr0,
+                );
+
+                // Write minimal stat info
+                let stat_ptr = statbuf as *mut u64;
+                // Zero the whole structure first (128 bytes for stat)
+                for i in 0..16 {
+                    core::ptr::write_volatile(stat_ptr.add(i), 0);
+                }
+                // st_ino at offset 8
+                core::ptr::write_volatile(stat_ptr.add(1), reply.data[2]);
+                // st_mode at offset 16 (u32)
+                core::ptr::write_volatile((statbuf + 16) as *mut u32, reply.data[1] as u32);
+                // st_size at offset 48
+                core::ptr::write_volatile((statbuf + 48) as *mut i64, reply.data[0] as i64);
+                // st_blksize at offset 56
+                core::ptr::write_volatile((statbuf + 56) as *mut i32, 4096);
+
+                // Restore page table
+                core::arch::asm!(
+                    "msr ttbr0_el1, {0}",
+                    "isb", "dsb sy", "tlbi vmalle1is", "dsb sy", "isb",
+                    in(reg) saved_ttbr0,
+                );
+            }
+
+            (result, None)
+        }
+        PendingSyscall::VfsGetdents { buf, count: _, shm_id } => {
+            let bytes_read = reply.tag as i64;
+
+            if bytes_read > 0 {
+                // Copy from SHM to user buffer
+                let shm_phys = shm::get_shm_phys_addr(shm_id);
+                if shm_phys != 0 {
+                    let caller_task = &TASKS[caller_id.0];
+                    let caller_ttbr0 = caller_task.page_table.0 as u64;
+
+                    let saved_ttbr0: u64;
+                    core::arch::asm!(
+                        "mrs {0}, ttbr0_el1",
+                        "msr ttbr0_el1, {1}",
+                        "isb", "dsb sy", "tlbi vmalle1is", "dsb sy", "isb",
+                        out(reg) saved_ttbr0,
+                        in(reg) caller_ttbr0,
+                    );
+
+                    core::ptr::copy_nonoverlapping(
+                        shm_phys as *const u8,
+                        buf as *mut u8,
+                        bytes_read as usize,
+                    );
+
+                    core::arch::asm!(
+                        "msr ttbr0_el1, {0}",
+                        "isb", "dsb sy", "tlbi vmalle1is", "dsb sy", "isb",
+                        in(reg) saved_ttbr0,
+                    );
+                }
+            }
+
+            // Clean up SHM
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            (bytes_read, None)
+        }
     }
 }
 

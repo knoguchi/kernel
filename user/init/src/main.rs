@@ -212,6 +212,89 @@ fn main() -> ! {
     }
 
     // ========================================
+    // Test dup syscall
+    // ========================================
+    print("\n--- Dup Test ---\n");
+
+    // Duplicate stdout
+    let dup_fd = syscall::dup(1);
+    if dup_fd >= 0 {
+        print("dup(1) returned fd ");
+        print_num(dup_fd as usize);
+        print("\n");
+        // Write to duplicated fd
+        syscall::write(dup_fd as usize, b"Hello via dup'd fd!\n");
+        syscall::close(dup_fd as usize);
+    } else {
+        print("dup failed: ");
+        print_num((-dup_fd) as usize);
+        print("\n");
+    }
+
+    // Test dup2 to redirect
+    let dup2_result = syscall::dup2(1, 10);
+    if dup2_result >= 0 {
+        print("dup2(1, 10) returned ");
+        print_num(dup2_result as usize);
+        print("\n");
+        syscall::write(10, b"Hello via fd 10!\n");
+        syscall::close(10);
+    } else {
+        print("dup2 failed: ");
+        print_num((-dup2_result) as usize);
+        print("\n");
+    }
+
+    // ========================================
+    // Test getcwd/chdir
+    // ========================================
+    print("\n--- Cwd Test ---\n");
+
+    let mut cwd_buf = [0u8; 256];
+    let cwd_result = syscall::getcwd(&mut cwd_buf);
+    if cwd_result > 0 {
+        print("getcwd: ");
+        // Find null terminator
+        let len = cwd_buf.iter().position(|&c| c == 0).unwrap_or(cwd_buf.len());
+        syscall::write(1, &cwd_buf[..len]);
+        print("\n");
+    } else {
+        print("getcwd failed\n");
+    }
+
+    // Change to /disk
+    let chdir_result = syscall::chdir(b"/disk\0");
+    if chdir_result == 0 {
+        print("chdir(/disk) succeeded\n");
+
+        // Check new cwd
+        let cwd_result = syscall::getcwd(&mut cwd_buf);
+        if cwd_result > 0 {
+            print("getcwd: ");
+            let len = cwd_buf.iter().position(|&c| c == 0).unwrap_or(cwd_buf.len());
+            syscall::write(1, &cwd_buf[..len]);
+            print("\n");
+        }
+    } else {
+        print("chdir failed\n");
+    }
+
+    // ========================================
+    // Test brk
+    // ========================================
+    print("\n--- Brk Test ---\n");
+
+    let initial_brk = syscall::brk(0);
+    print("Initial brk: 0x");
+    print_hex(initial_brk as u64);
+    print("\n");
+
+    let new_brk = syscall::brk(initial_brk + 4096);
+    print("After brk(+4096): 0x");
+    print_hex(new_brk as u64);
+    print("\n");
+
+    // ========================================
     // Spawn hello from embedded ELF
     // ========================================
     print("\n--- Spawn Test ---\n");

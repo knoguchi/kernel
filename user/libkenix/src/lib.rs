@@ -87,11 +87,20 @@ pub mod syscall {
     pub const SYS_IRQ_REGISTER: u64 = 30;
     pub const SYS_IRQ_WAIT: u64 = 31;
     pub const SYS_IRQ_ACK: u64 = 32;
+    pub const SYS_GETCWD: u64 = 17;
+    pub const SYS_DUP: u64 = 23;
+    pub const SYS_DUP3: u64 = 24;
+    pub const SYS_CHDIR: u64 = 49;
+    pub const SYS_OPENAT: u64 = 56;
     pub const SYS_CLOSE: u64 = 57;
     pub const SYS_PIPE: u64 = 59;
+    pub const SYS_GETDENTS64: u64 = 61;
     pub const SYS_READ: u64 = 63;
     pub const SYS_WRITE: u64 = 64;
+    pub const SYS_FSTAT: u64 = 80;
     pub const SYS_EXIT: u64 = 93;
+    pub const SYS_BRK: u64 = 214;
+    pub const SYS_WAIT4: u64 = 260;
 
     /// Exit the process
     pub fn exit(code: i32) -> ! {
@@ -335,6 +344,262 @@ pub mod syscall {
             );
         }
         (read_fd, write_fd)
+    }
+
+    /// Duplicate a file descriptor
+    ///
+    /// Returns the lowest available fd number that is a copy of oldfd.
+    pub fn dup(oldfd: usize) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") oldfd => ret,
+                in("x8") SYS_DUP,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Duplicate a file descriptor to a specific number
+    ///
+    /// If newfd is already open, it is closed first.
+    pub fn dup2(oldfd: usize, newfd: usize) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") oldfd => ret,
+                in("x1") newfd,
+                in("x2") 0u64,  // flags (O_CLOEXEC not supported yet)
+                in("x8") SYS_DUP3,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Open flags
+    pub const O_RDONLY: u32 = 0;
+    pub const O_WRONLY: u32 = 1;
+    pub const O_RDWR: u32 = 2;
+    pub const O_CREAT: u32 = 0o100;
+    pub const O_TRUNC: u32 = 0o1000;
+    pub const O_APPEND: u32 = 0o2000;
+    pub const O_DIRECTORY: u32 = 0o200000;
+
+    /// AT_FDCWD constant for openat
+    pub const AT_FDCWD: i32 = -100;
+
+    /// Open a file
+    ///
+    /// # Arguments
+    /// * `path` - Path to the file (null-terminated)
+    /// * `flags` - Open flags (O_RDONLY, O_WRONLY, etc.)
+    ///
+    /// # Returns
+    /// * File descriptor on success
+    /// * Negative error code on failure
+    pub fn open(path: &[u8], flags: u32) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") AT_FDCWD as i64 => ret,
+                in("x1") path.as_ptr(),
+                in("x2") flags as u64,
+                in("x3") 0u64,  // mode (ignored for now)
+                in("x8") SYS_OPENAT,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Get current working directory
+    ///
+    /// # Arguments
+    /// * `buf` - Buffer to store the path
+    ///
+    /// # Returns
+    /// * Buffer address on success
+    /// * Negative error code on failure
+    pub fn getcwd(buf: &mut [u8]) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") buf.as_mut_ptr() => ret,
+                in("x1") buf.len(),
+                in("x8") SYS_GETCWD,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Change current working directory
+    ///
+    /// # Arguments
+    /// * `path` - Path to the new directory (null-terminated)
+    ///
+    /// # Returns
+    /// * 0 on success
+    /// * Negative error code on failure
+    pub fn chdir(path: &[u8]) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") path.as_ptr() => ret,
+                in("x8") SYS_CHDIR,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Stat structure (simplified)
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Stat {
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_mode: u32,
+        pub st_nlink: u32,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub st_rdev: u64,
+        pub __pad1: u64,
+        pub st_size: i64,
+        pub st_blksize: i32,
+        pub __pad2: i32,
+        pub st_blocks: i64,
+        pub st_atime: i64,
+        pub st_atime_nsec: i64,
+        pub st_mtime: i64,
+        pub st_mtime_nsec: i64,
+        pub st_ctime: i64,
+        pub st_ctime_nsec: i64,
+        pub __unused: [i32; 2],
+    }
+
+    /// File mode bits
+    pub const S_IFMT: u32 = 0o170000;
+    pub const S_IFDIR: u32 = 0o040000;
+    pub const S_IFREG: u32 = 0o100000;
+
+    /// Get file status
+    ///
+    /// # Arguments
+    /// * `fd` - File descriptor
+    /// * `stat` - Stat structure to fill
+    ///
+    /// # Returns
+    /// * 0 on success
+    /// * Negative error code on failure
+    pub fn fstat(fd: usize, stat: &mut Stat) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") fd => ret,
+                in("x1") stat as *mut Stat,
+                in("x8") SYS_FSTAT,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Directory entry structure
+    #[repr(C)]
+    pub struct Dirent64 {
+        pub d_ino: u64,
+        pub d_off: i64,
+        pub d_reclen: u16,
+        pub d_type: u8,
+        pub d_name: [u8; 256],
+    }
+
+    /// Directory entry types
+    pub const DT_UNKNOWN: u8 = 0;
+    pub const DT_REG: u8 = 8;
+    pub const DT_DIR: u8 = 4;
+
+    /// Get directory entries
+    ///
+    /// # Arguments
+    /// * `fd` - Directory file descriptor
+    /// * `buf` - Buffer for dirent64 structures
+    ///
+    /// # Returns
+    /// * Number of bytes read on success
+    /// * 0 on end of directory
+    /// * Negative error code on failure
+    pub fn getdents64(fd: usize, buf: &mut [u8]) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") fd => ret,
+                in("x1") buf.as_mut_ptr(),
+                in("x2") buf.len(),
+                in("x8") SYS_GETDENTS64,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Wait options
+    pub const WNOHANG: u32 = 1;
+
+    /// Wait for child process
+    ///
+    /// # Arguments
+    /// * `pid` - Child PID to wait for (-1 for any)
+    /// * `options` - Wait options (WNOHANG, etc.)
+    ///
+    /// # Returns
+    /// * (pid, status) on success
+    /// * (negative error, 0) on failure
+    pub fn waitpid(pid: i32, options: u32) -> (isize, i32) {
+        let ret: isize;
+        let mut status: i32 = 0;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") pid as i64 => ret,
+                in("x1") &mut status as *mut i32,
+                in("x2") options as u64,
+                in("x3") 0u64,  // rusage (ignored)
+                in("x8") SYS_WAIT4,
+                options(nostack)
+            );
+        }
+        (ret, status)
+    }
+
+    /// Change data segment size (heap)
+    ///
+    /// # Arguments
+    /// * `addr` - New brk address (0 to query current)
+    ///
+    /// # Returns
+    /// * New/current brk address
+    pub fn brk(addr: usize) -> usize {
+        let ret: usize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") addr => ret,
+                in("x8") SYS_BRK,
+                options(nostack)
+            );
+        }
+        ret
     }
 }
 

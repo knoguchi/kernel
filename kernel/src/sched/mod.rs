@@ -12,7 +12,7 @@
 
 pub mod task;
 
-pub use task::{TaskId, TaskState, Message, IpcState, KERNEL_STACK_SIZE, FileDescriptor, FdKind, MAX_FDS, PendingSyscall};
+pub use task::{TaskId, TaskState, Message, IpcState, KERNEL_STACK_SIZE, FileDescriptor, FdKind, MAX_FDS, PendingSyscall, MAX_PATH_LEN, DEFAULT_HEAP_START};
 
 use crate::mm::{self, PhysAddr, AddressSpace, PageFlags};
 use crate::exception::ExceptionContext;

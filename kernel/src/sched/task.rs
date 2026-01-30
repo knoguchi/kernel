@@ -14,6 +14,12 @@ pub const MAX_TASKS: usize = 64;
 /// Maximum number of file descriptors per task
 pub const MAX_FDS: usize = 32;
 
+/// Maximum path length
+pub const MAX_PATH_LEN: usize = 64;
+
+/// Default heap start address (after code/data)
+pub const DEFAULT_HEAP_START: usize = 0x0010_0000;  // 1MB
+
 /// Console server task ID (well-known, created first after idle)
 pub const CONSOLE_SERVER_TID: TaskId = TaskId(1);
 
@@ -156,6 +162,29 @@ pub enum PendingSyscall {
     },
     /// Pipe close: waiting for pipeserv acknowledgment
     PipeClose,
+    /// VFS open: waiting for VFS to return vnode handle
+    VfsOpen {
+        /// Pre-allocated fd number
+        fd: usize,
+        /// Open flags (O_RDONLY, O_WRONLY, etc.)
+        flags: u32,
+        /// SHM ID containing path (needs cleanup)
+        shm_id: usize,
+    },
+    /// VFS stat: waiting for VFS to return file info
+    VfsStat {
+        /// User buffer for stat structure
+        statbuf: usize,
+    },
+    /// VFS getdents: waiting for VFS to fill directory entries
+    VfsGetdents {
+        /// User buffer for dirent64 structures
+        buf: usize,
+        /// Buffer size
+        count: usize,
+        /// SHM ID for data transfer
+        shm_id: usize,
+    },
 }
 
 impl PendingSyscall {
@@ -188,6 +217,8 @@ pub enum TaskState {
     NotifyBlocked = 8,
     /// Task is blocked waiting for pipe data
     PipeBlocked = 9,
+    /// Task is blocked waiting for child to exit (waitpid)
+    WaitBlocked = 10,
 }
 
 /// IPC Message structure
@@ -320,12 +351,28 @@ pub struct Task {
     pub notify_waiting: u64,
     /// Pending syscall waiting for IPC reply to complete
     pub pending_syscall: PendingSyscall,
+    /// Current working directory (null-terminated)
+    pub cwd: [u8; MAX_PATH_LEN],
+    /// Parent task ID (None for init and system tasks)
+    pub parent: Option<TaskId>,
+    /// Current heap break (end of data segment)
+    pub heap_brk: usize,
+    /// Exit code (set when task terminates)
+    pub exit_code: i32,
+    /// Tasks waiting for this task to exit (for waitpid)
+    pub wait_queue: Option<TaskId>,
 }
 
 impl Task {
     /// Create a new uninitialized task slot
     pub const fn empty() -> Self {
         const EMPTY_FD: FileDescriptor = FileDescriptor::empty();
+        // Default cwd is "/" (root)
+        const DEFAULT_CWD: [u8; MAX_PATH_LEN] = {
+            let mut cwd = [0u8; MAX_PATH_LEN];
+            cwd[0] = b'/';
+            cwd
+        };
         Self {
             id: TaskId(0),
             state: TaskState::Free,
@@ -342,6 +389,11 @@ impl Task {
             notify_pending: 0,
             notify_waiting: 0,
             pending_syscall: PendingSyscall::None,
+            cwd: DEFAULT_CWD,
+            parent: None,
+            heap_brk: DEFAULT_HEAP_START,
+            exit_code: 0,
+            wait_queue: None,
         }
     }
 
