@@ -138,6 +138,37 @@ fn main() -> ! {
     }
 
     // ========================================
+    // Test FAT32 disk access
+    // ========================================
+    print("\n--- FAT32 Disk Test ---\n");
+
+    let disk_fd = vfs_open("/disk/hello.txt");
+    if disk_fd >= 0 {
+        print("Opened /disk/hello.txt (fd=");
+        print_num(disk_fd as usize);
+        print(")\n");
+
+        let mut buf = [0u8; 32];
+        let n = vfs_read(disk_fd, &mut buf);
+        if n > 0 {
+            print("Read from disk: ");
+            syscall::write(1, &buf[..n as usize]);
+            print("\n");
+        } else {
+            print("Read failed: ");
+            print_num((-n) as usize);
+            print("\n");
+        }
+        vfs_close(disk_fd);
+    } else if disk_fd == ERR_NOENT {
+        print("No disk file (disk not mounted?)\n");
+    } else {
+        print("Failed to open /disk/hello.txt: ");
+        print_num((-disk_fd) as usize);
+        print("\n");
+    }
+
+    // ========================================
     // Spawn hello from embedded ELF
     // ========================================
     print("\n--- Spawn Test ---\n");

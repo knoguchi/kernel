@@ -148,6 +148,8 @@ pub enum TaskState {
     ReplyBlocked = 5,
     /// Task has terminated
     Terminated = 6,
+    /// Task is blocked waiting for an IRQ
+    IrqBlocked = 7,
 }
 
 /// IPC Message structure

@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "blkdev"
+version = "0.1.0"
+dependencies = [
+ "libkenix",
+]
+
+[[package]]
 name = "console"
 version = "0.1.0"
 dependencies = [

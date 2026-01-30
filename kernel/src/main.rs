@@ -15,6 +15,7 @@ mod syscall;
 mod elf;
 mod ipc;
 mod shm;
+mod irq;
 
 // Memory intrinsics required by compiler
 #[no_mangle]
@@ -96,6 +97,9 @@ extern "C" {
     // VFS server ELF (created third, gets task ID 3)
     static __vfs_elf_start: u8;
     static __vfs_elf_end: u8;
+    // Block device server ELF (created fourth, gets task ID 4)
+    static __blkdev_elf_start: u8;
+    static __blkdev_elf_end: u8;
 }
 
 struct Uart {
@@ -313,6 +317,22 @@ pub extern "C" fn kernel_main() -> ! {
         println!("  Created VFS server (id={}) - runs in EL0", id.0);
     } else {
         println!("  ERROR: Failed to create VFS server!");
+    }
+    println!();
+
+    // Create blkdev server (task ID 4)
+    println!("Creating blkdev server...");
+    let blkdev_start = unsafe { &__blkdev_elf_start as *const u8 };
+    let blkdev_end = unsafe { &__blkdev_elf_end as *const u8 };
+    let blkdev_size = blkdev_end as usize - blkdev_start as usize;
+    let blkdev_data = unsafe { core::slice::from_raw_parts(blkdev_start, blkdev_size) };
+
+    println!("  Blkdev ELF at {:#010x}, size {} bytes", blkdev_start as usize, blkdev_size);
+
+    if let Some(id) = sched::create_blkdev_server_from_elf("blkdev", blkdev_data) {
+        println!("  Created blkdev server (id={}) - runs in EL0 with VirtIO access", id.0);
+    } else {
+        println!("  ERROR: Failed to create blkdev server!");
     }
     println!();
 

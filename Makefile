@@ -1,6 +1,7 @@
-.PHONY: all boot kernel user clean run
+.PHONY: all boot kernel user clean run disk
 
 QEMU = qemu-system-aarch64
+DISK_IMG = disk.img
 # Use QEMU's bundled UEFI firmware (Homebrew location)
 OVMF = /opt/homebrew/share/qemu/edk2-aarch64-code.fd
 
@@ -27,6 +28,7 @@ user:
 	cp user/target/aarch64-kenix-user/release/init user/init.elf
 	cp user/target/aarch64-kenix-user/release/vfs user/vfs.elf
 	cp user/target/aarch64-kenix-user/release/hello user/hello.elf
+	cp user/target/aarch64-kenix-user/release/blkdev user/blkdev.elf
 
 kernel: user
 	cd kernel && cargo +nightly build --release --target aarch64-kenix.json -Zbuild-std=core,alloc
@@ -42,18 +44,26 @@ run: all
 		-nographic \
 		-serial mon:stdio
 
-run-kernel: kernel
+disk: $(DISK_IMG)
+
+$(DISK_IMG):
+	./scripts/create_disk.sh $(DISK_IMG) 32
+
+run-kernel: kernel $(DISK_IMG)
 	$(QEMU) \
 		-M virt \
 		-cpu cortex-a72 \
 		-m 1G \
+		-global virtio-mmio.force-legacy=false \
+		-device virtio-blk-device,drive=disk0 \
+		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-kernel kernel.elf \
 		-nographic \
 		-serial mon:stdio
 
 clean:
-	rm -rf esp kernel.elf
-	rm -f user/console.elf user/init.elf user/vfs.elf
+	rm -rf esp kernel.elf $(DISK_IMG)
+	rm -f user/console.elf user/init.elf user/vfs.elf user/blkdev.elf
 	cd boot && cargo clean
 	cd kernel && cargo clean
 	cd user && cargo clean 2>/dev/null || true

@@ -6,6 +6,7 @@ members = [
     "init",
     "vfs",
     "hello",
+    "blkdev",
 ]
 
 [profile.dev]

@@ -754,6 +754,9 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
 /// UART base address for QEMU virt machine (console server needs this)
 const UART_MMIO_BASE: usize = 0x0900_0000;
 
+/// VirtIO MMIO base address for QEMU virt machine (blkdev server needs this)
+const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
+
 /// Create the console server from ELF with UART MMIO access
 ///
 /// This is a specialized function for the console server that maps the UART
@@ -1046,4 +1049,222 @@ fn idle_task_entry() {
             core::arch::asm!("wfi", options(nostack, preserves_flags));
         }
     }
+}
+
+/// Create the blkdev server from ELF with VirtIO MMIO access
+///
+/// This is a specialized function for the block device server that maps the VirtIO
+/// MMIO region into the task's address space so it can access the virtio-blk device.
+///
+/// # Arguments
+/// * `name` - Task name for debugging
+/// * `elf_data` - Raw ELF file data
+///
+/// # Returns
+/// The TaskId if successful, None if parsing or allocation failed
+pub fn create_blkdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> {
+    // Parse ELF header
+    let elf = match ElfFile::parse(elf_data) {
+        Ok(e) => e,
+        Err(_e) => {
+            return None;
+        }
+    };
+
+    let task_id = task::find_free_slot()?;
+
+    // Create user address space
+    let mut addr_space = unsafe { AddressSpace::new_for_user()? };
+
+    // Find the range of all segments (same as create_user_task_from_elf)
+    let mut min_vaddr = usize::MAX;
+    let mut max_vaddr = 0usize;
+    let mut has_executable = false;
+    let mut has_writable = false;
+
+    for phdr in elf.load_segments() {
+        let vaddr = phdr.p_vaddr as usize;
+        let memsz = phdr.p_memsz as usize;
+        if memsz == 0 {
+            continue;
+        }
+        min_vaddr = min_vaddr.min(vaddr);
+        max_vaddr = max_vaddr.max(vaddr + memsz);
+        if phdr.p_flags & PF_X != 0 {
+            has_executable = true;
+        }
+        if phdr.p_flags & PF_W != 0 {
+            has_writable = true;
+        }
+    }
+
+    if min_vaddr == usize::MAX {
+        return None;
+    }
+
+    let block_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
+
+    // Calculate how many 4KB frames we need for the code
+    let code_size = max_vaddr - min_vaddr;
+    let num_frames = (code_size + mm::frame::PAGE_SIZE - 1) / mm::frame::PAGE_SIZE;
+
+    if num_frames > MAX_CODE_FRAMES {
+        return None;
+    }
+
+    // Allocate the first code frame
+    let first_frame = mm::alloc_frame()?;
+    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let first_frame_offset = first_frame.0 - phys_base_2mb.0;
+
+    // Zero and track all frames
+    let mut code_frames: [PhysAddr; MAX_CODE_FRAMES] = [PhysAddr(0); MAX_CODE_FRAMES];
+    code_frames[0] = first_frame;
+
+    unsafe {
+        core::ptr::write_bytes(first_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+    }
+
+    // Allocate remaining frames, checking they're in the same 2MB block
+    for i in 1..num_frames {
+        let frame = mm::alloc_frame()?;
+        let frame_2mb_base = PhysAddr(frame.0 & !(BLOCK_SIZE_2MB - 1));
+
+        if frame_2mb_base.0 != phys_base_2mb.0 {
+            return None;
+        }
+
+        code_frames[i] = frame;
+        unsafe {
+            core::ptr::write_bytes(frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        }
+    }
+
+    // Copy all segments to the appropriate frames
+    for phdr in elf.load_segments() {
+        let vaddr = phdr.p_vaddr as usize;
+        let filesz = phdr.p_filesz as usize;
+        let memsz = phdr.p_memsz as usize;
+
+        if memsz == 0 || filesz == 0 {
+            continue;
+        }
+
+        let segment_data = elf.segment_data(phdr).ok()?;
+        let offset_in_frames = vaddr - block_base;
+
+        let mut bytes_copied = 0usize;
+        while bytes_copied < filesz {
+            let current_offset = offset_in_frames + bytes_copied;
+            let frame_idx = current_offset / mm::frame::PAGE_SIZE;
+            let offset_in_frame = current_offset % mm::frame::PAGE_SIZE;
+
+            if frame_idx >= num_frames {
+                break;
+            }
+
+            let bytes_left_in_frame = mm::frame::PAGE_SIZE - offset_in_frame;
+            let bytes_left_to_copy = filesz - bytes_copied;
+            let copy_size = bytes_left_in_frame.min(bytes_left_to_copy);
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    segment_data.as_ptr().add(bytes_copied),
+                    (code_frames[frame_idx].0 + offset_in_frame) as *mut u8,
+                    copy_size,
+                );
+            }
+
+            bytes_copied += copy_size;
+        }
+    }
+
+    // Determine page flags based on combined segment flags
+    let flags = if has_executable && has_writable {
+        PageFlags::user_code_data()
+    } else if has_executable {
+        PageFlags::user_code()
+    } else if has_writable {
+        PageFlags::user_data()
+    } else {
+        PageFlags::user_code()
+    };
+
+    // Map the code block
+    unsafe {
+        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+            return None;
+        }
+    }
+
+    // Map VirtIO MMIO region for blkdev server
+    // VirtIO MMIO at 0x0a000000 is in a 2MB block starting at 0x0a000000
+    // We map the entire 2MB block with device memory attributes
+    unsafe {
+        let virtio_block_base = VIRTIO_MMIO_BASE & !(BLOCK_SIZE_2MB - 1);
+        if !addr_space.map_2mb(virtio_block_base, PhysAddr(virtio_block_base), PageFlags::user_device()) {
+            return None;
+        }
+    }
+
+    // Allocate and map user stack
+    let stack_frame = mm::alloc_frame()?;
+    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+
+    unsafe {
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
+            return None;
+        }
+    }
+
+    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    let user_entry_point = first_frame_offset + elf.entry_point() as usize;
+
+    // Allocate kernel stack
+    let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
+    let mut kernel_stack_base = PhysAddr(0);
+
+    for i in 0..stack_pages {
+        if let Some(frame) = mm::alloc_frame() {
+            if i == 0 {
+                kernel_stack_base = frame;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    unsafe {
+        let task = &mut TASKS[task_id.0];
+        task.id = task_id;
+        task.state = TaskState::Ready;
+        task.set_name(name);
+        task.kernel_stack_base = kernel_stack_base;
+        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        task.entry_point = user_entry_point;
+        task.time_slice = DEFAULT_TIME_SLICE;
+        task.next = None;
+        task.ipc = task::IpcState::empty();
+        task.init_stdio(); // Initialize stdin/stdout/stderr for blkdev
+
+        let kernel_stack_top = kernel_stack_base.0 + KERNEL_STACK_SIZE;
+        let ctx_addr = kernel_stack_top - EXCEPTION_CONTEXT_SIZE;
+        let ctx = ctx_addr as *mut ExceptionContext;
+
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = user_entry_point as u64;
+        (*ctx).spsr = 0x000;
+        (*ctx).sp = user_stack_top as u64;
+        // Pass physical base in x0 for VA->PA conversion in VirtIO driver
+        (*ctx).gpr[0] = phys_base_2mb.0 as u64;
+
+        task.kernel_stack_top = ctx_addr;
+
+        SCHEDULER.enqueue(task_id);
+        core::mem::forget(addr_space);
+    }
+
+    Some(task_id)
 }

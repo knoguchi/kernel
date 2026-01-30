@@ -8,7 +8,7 @@ Micro kernel written in Rust for AArch64
 - Raspberry Pi 4/5 (planned)
 - ARM Chromebook (planned)
 
-## Prerequisits
+## Prerequisites
 
 ```bash
 # Rust nightly
@@ -18,6 +18,10 @@ rustup component add rust-src
 # QEMU
 brew install qemu  # macOS
 apt install qemu-system-aarch64  # Linux
+
+# mtools (for FAT32 disk images)
+brew install mtools  # macOS
+apt install mtools   # Linux
 ```
 
 ## build & run
@@ -49,7 +53,8 @@ kenix/
 │       ├── syscall.rs     # Syscall dispatcher
 │       ├── gic.rs         # ARM GIC driver
 │       ├── timer.rs       # ARM timer driver
-│       └── elf.rs         # ELF loader
+│       ├── elf.rs         # ELF loader
+│       └── irq.rs         # IRQ-to-task routing
 ├── user/               # User-space programs (all Rust)
 │   ├── libkenix/          # Shared runtime library
 │   │   ├── Cargo.toml
@@ -62,14 +67,26 @@ kenix/
 │   │   └── src/main.rs       # System tests, VFS client
 │   ├── vfs/               # VFS server
 │   │   ├── Cargo.toml
-│   │   └── src/main.rs       # RAM filesystem
+│   │   └── src/
+│   │       ├── main.rs       # VFS server, mount points
+│   │       ├── blk_client.rs # Block device IPC client
+│   │       └── fat32/        # FAT32 filesystem
+│   ├── blkdev/            # Block device server
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs       # IPC server loop
+│   │       ├── virtio_mmio.rs # VirtIO MMIO registers
+│   │       ├── virtqueue.rs  # Virtqueue management
+│   │       └── blk.rs        # VirtIO-blk protocol
 │   ├── user.ld            # Shared linker script
 │   ├── aarch64-kenix-user.json  # Custom target spec
 │   └── Cargo.toml         # Workspace root
 ├── docs/               # Documentation
 │   ├── syscalls.md        # System call reference
-│   └── ipc-protocols.md   # IPC message formats
-├── journal/            # Development notes
+│   ├── ipc-protocols.md   # IPC message formats
+│   └── journal/           # Development notes
+├── scripts/            # Build scripts
+│   └── create_disk.sh     # FAT32 disk image creation
 └── Makefile
 ```
 
@@ -98,10 +115,9 @@ kenix/
 
 ### Servers
 - [x] Console server (UART)
-- [x] VFS server (ramfs)
-- [ ] Block device driver
-- [ ] RAM disk
-- [ ] FAT32 filesystem
+- [x] VFS server (ramfs + FAT32)
+- [x] Block device server (VirtIO-blk)
+- [x] FAT32 filesystem
 
 ### File Descriptors
 - [x] Per-task fd table
@@ -118,8 +134,9 @@ kenix/
 - [ ] Swapping
 
 ### Hardware Support
+- [x] VirtIO-blk driver (block device)
+- [ ] VirtIO-net driver (network)
 - [ ] Interrupts beyond timer (keyboard, network)
-- [ ] Virtio drivers (block, network)
 - [ ] Raspberry Pi 4/5 support
 - [ ] ARM Chromebook support
 

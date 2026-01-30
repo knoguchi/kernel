@@ -11,6 +11,7 @@ use crate::gic::{self, TIMER_IRQ, IRQ_SPURIOUS};
 use crate::timer;
 use crate::sched;
 use crate::syscall;
+use crate::irq;
 
 extern "C" {
     /// Exception vector table defined in vectors.s
@@ -183,25 +184,33 @@ extern "C" fn handle_el1_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
 
 #[no_mangle]
 extern "C" fn handle_el1_irq(ctx: &mut ExceptionContext, _exc_type: u64) {
-    let irq = gic::acknowledge();
+    let irq_num = gic::acknowledge();
 
-    if irq == IRQ_SPURIOUS {
+    if irq_num == IRQ_SPURIOUS {
         return;
     }
 
-    if irq == TIMER_IRQ {
+    if irq_num == TIMER_IRQ {
         timer::acknowledge_and_reset();
         // Check if we need to reschedule
         let needs_switch = sched::tick();
         // IMPORTANT: Send EOI before context switch because switch_context_and_restore
         // never returns (it does ERET directly)
-        gic::end_of_interrupt(irq);
+        gic::end_of_interrupt(irq_num);
+        if needs_switch {
+            unsafe { sched::context_switch(ctx); }
+        }
+    } else if irq::handle_irq(irq_num) {
+        // IRQ was handled by a registered userspace driver
+        // Don't send EOI here - the driver will do it via SYS_IRQ_ACK
+        // However, we may need to reschedule if the handler task was woken
+        let needs_switch = sched::tick();
         if needs_switch {
             unsafe { sched::context_switch(ctx); }
         }
     } else {
-        exception_println!("Unhandled IRQ: {}", irq);
-        gic::end_of_interrupt(irq);
+        exception_println!("Unhandled IRQ: {}", irq_num);
+        gic::end_of_interrupt(irq_num);
     }
 }
 
@@ -272,25 +281,32 @@ extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
 #[no_mangle]
 extern "C" fn handle_el0_irq(ctx: &mut ExceptionContext, _exc_type: u64) {
     // Handle IRQ same as EL1 (timer tick may trigger reschedule)
-    let irq = gic::acknowledge();
+    let irq_num = gic::acknowledge();
 
-    if irq == IRQ_SPURIOUS {
+    if irq_num == IRQ_SPURIOUS {
         return;
     }
 
-    if irq == TIMER_IRQ {
+    if irq_num == TIMER_IRQ {
         timer::acknowledge_and_reset();
         // Check if we need to reschedule
         let needs_switch = sched::tick();
         // IMPORTANT: Send EOI before context switch because switch_context_and_restore
         // never returns (it does ERET directly)
-        gic::end_of_interrupt(irq);
+        gic::end_of_interrupt(irq_num);
+        if needs_switch {
+            unsafe { sched::context_switch(ctx); }
+        }
+    } else if irq::handle_irq(irq_num) {
+        // IRQ was handled by a registered userspace driver
+        // Don't send EOI here - the driver will do it via SYS_IRQ_ACK
+        let needs_switch = sched::tick();
         if needs_switch {
             unsafe { sched::context_switch(ctx); }
         }
     } else {
-        exception_println!("Unhandled IRQ: {}", irq);
-        gic::end_of_interrupt(irq);
+        exception_println!("Unhandled IRQ: {}", irq_num);
+        gic::end_of_interrupt(irq_num);
     }
 }
 

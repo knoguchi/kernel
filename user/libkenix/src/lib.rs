@@ -82,6 +82,9 @@ pub mod syscall {
     pub const SYS_SHMGRANT: u64 = 13;
     pub const SYS_GETPID: u64 = 20;
     pub const SYS_SPAWN: u64 = 21;
+    pub const SYS_IRQ_REGISTER: u64 = 30;
+    pub const SYS_IRQ_WAIT: u64 = 31;
+    pub const SYS_IRQ_ACK: u64 = 32;
     pub const SYS_CLOSE: u64 = 57;
     pub const SYS_READ: u64 = 63;
     pub const SYS_WRITE: u64 = 64;
@@ -186,6 +189,74 @@ pub mod syscall {
                 inout("x0") elf_data.as_ptr() => ret,
                 in("x1") elf_data.len(),
                 in("x8") SYS_SPAWN,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Register current task as handler for an IRQ
+    ///
+    /// # Arguments
+    /// * `irq` - IRQ number (GIC interrupt ID)
+    ///
+    /// # Returns
+    /// * 0 on success
+    /// * Negative error code on failure
+    pub fn irq_register(irq: u32) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") irq as u64 => ret,
+                in("x8") SYS_IRQ_REGISTER,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Wait for an IRQ to fire
+    ///
+    /// If the IRQ is already pending, returns immediately.
+    /// Otherwise, blocks until the IRQ fires.
+    ///
+    /// # Arguments
+    /// * `irq` - IRQ number
+    ///
+    /// # Returns
+    /// * 0 when IRQ fires
+    /// * Negative error code on failure
+    pub fn irq_wait(irq: u32) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") irq as u64 => ret,
+                in("x8") SYS_IRQ_WAIT,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Acknowledge an IRQ (clear pending flag and send EOI)
+    ///
+    /// Must be called after handling an IRQ to re-enable it.
+    ///
+    /// # Arguments
+    /// * `irq` - IRQ number
+    ///
+    /// # Returns
+    /// * 0 on success
+    /// * Negative error code on failure
+    pub fn irq_ack(irq: u32) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") irq as u64 => ret,
+                in("x8") SYS_IRQ_ACK,
                 options(nostack)
             );
         }
@@ -452,6 +523,11 @@ pub mod msg {
     pub const VFS_STAT: u64 = 104;
     pub const VFS_READ_SHM: u64 = 110;  // Read via shared memory
 
+    // Block device server messages
+    pub const BLK_READ: u64 = 200;      // Read sectors
+    pub const BLK_WRITE: u64 = 201;     // Write sectors
+    pub const BLK_INFO: u64 = 202;      // Get device info (sector count, sector size)
+
     // Error codes
     pub const ERR_OK: i64 = 0;
     pub const ERR_NOENT: i64 = -2;
@@ -466,6 +542,9 @@ pub mod msg {
     pub const ERR_NOSPC: i64 = -28;
 }
 
+/// VirtIO block device IRQ (SPI 48 + 32 for GIC offset)
+pub const VIRTIO_BLK_IRQ: u32 = 48 + 32;
+
 // ============================================================================
 // Well-known Task IDs
 // ============================================================================
@@ -475,4 +554,5 @@ pub mod tasks {
     pub const CONSOLE: usize = 1;
     pub const INIT: usize = 2;
     pub const VFS: usize = 3;
+    pub const BLKDEV: usize = 4;
 }

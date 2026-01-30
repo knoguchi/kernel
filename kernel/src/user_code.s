@@ -23,3 +23,10 @@ __init_elf_end:
 __vfs_elf_start:
 .incbin "../user/vfs.elf"
 __vfs_elf_end:
+
+// Block device server ELF (task ID 4)
+.global __blkdev_elf_start
+.global __blkdev_elf_end
+__blkdev_elf_start:
+.incbin "../user/blkdev.elf"
+__blkdev_elf_end:

@@ -14,9 +14,10 @@
 //! - 0: SYS_YIELD - Voluntarily yield the CPU
 
 use crate::exception::ExceptionContext;
-use crate::sched::{self, TaskId, Message};
+use crate::sched::{self, TaskId, Message, TaskState};
 use crate::ipc;
 use crate::shm;
+use crate::irq;
 
 /// Syscall numbers - IPC (Kenix microkernel)
 pub const SYS_SEND: u16 = 1;     // Send message, block until received
@@ -34,6 +35,11 @@ pub const SYS_SHMGRANT: u16 = 13;   // Grant another task access to shared memor
 pub const SYS_YIELD: u16 = 0;    // Voluntarily yield CPU
 pub const SYS_GETPID: u16 = 20;  // Get current task ID
 pub const SYS_SPAWN: u16 = 21;   // Create new task from ELF
+
+/// Syscall numbers - IRQ handling
+pub const SYS_IRQ_REGISTER: u16 = 30;  // Register for IRQ handling
+pub const SYS_IRQ_WAIT: u16 = 31;      // Wait for IRQ to fire
+pub const SYS_IRQ_ACK: u16 = 32;       // Acknowledge IRQ
 
 /// Syscall numbers - POSIX-compatible file I/O
 pub const SYS_READ: u16 = 63;    // Read from file descriptor
@@ -175,6 +181,26 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             let elf_ptr = ctx.gpr[0] as usize;
             let elf_len = ctx.gpr[1] as usize;
             ctx.gpr[0] = sys_spawn(elf_ptr, elf_len) as u64;
+        }
+
+        // IRQ syscalls
+        // SYS_IRQ_REGISTER: x0=irq → returns result in x0
+        SYS_IRQ_REGISTER => {
+            let irq_num = ctx.gpr[0] as u32;
+            ctx.gpr[0] = sys_irq_register(irq_num) as u64;
+        }
+
+        // SYS_IRQ_WAIT: x0=irq → returns result in x0 (may block)
+        SYS_IRQ_WAIT => {
+            let irq_num = ctx.gpr[0] as u32;
+            let result = sys_irq_wait(ctx, irq_num);
+            ctx.gpr[0] = result as u64;
+        }
+
+        // SYS_IRQ_ACK: x0=irq → returns result in x0
+        SYS_IRQ_ACK => {
+            let irq_num = ctx.gpr[0] as u32;
+            ctx.gpr[0] = sys_irq_ack(irq_num) as u64;
         }
 
         _ => {
@@ -386,4 +412,67 @@ fn sys_spawn(elf_ptr: usize, elf_len: usize) -> i64 {
         Some(task_id) => task_id.0 as i64,
         None => ENOMEM,
     }
+}
+
+/// SYS_IRQ_REGISTER - Register the current task as handler for an IRQ
+///
+/// # Arguments
+/// * `irq` - IRQ number (GIC interrupt ID)
+///
+/// # Returns
+/// * 0 on success
+/// * Negative error code on failure
+fn sys_irq_register(irq: u32) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    irq::register_irq_handler(irq, current_id)
+}
+
+/// SYS_IRQ_WAIT - Wait for an IRQ to fire
+///
+/// If the IRQ is already pending, returns immediately.
+/// Otherwise, blocks the task until the IRQ fires.
+///
+/// # Arguments
+/// * `ctx` - Exception context (for potential blocking)
+/// * `irq` - IRQ number
+///
+/// # Returns
+/// * 0 when IRQ fires
+/// * Negative error code on failure
+fn sys_irq_wait(ctx: &mut ExceptionContext, irq: u32) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    let result = irq::wait_for_irq(irq, current_id);
+
+    if result == 1 {
+        // Need to block - set task state and context switch
+        unsafe {
+            use sched::task::TASKS;
+            TASKS[current_id.0].state = TaskState::IrqBlocked;
+            sched::context_switch_blocking(ctx);
+        }
+        // When we wake up, the IRQ has fired
+        0
+    } else {
+        result
+    }
+}
+
+/// SYS_IRQ_ACK - Acknowledge an IRQ (clear pending flag and send EOI)
+///
+/// # Arguments
+/// * `irq` - IRQ number
+///
+/// # Returns
+/// * 0 on success
+/// * Negative error code on failure
+fn sys_irq_ack(irq: u32) -> i64 {
+    irq::acknowledge_irq(irq)
 }
