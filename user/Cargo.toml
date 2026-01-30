@@ -5,6 +5,7 @@ members = [
     "console",
     "init",
     "vfs",
+    "hello",
 ]
 
 [profile.dev]

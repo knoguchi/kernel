@@ -499,6 +499,9 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
     Some(task_id)
 }
 
+/// Maximum number of code frames per user task (64KB max code size)
+const MAX_CODE_FRAMES: usize = 16;
+
 /// Create a user-mode task from an ELF binary
 ///
 /// This function parses the ELF file, maps each PT_LOAD segment with
@@ -559,53 +562,92 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     // Calculate the 2MB block that contains all segments
     let block_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
 
-    // Allocate a physical frame for user code
-    let code_frame = mm::alloc_frame()?;
+    // Calculate how many 4KB frames we need for the code
+    let code_size = max_vaddr - min_vaddr;
+    let num_frames = (code_size + mm::frame::PAGE_SIZE - 1) / mm::frame::PAGE_SIZE;
 
-    // Zero the frame first
-    unsafe {
-        core::ptr::write_bytes(code_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+    if num_frames > MAX_CODE_FRAMES {
+        // Code too large
+        return None;
     }
 
-    // Copy all segments to the appropriate offsets in the frame
+    // Allocate the first code frame
+    let first_frame = mm::alloc_frame()?;
+    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let first_frame_offset = first_frame.0 - phys_base_2mb.0;
+
+    // Zero and track all frames
+    let mut code_frames: [PhysAddr; MAX_CODE_FRAMES] = [PhysAddr(0); MAX_CODE_FRAMES];
+    code_frames[0] = first_frame;
+
+    unsafe {
+        core::ptr::write_bytes(first_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+    }
+
+    // Allocate remaining frames, checking they're in the same 2MB block
+    for i in 1..num_frames {
+        let frame = mm::alloc_frame()?;
+        let frame_2mb_base = PhysAddr(frame.0 & !(BLOCK_SIZE_2MB - 1));
+
+        // Verify this frame is in the same 2MB block as the first
+        if frame_2mb_base.0 != phys_base_2mb.0 {
+            // Frame is in a different 2MB block - with 2MB granularity we can't use it
+            // This is a limitation of the current simple allocator
+            return None;
+        }
+
+        code_frames[i] = frame;
+        unsafe {
+            core::ptr::write_bytes(frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        }
+    }
+
+    // Copy all segments to the appropriate frames
+    // The ELF is linked at block_base (typically 0), and we copy it to our frames.
+    // The frames will be mapped at virtual address first_frame_offset.
+    // So segment at vaddr X will be at virtual first_frame_offset + (X - block_base).
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
         let filesz = phdr.p_filesz as usize;
         let memsz = phdr.p_memsz as usize;
 
-        if memsz == 0 {
+        if memsz == 0 || filesz == 0 {
             continue;
         }
 
         // Get segment data from ELF
         let segment_data = elf.segment_data(phdr).ok()?;
 
-        // Calculate offset within the physical frame
-        // The frame will be mapped at block_base, so offset is vaddr - block_base
-        let offset_in_block = vaddr - block_base;
+        // Calculate offset within our allocated frames
+        // The segment's vaddr relative to block_base tells us where within our frames to copy
+        let offset_in_frames = vaddr - block_base;
 
-        // Make sure we don't overflow the frame
-        if offset_in_block + filesz > mm::frame::PAGE_SIZE {
-            // Segment extends beyond our frame, truncate
-            let copy_size = mm::frame::PAGE_SIZE.saturating_sub(offset_in_block);
-            if copy_size > 0 && copy_size <= segment_data.len() {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        segment_data.as_ptr(),
-                        (code_frame.0 + offset_in_block) as *mut u8,
-                        copy_size,
-                    );
-                }
+        // Copy the segment, handling frame boundaries
+        let mut bytes_copied = 0usize;
+        while bytes_copied < filesz {
+            let current_offset = offset_in_frames + bytes_copied;
+            let frame_idx = current_offset / mm::frame::PAGE_SIZE;
+            let offset_in_frame = current_offset % mm::frame::PAGE_SIZE;
+
+            if frame_idx >= num_frames {
+                // Beyond our allocated frames
+                break;
             }
-        } else {
-            // Copy full segment
+
+            // Calculate how many bytes we can copy to this frame
+            let bytes_left_in_frame = mm::frame::PAGE_SIZE - offset_in_frame;
+            let bytes_left_to_copy = filesz - bytes_copied;
+            let copy_size = bytes_left_in_frame.min(bytes_left_to_copy);
+
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    segment_data.as_ptr(),
-                    (code_frame.0 + offset_in_block) as *mut u8,
-                    filesz,
+                    segment_data.as_ptr().add(bytes_copied),
+                    (code_frames[frame_idx].0 + offset_in_frame) as *mut u8,
+                    copy_size,
                 );
             }
+
+            bytes_copied += copy_size;
         }
     }
 
@@ -625,13 +667,8 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         PageFlags::user_code() // Read-only
     };
 
-    // Calculate the 2MB-aligned physical base for the block
-    let phys_base_2mb = PhysAddr(code_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    // Calculate the offset of our frame within the 2MB block
-    let code_frame_offset = code_frame.0 - phys_base_2mb.0;
-
     // Map the 2MB block at virtual address 0
-    // The code will be at virtual address code_frame_offset within this block
+    // The code will be at virtual address first_frame_offset within this block
     unsafe {
         if !addr_space.map_2mb(0, phys_base_2mb, flags) {
             return None;
@@ -655,12 +692,11 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
 
     // Entry point: ELF entry + frame offset within 2MB block
-    // The ELF is linked at 0, and we copied it to the start of the frame.
-    // The frame is at offset code_frame_offset within the mapped 2MB block.
-    // So the actual entry point is code_frame_offset + elf.entry_point()
-    let user_entry_point = code_frame_offset + elf.entry_point() as usize;
+    // The ELF is linked at 0, and we copied it starting at first_frame_offset.
+    // So the actual entry point is first_frame_offset + elf.entry_point()
+    let user_entry_point = first_frame_offset + elf.entry_point() as usize;
 
-    // Allocate kernel stack for syscalls/interrupts (4 pages = 16KB)
+    // Allocate kernel stack for syscalls/interrupts
     let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
     let mut kernel_stack_base = PhysAddr(0);
 
@@ -771,45 +807,80 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
 
     let block_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
 
-    // Allocate a physical frame for user code
-    let code_frame = mm::alloc_frame()?;
+    // Calculate how many 4KB frames we need for the code
+    let code_size = max_vaddr - min_vaddr;
+    let num_frames = (code_size + mm::frame::PAGE_SIZE - 1) / mm::frame::PAGE_SIZE;
 
-    unsafe {
-        core::ptr::write_bytes(code_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+    if num_frames > MAX_CODE_FRAMES {
+        return None;
     }
 
-    // Copy all segments
+    // Allocate the first code frame
+    let first_frame = mm::alloc_frame()?;
+    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let first_frame_offset = first_frame.0 - phys_base_2mb.0;
+
+    // Zero and track all frames
+    let mut code_frames: [PhysAddr; MAX_CODE_FRAMES] = [PhysAddr(0); MAX_CODE_FRAMES];
+    code_frames[0] = first_frame;
+
+    unsafe {
+        core::ptr::write_bytes(first_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+    }
+
+    // Allocate remaining frames, checking they're in the same 2MB block
+    for i in 1..num_frames {
+        let frame = mm::alloc_frame()?;
+        let frame_2mb_base = PhysAddr(frame.0 & !(BLOCK_SIZE_2MB - 1));
+
+        if frame_2mb_base.0 != phys_base_2mb.0 {
+            return None;
+        }
+
+        code_frames[i] = frame;
+        unsafe {
+            core::ptr::write_bytes(frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        }
+    }
+
+    // Copy all segments to the appropriate frames
+    // The ELF is linked at block_base (typically 0), and we copy it to our frames.
+    // The frames will be mapped at virtual address first_frame_offset.
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
         let filesz = phdr.p_filesz as usize;
         let memsz = phdr.p_memsz as usize;
 
-        if memsz == 0 {
+        if memsz == 0 || filesz == 0 {
             continue;
         }
 
         let segment_data = elf.segment_data(phdr).ok()?;
-        let offset_in_block = vaddr - block_base;
+        let offset_in_frames = vaddr - block_base;
 
-        if offset_in_block + filesz > mm::frame::PAGE_SIZE {
-            let copy_size = mm::frame::PAGE_SIZE.saturating_sub(offset_in_block);
-            if copy_size > 0 && copy_size <= segment_data.len() {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        segment_data.as_ptr(),
-                        (code_frame.0 + offset_in_block) as *mut u8,
-                        copy_size,
-                    );
-                }
+        let mut bytes_copied = 0usize;
+        while bytes_copied < filesz {
+            let current_offset = offset_in_frames + bytes_copied;
+            let frame_idx = current_offset / mm::frame::PAGE_SIZE;
+            let offset_in_frame = current_offset % mm::frame::PAGE_SIZE;
+
+            if frame_idx >= num_frames {
+                break;
             }
-        } else {
+
+            let bytes_left_in_frame = mm::frame::PAGE_SIZE - offset_in_frame;
+            let bytes_left_to_copy = filesz - bytes_copied;
+            let copy_size = bytes_left_in_frame.min(bytes_left_to_copy);
+
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    segment_data.as_ptr(),
-                    (code_frame.0 + offset_in_block) as *mut u8,
-                    filesz,
+                    segment_data.as_ptr().add(bytes_copied),
+                    (code_frames[frame_idx].0 + offset_in_frame) as *mut u8,
+                    copy_size,
                 );
             }
+
+            bytes_copied += copy_size;
         }
     }
 
@@ -825,9 +896,6 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
     } else {
         PageFlags::user_code()
     };
-
-    let phys_base_2mb = PhysAddr(code_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let code_frame_offset = code_frame.0 - phys_base_2mb.0;
 
     // Map the code block
     unsafe {
@@ -860,7 +928,7 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
     }
 
     let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
-    let user_entry_point = code_frame_offset + elf.entry_point() as usize;
+    let user_entry_point = first_frame_offset + elf.entry_point() as usize;
 
     // Allocate kernel stack
     let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;

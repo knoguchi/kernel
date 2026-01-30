@@ -17,11 +17,16 @@ boot:
 	cp target/aarch64-unknown-uefi/release/kenix-boot.efi esp/EFI/BOOT/BOOTAA64.EFI
 
 # Build all user-space programs (all Rust now)
+# Build hello first since init embeds it via include_bytes!
 user:
+	cd user && cargo +nightly build --release --target aarch64-kenix-user.json -Zbuild-std=core -p libkenix -p hello
+	mkdir -p user/init/data
+	cp user/target/aarch64-kenix-user/release/hello user/init/data/hello.elf
 	cd user && cargo +nightly build --release --target aarch64-kenix-user.json -Zbuild-std=core
 	cp user/target/aarch64-kenix-user/release/console user/console.elf
 	cp user/target/aarch64-kenix-user/release/init user/init.elf
 	cp user/target/aarch64-kenix-user/release/vfs user/vfs.elf
+	cp user/target/aarch64-kenix-user/release/hello user/hello.elf
 
 kernel: user
 	cd kernel && cargo +nightly build --release --target aarch64-kenix.json -Zbuild-std=core,alloc

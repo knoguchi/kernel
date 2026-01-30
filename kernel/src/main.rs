@@ -146,18 +146,20 @@ impl Write for Uart {
 
 unsafe impl Send for Uart {}
 
-static UART: Mutex<Uart> = Mutex::new(Uart::new(UART_BASE));
+pub static UART: Mutex<Uart> = Mutex::new(Uart::new(UART_BASE));
 
+#[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        write!(UART.lock(), $($arg)*).unwrap()
+        write!($crate::UART.lock(), $($arg)*).unwrap()
     }};
 }
 
+#[macro_export]
 macro_rules! println {
-    () => { print!("\n") };
-    ($($arg:tt)*) => {{ print!($($arg)*); print!("\n"); }};
+    () => { $crate::print!("\n") };
+    ($($arg:tt)*) => {{ $crate::print!($($arg)*); $crate::print!("\n"); }};
 }
 
 #[no_mangle]

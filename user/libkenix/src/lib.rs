@@ -450,6 +450,7 @@ pub mod msg {
     pub const VFS_READ: u64 = 102;
     pub const VFS_WRITE: u64 = 103;
     pub const VFS_STAT: u64 = 104;
+    pub const VFS_READ_SHM: u64 = 110;  // Read via shared memory
 
     // Error codes
     pub const ERR_OK: i64 = 0;

@@ -93,17 +93,20 @@ impl PageFlags {
 /// Maximum L1 entries we track (4GB address space)
 const MAX_L1_ENTRIES: usize = 4;
 
+/// Only track L3 tables for L1[0] (user space), not for kernel RAM (L1[1-3])
+/// This reduces struct size from ~32KB to ~8KB
+const L3_TABLES_COUNT: usize = ENTRIES_PER_TABLE; // 512 entries for L1[0] only
+
 /// Per-task address space
 pub struct AddressSpace {
     /// L1 page table physical address (TTBR0_EL1)
     ttbr0: PhysAddr,
     /// L2 tables (up to 4 for 4GB address space with 1GB per L1 entry)
     l2_tables: [Option<PhysAddr>; MAX_L1_ENTRIES],
-    /// L3 tables: indexed by [l1_idx][l2_idx]
+    /// L3 tables for L1[0] only (user space region 0x00000000-0x40000000)
     /// Only allocated when 4KB mapping is needed in that 2MB region
-    /// Using a flat array to avoid nested arrays issue with const init
-    /// Index = l1_idx * 512 + l2_idx
-    l3_tables: [Option<PhysAddr>; MAX_L1_ENTRIES * ENTRIES_PER_TABLE],
+    /// Index = l2_idx (0-511)
+    l3_tables: [Option<PhysAddr>; L3_TABLES_COUNT],
 }
 
 impl AddressSpace {
@@ -124,12 +127,12 @@ impl AddressSpace {
         let addr_space = Self {
             ttbr0: l1_frame,
             l2_tables: [None; MAX_L1_ENTRIES],
-            l3_tables: [None; MAX_L1_ENTRIES * ENTRIES_PER_TABLE],
+            l3_tables: [None; L3_TABLES_COUNT],
         };
 
-        // Clone kernel mappings from the current TTBR0
+        // Clone kernel mappings from the kernel's TTBR0
         // We copy the L1 entries that map kernel space (0x40000000 and above)
-        let kernel_ttbr0 = read_ttbr0_el1();
+        let kernel_ttbr0 = super::kernel_ttbr0();
         let kernel_l1_ptr = kernel_ttbr0 as *const u64;
 
         // Copy L1 entries 1-3 (covers 0x40000000 - 0xFFFFFFFF)
@@ -163,48 +166,61 @@ impl AddressSpace {
         let mut addr_space = Self {
             ttbr0: l1_frame,
             l2_tables: [None; MAX_L1_ENTRIES],
-            l3_tables: [None; MAX_L1_ENTRIES * ENTRIES_PER_TABLE],
+            l3_tables: [None; L3_TABLES_COUNT],
         };
 
-        // Get kernel page tables
-        let kernel_ttbr0 = read_ttbr0_el1();
-        let kernel_l1_ptr = kernel_ttbr0 as *const u64;
-
-        // Allocate new L2 tables and copy kernel mappings
+        // Allocate new L2 tables with necessary mappings
         // L1[0] covers 0x00000000 - 0x40000000 (device region + user space)
         // L1[1] covers 0x40000000 - 0x80000000 (RAM)
 
-        // For L1[0]: Create new L2 table, copy device mappings (GIC, UART)
+        // For L1[0]: Create new L2 table with device mappings (GIC, UART)
+        // We create it from scratch to avoid read-from-kernel-memory issues
+        const GIC_BASE: u64 = 0x0800_0000;
+        const UART_BASE: u64 = 0x0900_0000;
+
         let l2_0_frame = alloc_frame()?;
         let l2_0_ptr = l2_0_frame.0 as *mut u64;
+
+        // Zero all entries first
         for i in 0..ENTRIES_PER_TABLE {
             ptr::write_volatile(l2_0_ptr.add(i), 0);
         }
 
-        // Get kernel's L2 device table and copy device entries
-        let kernel_l1_0_entry = ptr::read_volatile(kernel_l1_ptr.add(0));
-        if (kernel_l1_0_entry & 0b11) == 0b11 {
-            // It's a table descriptor, get the L2 table address
-            let kernel_l2_0_addr = (kernel_l1_0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
-            // Copy device entries (GIC at index 64, UART at index 72)
-            // Actually, copy all entries to preserve any device mappings
-            for i in 0..ENTRIES_PER_TABLE {
-                let entry = ptr::read_volatile(kernel_l2_0_addr.add(i));
-                ptr::write_volatile(l2_0_ptr.add(i), entry);
-            }
-        }
+        // Map GIC at index 64 (0x08000000 >> 21 = 64)
+        let gic_l2_idx = l2_index(GIC_BASE as usize);
+        let gic_entry = PageTableEntry::block_2mb_device(GIC_BASE);
+        ptr::write_volatile(l2_0_ptr.add(gic_l2_idx), gic_entry.raw());
+
+        // Map UART at index 72 (0x09000000 >> 21 = 72)
+        let uart_l2_idx = l2_index(UART_BASE as usize);
+        let uart_entry = PageTableEntry::block_2mb_device(UART_BASE);
+        ptr::write_volatile(l2_0_ptr.add(uart_l2_idx), uart_entry.raw());
 
         // Set L1[0] to point to our new L2 table
         let l1_0_entry = PageTableEntry::table(l2_0_frame.0 as u64);
         ptr::write_volatile(l1_ptr.add(0), l1_0_entry.as_u64());
         addr_space.l2_tables[0] = Some(l2_0_frame);
 
-        // For L1[1]: Copy the kernel RAM L2 table (or just copy L1 entry for 1GB block)
-        // The kernel uses L2 tables for RAM too, so let's just copy the L1 entry directly
-        // This shares the kernel's L2 table (read-only for our purposes)
-        let kernel_l1_1_entry = ptr::read_volatile(kernel_l1_ptr.add(1));
-        ptr::write_volatile(l1_ptr.add(1), kernel_l1_1_entry);
-        // Note: We don't track this in l2_tables since it's shared with kernel
+        // For L1[1]: Create a fresh L2 RAM table with identity mapping
+        // We create it from scratch to avoid any read-from-kernel-memory issues
+        // RAM region: 0x40000000 - 0x80000000 (512 * 2MB blocks)
+        const RAM_START: u64 = 0x4000_0000;
+        const BLOCK_SIZE_2MB: u64 = 2 * 1024 * 1024;
+
+        let l2_1_frame = alloc_frame()?;
+        let l2_1_ptr = l2_1_frame.0 as *mut u64;
+
+        // Initialize all 512 entries for the RAM region
+        for i in 0..512 {
+            let paddr = RAM_START + (i as u64 * BLOCK_SIZE_2MB);
+            let entry = PageTableEntry::block_2mb_normal(paddr);
+            ptr::write_volatile(l2_1_ptr.add(i), entry.raw());
+        }
+
+        // Set L1[1] to point to our new L2 table
+        let l1_1_entry = PageTableEntry::table(l2_1_frame.0 as u64);
+        ptr::write_volatile(l1_ptr.add(1), l1_1_entry.as_u64());
+        addr_space.l2_tables[1] = Some(l2_1_frame);
 
         Some(addr_space)
     }

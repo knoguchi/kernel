@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hello"
+version = "0.1.0"
+dependencies = [
+ "libkenix",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [

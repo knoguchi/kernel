@@ -7,6 +7,7 @@
 #![no_main]
 
 use libkenix::ipc::{self, Message, TASK_ANY};
+use libkenix::shm::{self, ShmId};
 use libkenix::msg::*;
 use libkenix::console;
 
@@ -14,11 +15,10 @@ use libkenix::console;
 // RAM Filesystem
 // ============================================================================
 
-// Note: Keep sizes small to fit in 4KB frame (kernel limitation)
-const MAX_INODES: usize = 4;
-const MAX_FILE_SIZE: usize = 256;
-const MAX_DIR_ENTRIES: usize = 8;
-const MAX_NAME_LEN: usize = 16;
+const MAX_INODES: usize = 8;
+const MAX_FILE_SIZE: usize = 1024;  // 1KB max file size for owned files
+const MAX_DIR_ENTRIES: usize = 16;
+const MAX_NAME_LEN: usize = 32;
 
 #[derive(Clone, Copy, PartialEq)]
 enum InodeType {
@@ -78,14 +78,12 @@ struct RamFs {
 }
 
 impl RamFs {
-    fn new() -> Self {
-        const EMPTY: Inode = Inode::empty();
-        Self {
-            inodes: [EMPTY; MAX_INODES],
-        }
-    }
-
     fn init(&mut self) {
+        // Initialize all inodes as empty
+        for inode in self.inodes.iter_mut() {
+            *inode = Inode::empty();
+        }
+
         // Create root directory at inode 0
         const EMPTY_ENTRY: DirEntry = DirEntry::empty();
         self.inodes[0] = Inode {
@@ -100,7 +98,7 @@ impl RamFs {
         self.create_file(0, "hello.txt", b"Hello!\n");
 
         // Create /test.txt
-        self.create_file(0, "test.txt", b"Test file.\n");
+        self.create_file(0, "test.txt", b"Test file from VFS.\n");
     }
 
     fn alloc_inode(&mut self) -> Option<usize> {
@@ -115,7 +113,6 @@ impl RamFs {
     fn create_file(&mut self, dir_ino: usize, name: &str, content: &[u8]) -> Option<usize> {
         let ino = self.alloc_inode()?;
 
-        // Initialize file inode
         let mut file_data = FileData {
             data: [0; MAX_FILE_SIZE],
             size: content.len().min(MAX_FILE_SIZE),
@@ -144,7 +141,6 @@ impl RamFs {
     }
 
     fn lookup(&self, path: &[u8], path_len: usize) -> Result<usize, i64> {
-        // Skip leading slash
         let mut start = 0;
         if path_len > 0 && path[0] == b'/' {
             start = 1;
@@ -158,7 +154,6 @@ impl RamFs {
         let mut pos = start;
 
         while pos < path_len {
-            // Find end of component (next / or end)
             let mut end = pos;
             while end < path_len && path[end] != b'/' {
                 end += 1;
@@ -169,7 +164,6 @@ impl RamFs {
                 continue;
             }
 
-            // Look up component
             let comp = &path[pos..end];
             let comp_len = end - pos;
 
@@ -204,6 +198,14 @@ impl RamFs {
         }
 
         Ok(current)
+    }
+
+    fn get_file_size(&self, ino: usize) -> Option<usize> {
+        match &self.inodes[ino].data {
+            InodeData::File(file) => Some(file.size),
+            InodeData::Dir(dir) => Some(dir.count),
+            _ => None,
+        }
     }
 
     fn read(&self, ino: usize, offset: usize, buf: &mut [u8]) -> Result<usize, i64> {
@@ -248,26 +250,14 @@ impl RamFs {
             InodeData::None => Err(ERR_NOENT),
         }
     }
-
-    fn get_size(&self, ino: usize) -> Result<usize, i64> {
-        if ino >= MAX_INODES {
-            return Err(ERR_INVAL);
-        }
-        match &self.inodes[ino].data {
-            InodeData::File(file) => Ok(file.size),
-            InodeData::Dir(dir) => Ok(dir.count),
-            InodeData::None => Err(ERR_NOENT),
-        }
-    }
 }
 
 // ============================================================================
 // Open File Tracking
 // ============================================================================
 
-// Keep client tracking small (kernel limitation)
 const MAX_CLIENTS: usize = 8;
-const MAX_OPEN_FILES: usize = 4;
+const MAX_OPEN_FILES: usize = 8;
 
 #[derive(Clone, Copy)]
 struct OpenFile {
@@ -288,6 +278,8 @@ impl OpenFile {
 
 struct ClientState {
     files: [OpenFile; MAX_OPEN_FILES],
+    shm_id: Option<ShmId>,
+    shm_addr: Option<usize>,
 }
 
 impl ClientState {
@@ -295,6 +287,8 @@ impl ClientState {
         const EMPTY: OpenFile = OpenFile::empty();
         Self {
             files: [EMPTY; MAX_OPEN_FILES],
+            shm_id: None,
+            shm_addr: None,
         }
     }
 }
@@ -317,29 +311,22 @@ fn handle_open(client: usize, msg_data: &[u64; 4]) -> i64 {
         return ERR_INVAL;
     }
 
-    // Path is embedded in message data[0..3] (up to 32 bytes)
-    // data[0] bits 0-7: path length
-    // data[0] bits 8+, data[1-3]: path bytes
     let path_len = (msg_data[0] & 0xFF) as usize;
     if path_len > 31 {
         return ERR_INVAL;
     }
 
-    // Extract path bytes from message
     let mut path_buf = [0u8; 32];
     let msg_bytes = unsafe {
         core::slice::from_raw_parts(msg_data.as_ptr() as *const u8, 32)
     };
-    // Skip first byte (length), copy path
     path_buf[..path_len].copy_from_slice(&msg_bytes[1..1 + path_len]);
 
-    // Lookup the file
     let ino = match unsafe { RAMFS.lookup(&path_buf, path_len) } {
         Ok(i) => i,
         Err(e) => return e,
     };
 
-    // Find free file slot
     let client_state = unsafe { &mut CLIENTS[client] };
     for i in 0..MAX_OPEN_FILES {
         if !client_state.files[i].in_use {
@@ -369,8 +356,6 @@ fn handle_close(client: usize, handle: u64) -> i64 {
     ERR_OK
 }
 
-/// Handle read - returns data in reply message
-/// Reply: tag = bytes_read (or error), data[0-3] = file data (up to 32 bytes)
 fn handle_read(client: usize, handle: u64, len: u64, reply_data: &mut [u64; 4]) -> i64 {
     if client >= MAX_CLIENTS || handle as usize >= MAX_OPEN_FILES {
         return ERR_BADF;
@@ -382,14 +367,12 @@ fn handle_read(client: usize, handle: u64, len: u64, reply_data: &mut [u64; 4]) 
         return ERR_BADF;
     }
 
-    // Read into a local buffer (max 32 bytes for message-based transfer)
     let read_len = (len as usize).min(32);
     let mut buf = [0u8; 32];
 
     match unsafe { RAMFS.read(file.inode, file.offset, &mut buf[..read_len]) } {
         Ok(n) => {
             file.offset += n;
-            // Copy data to reply message
             unsafe {
                 let reply_bytes = core::slice::from_raw_parts_mut(
                     reply_data.as_mut_ptr() as *mut u8,
@@ -401,6 +384,109 @@ fn handle_read(client: usize, handle: u64, len: u64, reply_data: &mut [u64; 4]) 
         }
         Err(e) => e,
     }
+}
+
+fn handle_stat(client: usize, msg_data: &[u64; 4], reply_data: &mut [u64; 4]) -> i64 {
+    if client >= MAX_CLIENTS {
+        return ERR_INVAL;
+    }
+
+    let path_len = (msg_data[0] & 0xFF) as usize;
+    if path_len > 31 {
+        return ERR_INVAL;
+    }
+
+    let mut path_buf = [0u8; 32];
+    let msg_bytes = unsafe {
+        core::slice::from_raw_parts(msg_data.as_ptr() as *const u8, 32)
+    };
+    path_buf[..path_len].copy_from_slice(&msg_bytes[1..1 + path_len]);
+
+    let ino = match unsafe { RAMFS.lookup(&path_buf, path_len) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+
+    let size = match unsafe { RAMFS.get_file_size(ino) } {
+        Some(s) => s,
+        None => return ERR_NOENT,
+    };
+
+    let is_dir = match unsafe { &RAMFS.inodes[ino].data } {
+        InodeData::Dir(_) => 1u64,
+        _ => 0u64,
+    };
+
+    reply_data[0] = size as u64;
+    reply_data[1] = is_dir;
+
+    ERR_OK
+}
+
+fn handle_read_shm(client: usize, msg_data: &[u64; 4]) -> i64 {
+    if client >= MAX_CLIENTS {
+        return ERR_INVAL;
+    }
+
+    let handle = msg_data[0] as usize;
+    let shm_id = msg_data[1];
+    let shm_offset = msg_data[2] as usize;
+    let max_len = msg_data[3] as usize;
+
+    if handle >= MAX_OPEN_FILES {
+        return ERR_BADF;
+    }
+
+    let client_state = unsafe { &mut CLIENTS[client] };
+
+    if client_state.shm_id != Some(shm_id) {
+        if let Some(old_id) = client_state.shm_id {
+            shm::unmap(old_id);
+            client_state.shm_id = None;
+            client_state.shm_addr = None;
+        }
+
+        let addr = shm::map(shm_id, 0);
+        if addr < 0 {
+            return ERR_INVAL;
+        }
+        client_state.shm_id = Some(shm_id);
+        client_state.shm_addr = Some(addr as usize);
+    }
+
+    let shm_base = match client_state.shm_addr {
+        Some(a) => a,
+        None => return ERR_INVAL,
+    };
+
+    let file = &mut client_state.files[handle];
+    if !file.in_use {
+        return ERR_BADF;
+    }
+
+    // Read file data
+    let file_data = match unsafe { &RAMFS.inodes[file.inode].data } {
+        InodeData::File(f) => &f.data[..f.size],
+        _ => return ERR_ISDIR,
+    };
+
+    if file.offset >= file_data.len() {
+        return 0;
+    }
+    let avail = file_data.len() - file.offset;
+    let to_read = max_len.min(avail);
+
+    let dest_ptr = (shm_base + shm_offset) as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            file_data[file.offset..].as_ptr(),
+            dest_ptr,
+            to_read
+        );
+    }
+
+    file.offset += to_read;
+    to_read as i64
 }
 
 fn handle_write(client: usize, handle: u64, buf_ptr: u64, len: u64) -> i64 {
@@ -433,63 +519,27 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn main() -> ! {
-    // Initialize ramfs
     unsafe {
         RAMFS.init();
     }
 
     console::println("[vfs] Server started");
 
-    // Main message loop
     loop {
         let recv = ipc::recv(TASK_ANY);
         let client = recv.sender;
 
-        // Debug: show what we received
-        console::print("[vfs] recv tag=");
-        console::print_hex("", recv.msg.tag);
-
-        // Prepare reply data (may be filled by handle_read)
         let mut reply_data = [0u64; 4];
 
         let result = match recv.msg.tag {
-            VFS_OPEN => {
-                console::print("[vfs] OPEN\n");
-                // Path embedded in msg.data
-                handle_open(client, &recv.msg.data)
-            }
-            VFS_CLOSE => {
-                console::print("[vfs] CLOSE\n");
-                handle_close(client, recv.msg.data[0])
-            }
-            VFS_READ => {
-                console::print("[vfs] READ\n");
-                // data[0] = handle, data[1] = max_len
-                handle_read(
-                    client,
-                    recv.msg.data[0],
-                    recv.msg.data[1],
-                    &mut reply_data,
-                )
-            }
-            VFS_WRITE => {
-                console::print("[vfs] WRITE\n");
-                handle_write(
-                    client,
-                    recv.msg.data[0],  // handle
-                    recv.msg.data[1],  // buf_ptr (unused for now)
-                    recv.msg.data[2],  // len
-                )
-            }
-            _ => {
-                console::print("[vfs] UNKNOWN\n");
-                ERR_INVAL
-            }
+            VFS_OPEN => handle_open(client, &recv.msg.data),
+            VFS_CLOSE => handle_close(client, recv.msg.data[0]),
+            VFS_READ => handle_read(client, recv.msg.data[0], recv.msg.data[1], &mut reply_data),
+            VFS_STAT => handle_stat(client, &recv.msg.data, &mut reply_data),
+            VFS_READ_SHM => handle_read_shm(client, &recv.msg.data),
+            VFS_WRITE => handle_write(client, recv.msg.data[0], recv.msg.data[1], recv.msg.data[2]),
+            _ => ERR_INVAL,
         };
-
-        // Debug: show result
-        console::print("[vfs] reply result=");
-        console::print_hex("", result as u64);
 
         let reply = Message::new(result as u64, reply_data);
         ipc::reply(&reply);

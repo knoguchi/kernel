@@ -102,8 +102,8 @@ impl FileDescriptor {
     }
 }
 
-/// Kernel stack size per task (16KB)
-pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
+/// Kernel stack size per task (128KB - needs to be large due to AddressSpace struct ~32KB)
+pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
 
 /// Default time slice in timer ticks
 pub const DEFAULT_TIME_SLICE: u32 = 1;

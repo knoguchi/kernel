@@ -22,6 +22,8 @@ const EM_AARCH64: u16 = 183;
 
 /// ELF executable type
 const ET_EXEC: u16 = 2;
+/// ELF shared object type (also used for PIE executables)
+const ET_DYN: u16 = 3;
 
 /// Program header types
 const PT_LOAD: u32 = 1;
@@ -147,8 +149,8 @@ impl<'a> ElfFile<'a> {
             return Err(ElfError::NotAarch64);
         }
 
-        // Check executable type
-        if header.e_type != ET_EXEC {
+        // Check executable type (ET_EXEC or ET_DYN for PIE)
+        if header.e_type != ET_EXEC && header.e_type != ET_DYN {
             return Err(ElfError::NotExecutable);
         }
 

@@ -6,6 +6,18 @@
 use super::frame::alloc_frame;
 use super::paging::{PageTableEntry, BLOCK_SIZE_2MB, l1_index, l2_index};
 
+/// Kernel's original TTBR0 value, stored at boot time
+/// This is needed because during syscalls, TTBR0_EL1 contains the user's page table
+static mut KERNEL_TTBR0: u64 = 0;
+
+/// Get the kernel's original TTBR0 value
+///
+/// # Safety
+/// Must be called after init_and_enable()
+pub fn kernel_ttbr0() -> u64 {
+    unsafe { KERNEL_TTBR0 }
+}
+
 /// MAIR_EL1 value:
 /// Attr0 (index 0) = 0x00 = Device-nGnRnE
 /// Attr1 (index 1) = 0xFF = Normal Write-Back (Inner/Outer Write-Back, Read/Write Allocate)
@@ -105,6 +117,9 @@ pub unsafe fn init_and_enable(print_fn: impl Fn(&str, u64)) {
     write_mair_el1(MAIR_VALUE);
     write_tcr_el1(TCR_VALUE);
     write_ttbr0_el1(l1_addr as u64);
+
+    // Store kernel's TTBR0 for later use by address space creation
+    KERNEL_TTBR0 = l1_addr as u64;
 
     // Instruction barrier after register writes
     core::arch::asm!("isb", options(nostack, preserves_flags));

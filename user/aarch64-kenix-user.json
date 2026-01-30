@@ -11,7 +11,8 @@
     "panic-strategy": "abort",
     "disable-redzone": true,
     "features": "+strict-align,+neon,+fp-armv8",
+    "relocation-model": "static",
     "pre-link-args": {
-        "gnu-lld": ["-Tuser.ld", "--gc-sections"]
+        "gnu-lld": ["-Tuser.ld", "--gc-sections", "-z", "max-page-size=4096"]
     }
 }
