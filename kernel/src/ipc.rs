@@ -7,11 +7,13 @@
 //! - `reply`: Reply to a caller and return immediately
 
 use crate::sched::task::{
-    TaskId, TaskState, Message, TASKS, MAX_TASKS,
+    TaskId, TaskState, Message, TASKS, MAX_TASKS, PendingSyscall,
     enqueue_sender, find_sender, remove_from_sender_queue,
+    FileDescriptor, FdKind, FdFlags,
 };
 use crate::sched::{self, current};
 use crate::exception::ExceptionContext;
+use crate::shm;
 
 /// Write sys_recv return values to a task's saved exception context
 ///
@@ -319,8 +321,29 @@ pub fn sys_reply(msg: Message) -> i64 {
         caller_task.ipc.pending_msg = msg;
         caller_task.ipc.reply_to = None;
 
+        // Check if this reply completes a pending syscall
+        let pending = caller_task.pending_syscall;
+        let (x0_val, x1_opt) = complete_pending_syscall(caller_id, pending, &msg);
+
         // Set up return values in caller's saved context
-        set_call_return(caller_id, &msg);
+        if !pending.is_none() {
+            // Pending syscall - set x0 (and optionally x1) directly
+            let task = &TASKS[caller_id.0];
+            let ctx = task.kernel_stack_top as *mut ExceptionContext;
+            if !ctx.is_null() {
+                (*ctx).gpr[0] = x0_val as u64;
+                if let Some(x1_val) = x1_opt {
+                    (*ctx).gpr[1] = x1_val as u64;
+                }
+            }
+        } else {
+            // Normal IPC - use standard return format
+            set_call_return(caller_id, &msg);
+        }
+
+        // Clear pending syscall
+        let caller_task = &mut TASKS[caller_id.0];
+        caller_task.pending_syscall = PendingSyscall::None;
 
         // Wake up caller
         caller_task.state = TaskState::Ready;
@@ -332,6 +355,121 @@ pub fn sys_reply(msg: Message) -> i64 {
     }
 
     IPC_OK
+}
+
+/// Complete a pending syscall using the IPC reply from a server
+///
+/// Returns (x0_value, optional_x1_value) for the syscall return
+unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, reply: &Message) -> (i64, Option<i64>) {
+    match pending {
+        PendingSyscall::None => {
+            // No pending syscall, use reply tag directly
+            (reply.tag as i64, None)
+        }
+        PendingSyscall::PipeCreate => {
+            let pipe_id = reply.tag as i64;
+
+            // Check if pipeserv returned an error
+            if pipe_id < 0 {
+                return (pipe_id, Some(pipe_id)); // Both fds are error
+            }
+
+            let caller_task = &mut TASKS[caller_id.0];
+
+            // Allocate read fd
+            let read_fd = match caller_task.alloc_fd() {
+                Some(fd) => fd,
+                None => return (-12, Some(-12)), // ENOMEM
+            };
+            caller_task.fds[read_fd] = FileDescriptor {
+                kind: FdKind::PipeRead,
+                flags: FdFlags::read_only(),
+                server: TaskId(6), // PIPESERV_TID
+                handle: pipe_id as u64,
+            };
+
+            // Allocate write fd
+            let write_fd = match caller_task.alloc_fd() {
+                Some(fd) => fd,
+                None => {
+                    caller_task.close_fd(read_fd);
+                    return (-12, Some(-12)); // ENOMEM
+                }
+            };
+            caller_task.fds[write_fd] = FileDescriptor {
+                kind: FdKind::PipeWrite,
+                flags: FdFlags::write_only(),
+                server: TaskId(6), // PIPESERV_TID
+                handle: pipe_id as u64,
+            };
+
+            (read_fd as i64, Some(write_fd as i64))
+        }
+        PendingSyscall::PipeRead { user_buf, max_len: _, shm_id } => {
+            let bytes_read = reply.tag as i64;
+
+            if bytes_read > 0 {
+                // Get physical address of SHM (kernel has identity mapping)
+                let shm_phys = shm::get_shm_phys_addr(shm_id);
+                if shm_phys != 0 {
+                    // We need to copy to the caller's address space, but we're
+                    // currently running in the server's context. Temporarily
+                    // switch to the caller's page table for the copy.
+                    let caller_task = &TASKS[caller_id.0];
+                    let caller_ttbr0 = caller_task.page_table.0 as u64;
+
+                    // Save current TTBR0 and switch to caller's page table
+                    let saved_ttbr0: u64;
+                    core::arch::asm!(
+                        "mrs {0}, ttbr0_el1",
+                        "msr ttbr0_el1, {1}",
+                        "isb",
+                        "dsb sy",
+                        "tlbi vmalle1is",
+                        "dsb sy",
+                        "isb",
+                        out(reg) saved_ttbr0,
+                        in(reg) caller_ttbr0,
+                    );
+
+                    // Now we can access the caller's address space
+                    core::ptr::copy_nonoverlapping(
+                        shm_phys as *const u8,
+                        user_buf as *mut u8,
+                        bytes_read as usize,
+                    );
+
+                    // Restore original page table
+                    core::arch::asm!(
+                        "msr ttbr0_el1, {0}",
+                        "isb",
+                        "dsb sy",
+                        "tlbi vmalle1is",
+                        "dsb sy",
+                        "isb",
+                        in(reg) saved_ttbr0,
+                    );
+                }
+            }
+
+            // Clean up: unmap from caller's space if mapped, then destroy SHM
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            (bytes_read, None)
+        }
+        PendingSyscall::PipeWrite { shm_id } => {
+            let bytes_written = reply.tag as i64;
+
+            // Clean up: unmap from caller's space if mapped
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            (bytes_written, None)
+        }
+        PendingSyscall::PipeClose => {
+            // Just return success
+            (0, None)
+        }
+    }
 }
 
 /// Wake a task from IPC blocked state (used by scheduler)

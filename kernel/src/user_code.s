@@ -30,3 +30,17 @@ __vfs_elf_end:
 __blkdev_elf_start:
 .incbin "../user/blkdev.elf"
 __blkdev_elf_end:
+
+// Network device server ELF (task ID 5)
+.global __netdev_elf_start
+.global __netdev_elf_end
+__netdev_elf_start:
+.incbin "../user/netdev.elf"
+__netdev_elf_end:
+
+// Pipe server ELF (task ID 6)
+.global __pipeserv_elf_start
+.global __pipeserv_elf_end
+__pipeserv_elf_start:
+.incbin "../user/pipeserv.elf"
+__pipeserv_elf_end:

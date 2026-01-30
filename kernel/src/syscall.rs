@@ -14,10 +14,20 @@
 //! - 0: SYS_YIELD - Voluntarily yield the CPU
 
 use crate::exception::ExceptionContext;
-use crate::sched::{self, TaskId, Message, TaskState};
+use crate::sched::{self, TaskId, Message, TaskState, FileDescriptor, PendingSyscall};
+use crate::sched::task::FdFlags;
 use crate::ipc;
 use crate::shm;
 use crate::irq;
+
+/// Pipe server task ID
+const PIPESERV_TID: TaskId = TaskId(6);
+
+/// Pipe server IPC message tags
+const PIPE_CREATE: u64 = 500;
+const PIPE_READ: u64 = 501;
+const PIPE_WRITE: u64 = 502;
+const PIPE_CLOSE: u64 = 503;
 
 /// Syscall numbers - IPC (Kenix microkernel)
 pub const SYS_SEND: u16 = 1;     // Send message, block until received
@@ -33,6 +43,8 @@ pub const SYS_SHMGRANT: u16 = 13;   // Grant another task access to shared memor
 
 /// Syscall numbers - Kenix-specific
 pub const SYS_YIELD: u16 = 0;    // Voluntarily yield CPU
+pub const SYS_NOTIFY: u16 = 7;   // Send async notification
+pub const SYS_WAIT_NOTIFY: u16 = 8;  // Wait for notification
 pub const SYS_GETPID: u16 = 20;  // Get current task ID
 pub const SYS_SPAWN: u16 = 21;   // Create new task from ELF
 
@@ -42,9 +54,10 @@ pub const SYS_IRQ_WAIT: u16 = 31;      // Wait for IRQ to fire
 pub const SYS_IRQ_ACK: u16 = 32;       // Acknowledge IRQ
 
 /// Syscall numbers - POSIX-compatible file I/O
+pub const SYS_CLOSE: u16 = 57;   // Close file descriptor
+pub const SYS_PIPE: u16 = 59;    // Create pipe
 pub const SYS_READ: u16 = 63;    // Read from file descriptor
 pub const SYS_WRITE: u16 = 64;   // Write to file descriptor
-pub const SYS_CLOSE: u16 = 57;   // Close file descriptor
 pub const SYS_EXIT: u16 = 93;    // Terminate process
 
 /// Error codes (Linux-compatible)
@@ -71,6 +84,21 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
     match syscall_num {
         SYS_YIELD => {
             ctx.gpr[0] = sys_yield() as u64;
+        }
+
+        // Notification syscalls
+        // SYS_NOTIFY: x0=dest_tid, x1=bits → returns result in x0
+        SYS_NOTIFY => {
+            let dest = TaskId(ctx.gpr[0] as usize);
+            let bits = ctx.gpr[1];
+            ctx.gpr[0] = sys_notify(dest, bits) as u64;
+        }
+
+        // SYS_WAIT_NOTIFY: x0=expected_bits → returns received bits in x0
+        SYS_WAIT_NOTIFY => {
+            let expected_bits = ctx.gpr[0];
+            let result = sys_wait_notify(ctx, expected_bits);
+            ctx.gpr[0] = result as u64;
         }
 
         // IPC syscalls - register convention:
@@ -153,19 +181,26 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             let fd = ctx.gpr[0] as usize;
             let buf = ctx.gpr[1] as usize;
             let len = ctx.gpr[2] as usize;
-            ctx.gpr[0] = sys_read(fd, buf, len) as u64;
+            ctx.gpr[0] = sys_read(ctx, fd, buf, len) as u64;
         }
 
         SYS_WRITE => {
             let fd = ctx.gpr[0] as usize;
             let buf = ctx.gpr[1] as usize;
             let len = ctx.gpr[2] as usize;
-            ctx.gpr[0] = sys_write(fd, buf, len) as u64;
+            ctx.gpr[0] = sys_write(ctx, fd, buf, len) as u64;
         }
 
         SYS_CLOSE => {
             let fd = ctx.gpr[0] as usize;
-            ctx.gpr[0] = sys_close(fd) as u64;
+            ctx.gpr[0] = sys_close(ctx, fd) as u64;
+        }
+
+        // SYS_PIPE: returns read_fd in x0, write_fd in x1
+        SYS_PIPE => {
+            let (read_fd, write_fd) = sys_pipe(ctx);
+            ctx.gpr[0] = read_fd as u64;
+            ctx.gpr[1] = write_fd as u64;
         }
 
         SYS_EXIT => {
@@ -228,7 +263,7 @@ use sched::task::{TASKS, FdKind};
 ///
 /// Currently only supports stdin (fd=0) from console.
 /// Returns number of bytes read, or negative error code.
-fn sys_read(fd: usize, buf: usize, len: usize) -> i64 {
+fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i64 {
     // Get current task's fd table
     let current_id = match sched::current() {
         Some(id) => id,
@@ -281,6 +316,42 @@ fn sys_read(fd: usize, buf: usize, len: usize) -> i64 {
 
             1 // Read one character
         }
+        FdKind::PipeRead => {
+            let pipe_id = fd_entry.handle;
+            if len == 0 {
+                return 0;
+            }
+
+            // Create SHM for data transfer
+            let shm_id_i64 = shm::sys_shmcreate(len);
+            if shm_id_i64 < 0 {
+                return ENOMEM;
+            }
+            let shm_id = shm_id_i64 as usize;
+
+            // Grant pipeserv access to SHM
+            shm::sys_shmgrant(shm_id, PIPESERV_TID.0);
+
+            // Set up pending syscall - IPC reply will complete it
+            unsafe {
+                let task = &mut TASKS[current_id.0];
+                task.pending_syscall = PendingSyscall::PipeRead {
+                    user_buf: buf,
+                    max_len: len,
+                    shm_id,
+                };
+            }
+
+            // Send PIPE_READ request to pipeserv
+            // The IPC will block, and when pipeserv replies, the reply handler
+            // will complete the syscall by copying data from SHM to user_buf
+            let msg = Message::new(PIPE_READ, [pipe_id, shm_id as u64, len as u64, 0]);
+            ipc::sys_call(ctx, PIPESERV_TID, msg);
+
+            // Note: Code after sys_call never runs due to ERET.
+            // The return value is set by complete_pending_syscall in ipc.rs
+            0 // Placeholder - never actually returned
+        }
         _ => EBADF,
     }
 }
@@ -289,7 +360,7 @@ fn sys_read(fd: usize, buf: usize, len: usize) -> i64 {
 ///
 /// Currently supports stdout (fd=1) and stderr (fd=2) to console.
 /// Returns number of bytes written, or negative error code.
-fn sys_write(fd: usize, buf: usize, len: usize) -> i64 {
+fn sys_write(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i64 {
     // Get current task's fd table
     let current_id = match sched::current() {
         Some(id) => id,
@@ -341,12 +412,54 @@ fn sys_write(fd: usize, buf: usize, len: usize) -> i64 {
 
             len as i64
         }
+        FdKind::PipeWrite => {
+            let pipe_id = fd_entry.handle;
+            if len == 0 {
+                return 0;
+            }
+
+            // Create SHM for data transfer
+            let shm_id_i64 = shm::sys_shmcreate(len);
+            if shm_id_i64 < 0 {
+                return ENOMEM;
+            }
+            let shm_id = shm_id_i64 as usize;
+
+            // Map SHM and copy data from user buffer
+            let shm_addr = shm::sys_shmmap(shm_id, 0);
+            if shm_addr < 0 {
+                return ENOMEM;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf as *const u8,
+                    shm_addr as *mut u8,
+                    len,
+                );
+            }
+
+            // Grant pipeserv access to SHM
+            shm::sys_shmgrant(shm_id, PIPESERV_TID.0);
+
+            // Set up pending syscall
+            unsafe {
+                let task = &mut TASKS[current_id.0];
+                task.pending_syscall = PendingSyscall::PipeWrite { shm_id };
+            }
+
+            // Send PIPE_WRITE request to pipeserv
+            let msg = Message::new(PIPE_WRITE, [pipe_id, shm_id as u64, len as u64, 0]);
+            ipc::sys_call(ctx, PIPESERV_TID, msg);
+
+            // Return value set by complete_pending_syscall
+            0 // Placeholder
+        }
         _ => EBADF,
     }
 }
 
 /// SYS_CLOSE - Close a file descriptor
-fn sys_close(fd: usize) -> i64 {
+fn sys_close(ctx: &mut ExceptionContext, fd: usize) -> i64 {
     let current_id = match sched::current() {
         Some(id) => id,
         None => return EBADF,
@@ -354,12 +467,68 @@ fn sys_close(fd: usize) -> i64 {
 
     unsafe {
         let task = &mut TASKS[current_id.0];
-        if task.close_fd(fd) {
-            ESUCCESS
-        } else {
-            EBADF
+        if fd >= sched::MAX_FDS {
+            return EBADF;
         }
+
+        let fd_entry = task.fds[fd];
+        if fd_entry.kind == FdKind::None {
+            return EBADF;
+        }
+
+        // Close the local fd first
+        task.close_fd(fd);
+
+        // Handle pipe cleanup via IPC to pipeserv
+        match fd_entry.kind {
+            FdKind::PipeRead | FdKind::PipeWrite => {
+                let is_read = fd_entry.kind == FdKind::PipeRead;
+
+                // Set up pending syscall
+                task.pending_syscall = PendingSyscall::PipeClose;
+
+                // Send PIPE_CLOSE to pipeserv
+                let msg = Message::new(PIPE_CLOSE, [fd_entry.handle, is_read as u64, 0, 0]);
+                ipc::sys_call(ctx, PIPESERV_TID, msg);
+
+                // Return value set by complete_pending_syscall
+                return 0;
+            }
+            _ => {}
+        }
+
+        ESUCCESS
     }
+}
+
+/// SYS_PIPE - Create a pipe
+///
+/// Creates a pipe via pipeserv and returns two file descriptors.
+///
+/// # Returns
+/// (read_fd, write_fd) on success, or (-1, -1) on failure
+fn sys_pipe(ctx: &mut ExceptionContext) -> (i64, i64) {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return (EBADF, EBADF),
+    };
+
+    // Set up pending syscall - IPC reply will allocate fds and return them
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::PipeCreate;
+    }
+
+    // Send PIPE_CREATE request to pipeserv
+    // The reply handler (complete_pending_syscall) will:
+    // 1. Get pipe_id from reply
+    // 2. Allocate two fds
+    // 3. Set x0=read_fd, x1=write_fd
+    let msg = Message::new(PIPE_CREATE, [0; 4]);
+    ipc::sys_call(ctx, PIPESERV_TID, msg);
+
+    // Return value set by complete_pending_syscall
+    (0, 0) // Placeholder - never actually returned
 }
 
 /// SYS_GETPID - Get current task ID
@@ -475,4 +644,92 @@ fn sys_irq_wait(ctx: &mut ExceptionContext, irq: u32) -> i64 {
 /// * Negative error code on failure
 fn sys_irq_ack(irq: u32) -> i64 {
     irq::acknowledge_irq(irq)
+}
+
+/// SYS_NOTIFY - Send asynchronous notification to a task
+///
+/// Sets notification bits on the target task. If the target is blocked
+/// waiting for any of these bits, it will be woken up.
+///
+/// # Arguments
+/// * `dest` - Target task ID
+/// * `bits` - Notification bits to set (OR'd with existing pending bits)
+///
+/// # Returns
+/// * 0 on success
+/// * Negative error code on failure
+fn sys_notify(dest: TaskId, bits: u64) -> i64 {
+    use sched::task::MAX_TASKS;
+
+    // Validate target
+    if dest.0 >= MAX_TASKS {
+        return EINVAL;
+    }
+
+    unsafe {
+        let target = &mut TASKS[dest.0];
+
+        // Check target is valid
+        if target.state == TaskState::Free || target.state == TaskState::Terminated {
+            return EINVAL;
+        }
+
+        // Set notification bits
+        target.notify_pending |= bits;
+
+        // If target is waiting for notifications and any expected bits are now set, wake it
+        if target.state == TaskState::NotifyBlocked {
+            let matched = target.notify_pending & target.notify_waiting;
+            if matched != 0 {
+                target.state = TaskState::Ready;
+                sched::enqueue_task(dest);
+            }
+        }
+    }
+
+    ESUCCESS
+}
+
+/// SYS_WAIT_NOTIFY - Wait for notification bits
+///
+/// Blocks until any of the expected notification bits are set.
+/// Returns immediately if any expected bits are already pending.
+///
+/// # Arguments
+/// * `ctx` - Exception context (for potential blocking)
+/// * `expected_bits` - Bits to wait for (0 = any bit)
+///
+/// # Returns
+/// * Matched notification bits (which are then cleared)
+fn sys_wait_notify(ctx: &mut ExceptionContext, expected_bits: u64) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    // If expected_bits is 0, wait for any notification
+    let mask = if expected_bits == 0 { !0u64 } else { expected_bits };
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // Check if any expected bits are already pending
+        let matched = task.notify_pending & mask;
+        if matched != 0 {
+            // Clear matched bits and return them
+            task.notify_pending &= !matched;
+            return matched as i64;
+        }
+
+        // No bits pending - need to block
+        task.notify_waiting = mask;
+        task.state = TaskState::NotifyBlocked;
+        sched::context_switch_blocking(ctx);
+
+        // When we wake up, check which bits matched
+        let matched = task.notify_pending & mask;
+        task.notify_pending &= !matched;
+        task.notify_waiting = 0;
+        matched as i64
+    }
 }

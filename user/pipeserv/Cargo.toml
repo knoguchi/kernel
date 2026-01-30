@@ -1,0 +1,7 @@
+[package]
+name = "pipeserv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkenix = { path = "../libkenix" }

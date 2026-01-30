@@ -211,12 +211,57 @@ Reply:
 
 ---
 
-## Network Server :construction:
+## Network Device Server (Task 5)
 
-### NET_SOCKET (300) - Create socket
+The network device server provides raw packet send/receive via VirtIO-net.
+
+### NET_SEND (300) - Send packet
 ```
 Request:
   tag = 300
+  data[0] = shm_id (source buffer)
+  data[1] = offset in SHM
+  data[2] = length (max 1514 bytes)
+
+Reply:
+  tag = bytes_sent (>= 0) or error (< 0)
+```
+Note: Caller must grant netdev server access via `SYS_SHMGRANT` first.
+
+### NET_RECV (301) - Receive packet
+```
+Request:
+  tag = 301
+  data[0] = shm_id (destination buffer)
+  data[1] = offset in SHM
+  data[2] = max_length
+
+Reply:
+  tag = bytes_received (>= 0) or error (< 0)
+```
+Returns 0 if no packet is available.
+
+### NET_INFO (302) - Get device info
+```
+Request:
+  tag = 302
+
+Reply:
+  tag = ERR_OK (0)
+  data[0] = MAC address (6 bytes packed in low 48 bits)
+  data[1] = link status (1 = up, 0 = down)
+```
+
+---
+
+## Network Socket Server (Future) :construction:
+
+The socket server will provide TCP/IP networking, built on top of the netdev raw packet interface.
+
+### SOCK_SOCKET (400) - Create socket
+```
+Request:
+  tag = 400
   data[0] = domain (AF_INET=2)
   data[1] = type (SOCK_STREAM=1, SOCK_DGRAM=2)
 
@@ -224,10 +269,10 @@ Reply:
   tag = socket_handle or error
 ```
 
-### NET_BIND (301) - Bind socket
+### SOCK_BIND (401) - Bind socket
 ```
 Request:
-  tag = 301
+  tag = 401
   data[0] = socket_handle
   data[1] = ip_address (big-endian)
   data[2] = port
@@ -236,10 +281,10 @@ Reply:
   tag = 0 or error
 ```
 
-### NET_LISTEN (302) - Listen for connections
+### SOCK_LISTEN (402) - Listen for connections
 ```
 Request:
-  tag = 302
+  tag = 402
   data[0] = socket_handle
   data[1] = backlog
 
@@ -247,10 +292,10 @@ Reply:
   tag = 0 or error
 ```
 
-### NET_ACCEPT (303) - Accept connection
+### SOCK_ACCEPT (403) - Accept connection
 ```
 Request:
-  tag = 303
+  tag = 403
   data[0] = socket_handle
 
 Reply:
@@ -259,10 +304,10 @@ Reply:
   data[1] = client_port
 ```
 
-### NET_CONNECT (304) - Connect to server
+### SOCK_CONNECT (404) - Connect to server
 ```
 Request:
-  tag = 304
+  tag = 404
   data[0] = socket_handle
   data[1] = ip_address
   data[2] = port
@@ -271,10 +316,10 @@ Reply:
   tag = 0 or error
 ```
 
-### NET_SEND (305) - Send data
+### SOCK_SEND (405) - Send data
 ```
 Request:
-  tag = 305
+  tag = 405
   data[0] = socket_handle
   data[1] = shm_id
   data[2] = offset
@@ -284,10 +329,10 @@ Reply:
   tag = bytes_sent or error
 ```
 
-### NET_RECV (306) - Receive data
+### SOCK_RECV (406) - Receive data
 ```
 Request:
-  tag = 306
+  tag = 406
   data[0] = socket_handle
   data[1] = shm_id
   data[2] = offset
@@ -297,10 +342,10 @@ Reply:
   tag = bytes_received or error
 ```
 
-### NET_CLOSE (307) - Close socket
+### SOCK_CLOSE (407) - Close socket
 ```
 Request:
-  tag = 307
+  tag = 407
   data[0] = socket_handle
 
 Reply:
@@ -318,7 +363,8 @@ Reply:
 | 2 | Init | Init process |
 | 3 | VFS | Virtual filesystem server (ramfs + FAT32) |
 | 4 | Blkdev | Block device server (VirtIO-blk) |
-| 5+ | (dynamic) | User applications |
+| 5 | Netdev | Network device server (VirtIO-net) |
+| 6+ | (dynamic) | User applications |
 
 ---
 

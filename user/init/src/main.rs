@@ -169,6 +169,49 @@ fn main() -> ! {
     }
 
     // ========================================
+    // Test Pipe
+    // ========================================
+    print("\n--- Pipe Test ---\n");
+
+    let (read_fd, write_fd) = syscall::pipe();
+    if read_fd >= 0 && write_fd >= 0 {
+        print("Created pipe: read_fd=");
+        print_num(read_fd as usize);
+        print(", write_fd=");
+        print_num(write_fd as usize);
+        print("\n");
+
+        // Write to pipe
+        let test_data = b"Hello, pipe!";
+        let written = syscall::write(write_fd as usize, test_data);
+        print("Wrote ");
+        print_num(written as usize);
+        print(" bytes to pipe\n");
+
+        // Read from pipe
+        let mut buf = [0u8; 32];
+        let read_count = syscall::read(read_fd as usize, &mut buf);
+        if read_count > 0 {
+            print("Read from pipe: ");
+            syscall::write(1, &buf[..read_count as usize]);
+            print("\n");
+        } else {
+            print("Read failed: ");
+            print_num((-read_count) as usize);
+            print("\n");
+        }
+
+        // Close pipe ends
+        syscall::close(read_fd as usize);
+        syscall::close(write_fd as usize);
+        print("Pipe closed\n");
+    } else {
+        print("Failed to create pipe: ");
+        print_num((-read_fd) as usize);
+        print("\n");
+    }
+
+    // ========================================
     // Spawn hello from embedded ELF
     // ========================================
     print("\n--- Spawn Test ---\n");

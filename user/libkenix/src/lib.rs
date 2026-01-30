@@ -76,6 +76,8 @@ pub mod syscall {
     pub const SYS_RECV: u64 = 2;
     pub const SYS_CALL: u64 = 3;
     pub const SYS_REPLY: u64 = 4;
+    pub const SYS_NOTIFY: u64 = 7;
+    pub const SYS_WAIT_NOTIFY: u64 = 8;
     pub const SYS_SHMCREATE: u64 = 10;
     pub const SYS_SHMMAP: u64 = 11;
     pub const SYS_SHMUNMAP: u64 = 12;
@@ -86,6 +88,7 @@ pub mod syscall {
     pub const SYS_IRQ_WAIT: u64 = 31;
     pub const SYS_IRQ_ACK: u64 = 32;
     pub const SYS_CLOSE: u64 = 57;
+    pub const SYS_PIPE: u64 = 59;
     pub const SYS_READ: u64 = 63;
     pub const SYS_WRITE: u64 = 64;
     pub const SYS_EXIT: u64 = 93;
@@ -261,6 +264,77 @@ pub mod syscall {
             );
         }
         ret
+    }
+
+    /// Send asynchronous notification to a task
+    ///
+    /// Sets notification bits on the target task. If the target is waiting
+    /// for any of these bits, it will be woken up.
+    ///
+    /// # Arguments
+    /// * `dest` - Target task ID
+    /// * `bits` - Notification bits to set
+    ///
+    /// # Returns
+    /// * 0 on success
+    /// * Negative error code on failure
+    pub fn notify(dest: usize, bits: u64) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") dest => ret,
+                in("x1") bits,
+                in("x8") SYS_NOTIFY,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Wait for notification bits
+    ///
+    /// Blocks until any of the expected notification bits are set.
+    /// Returns immediately if any expected bits are already pending.
+    ///
+    /// # Arguments
+    /// * `expected_bits` - Bits to wait for (0 = any bit)
+    ///
+    /// # Returns
+    /// * Matched notification bits (which are then cleared)
+    pub fn wait_notify(expected_bits: u64) -> u64 {
+        let ret: u64;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") expected_bits => ret,
+                in("x8") SYS_WAIT_NOTIFY,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Create a pipe
+    ///
+    /// Creates a unidirectional pipe with a read end and write end.
+    ///
+    /// # Returns
+    /// * (read_fd, write_fd) tuple on success
+    /// * (-1, -1) on failure
+    pub fn pipe() -> (isize, isize) {
+        let read_fd: isize;
+        let write_fd: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                out("x0") read_fd,
+                out("x1") write_fd,
+                in("x8") SYS_PIPE,
+                options(nostack)
+            );
+        }
+        (read_fd, write_fd)
     }
 }
 
@@ -528,6 +602,17 @@ pub mod msg {
     pub const BLK_WRITE: u64 = 201;     // Write sectors
     pub const BLK_INFO: u64 = 202;      // Get device info (sector count, sector size)
 
+    // Network device server messages
+    pub const NET_SEND: u64 = 300;      // Send packet (shm_id, offset, len)
+    pub const NET_RECV: u64 = 301;      // Receive packet (shm_id, offset, max_len)
+    pub const NET_INFO: u64 = 302;      // Get device info (MAC, link status)
+
+    // Pipe server messages
+    pub const PIPE_CREATE: u64 = 500;   // Create new pipe -> returns pipe_id
+    pub const PIPE_READ: u64 = 501;     // Read from pipe (pipe_id, shm_id, max_len)
+    pub const PIPE_WRITE: u64 = 502;    // Write to pipe (pipe_id, shm_id, len)
+    pub const PIPE_CLOSE: u64 = 503;    // Close pipe end (pipe_id, is_read_end)
+
     // Error codes
     pub const ERR_OK: i64 = 0;
     pub const ERR_NOENT: i64 = -2;
@@ -545,6 +630,10 @@ pub mod msg {
 /// VirtIO block device IRQ (SPI 48 + 32 for GIC offset)
 pub const VIRTIO_BLK_IRQ: u32 = 48 + 32;
 
+/// VirtIO network device IRQ (SPI 49 + 32 for GIC offset)
+/// Each VirtIO MMIO slot gets its own IRQ (48, 49, 50, ...)
+pub const VIRTIO_NET_IRQ: u32 = 49 + 32;
+
 // ============================================================================
 // Well-known Task IDs
 // ============================================================================
@@ -555,4 +644,6 @@ pub mod tasks {
     pub const INIT: usize = 2;
     pub const VFS: usize = 3;
     pub const BLKDEV: usize = 4;
+    pub const NETDEV: usize = 5;
+    pub const PIPESERV: usize = 6;
 }

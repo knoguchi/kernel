@@ -89,8 +89,8 @@ Send a signal to another task.
 | 4 | `SYS_REPLY` | :white_check_mark: | Reply to caller |
 | 5 | `SYS_NBSEND` | :construction: | Non-blocking send |
 | 6 | `SYS_NBRECV` | :construction: | Non-blocking receive |
-| 7 | `SYS_NOTIFY` | :construction: | Send async notification |
-| 8 | `SYS_WAIT_NOTIFY` | :construction: | Wait for notification |
+| 7 | `SYS_NOTIFY` | :white_check_mark: | Send async notification |
+| 8 | `SYS_WAIT_NOTIFY` | :white_check_mark: | Wait for notification |
 
 ### Message Format
 ```
@@ -148,19 +148,24 @@ Return: x0 = sender or -EWOULDBLOCK, x1-x5 = message
 ```
 Non-blocking receive. Returns immediately if no message.
 
-### SYS_NOTIFY (7) :construction:
+### SYS_NOTIFY (7)
 ```
-Args:   x0 = dest_task_id, x1 = notification_bits
+Args:   x0 = dest_task_id
+        x1 = notification_bits
 Return: x0 = 0 or error
 ```
-Send asynchronous notification (bitmap). Never blocks.
+Send asynchronous notification bits to a task. Sets the bits in the target task's
+pending notification bitmap. If the target is blocked waiting for any of these
+bits, it will be woken up. Never blocks.
 
-### SYS_WAIT_NOTIFY (8) :construction:
+### SYS_WAIT_NOTIFY (8)
 ```
-Args:   x0 = expected_bits (0 = any)
+Args:   x0 = expected_bits (0 = any bit)
 Return: x0 = notification_bits received
 ```
-Wait for notification bits to be set.
+Wait for notification bits to be set. Blocks until any of the expected bits are
+pending. Returns immediately if any expected bits are already pending. The matched
+bits are cleared from the pending bitmap before returning.
 
 ---
 
@@ -231,7 +236,7 @@ Destroy a shared memory region (must be owner, unmaps from all tasks).
 | 56 | `SYS_OPENAT` | :construction: | Open file (via VFS) |
 | 23 | `SYS_DUP` | :construction: | Duplicate fd |
 | 24 | `SYS_DUP2` | :construction: | Duplicate fd to specific number |
-| 59 | `SYS_PIPE` | :construction: | Create pipe pair |
+| 59 | `SYS_PIPE` | :white_check_mark: | Create pipe pair |
 | 62 | `SYS_LSEEK` | :construction: | Seek in file |
 | 79 | `SYS_FSTAT` | :construction: | Get file status |
 | 80 | `SYS_FSTATAT` | :construction: | Get file status (path) |
@@ -285,14 +290,17 @@ Return: x0 = newfd or error
 ```
 Duplicate file descriptor to specific number.
 
-### SYS_PIPE (59) :construction:
+### SYS_PIPE (59)
 ```
-Args:   x0 = pipefd_ptr (array of 2 ints)
-Return: x0 = 0 or error
-        [pipefd[0]] = read end
-        [pipefd[1]] = write end
+Args:   (none)
+Return: x0 = read_fd (>= 0) or error (< 0)
+        x1 = write_fd (>= 0) or error (< 0)
 ```
-Create a unidirectional pipe.
+Create a unidirectional pipe with a 4KB circular buffer. Returns two file
+descriptors: the read end in x0 and the write end in x1. Reading from an empty
+pipe blocks until data is available (or all writers close). Writing to a full
+pipe blocks until space is available. Reading from a pipe with no writers
+returns EOF (0). Writing to a pipe with no readers returns EPIPE.
 
 ### SYS_LSEEK (62) :construction:
 ```

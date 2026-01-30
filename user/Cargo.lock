@@ -35,6 +35,20 @@ name = "libkenix"
 version = "0.1.0"
 
 [[package]]
+name = "netdev"
+version = "0.1.0"
+dependencies = [
+ "libkenix",
+]
+
+[[package]]
+name = "pipeserv"
+version = "0.1.0"
+dependencies = [
+ "libkenix",
+]
+
+[[package]]
 name = "vfs"
 version = "0.1.0"
 dependencies = [

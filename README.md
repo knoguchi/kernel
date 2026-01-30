@@ -54,7 +54,8 @@ kenix/
 │       ├── gic.rs         # ARM GIC driver
 │       ├── timer.rs       # ARM timer driver
 │       ├── elf.rs         # ELF loader
-│       └── irq.rs         # IRQ-to-task routing
+│       ├── irq.rs         # IRQ-to-task routing
+│       └── pipe.rs        # Kernel-level pipes
 ├── user/               # User-space programs (all Rust)
 │   ├── libkenix/          # Shared runtime library
 │   │   ├── Cargo.toml
@@ -78,6 +79,19 @@ kenix/
 │   │       ├── virtio_mmio.rs # VirtIO MMIO registers
 │   │       ├── virtqueue.rs  # Virtqueue management
 │   │       └── blk.rs        # VirtIO-blk protocol
+│   ├── netdev/            # Network device server
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs       # IPC server loop
+│   │       ├── virtio_mmio.rs # VirtIO MMIO registers
+│   │       ├── virtqueue.rs  # Virtqueue management
+│   │       └── net.rs        # VirtIO-net protocol
+│   ├── pipeserv/          # Pipe server (unused, kernel pipes preferred)
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs
+│   ├── hello/             # Test program for spawn
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs
 │   ├── user.ld            # Shared linker script
 │   ├── aarch64-kenix-user.json  # Custom target spec
 │   └── Cargo.toml         # Workspace root
@@ -111,12 +125,13 @@ kenix/
 - [x] Synchronous IPC (call/recv/reply)
 - [x] Inline message passing (24 bytes)
 - [x] Shared memory IPC
-- [ ] Asynchronous notifications
+- [x] Asynchronous notifications (notify/wait_notify)
 
 ### Servers
 - [x] Console server (UART)
 - [x] VFS server (ramfs + FAT32)
 - [x] Block device server (VirtIO-blk)
+- [x] Network device server (VirtIO-net)
 - [x] FAT32 filesystem
 
 ### File Descriptors
@@ -125,8 +140,8 @@ kenix/
 - [x] read() syscall
 - [x] write() syscall
 - [x] close() syscall
+- [x] pipe() syscall (kernel-level pipes)
 - [ ] dup/dup2
-- [ ] pipe
 
 ### Memory Management
 - [ ] Demand paging
@@ -135,7 +150,7 @@ kenix/
 
 ### Hardware Support
 - [x] VirtIO-blk driver (block device)
-- [ ] VirtIO-net driver (network)
+- [x] VirtIO-net driver (network)
 - [ ] Interrupts beyond timer (keyboard, network)
 - [ ] Raspberry Pi 4/5 support
 - [ ] ARM Chromebook support

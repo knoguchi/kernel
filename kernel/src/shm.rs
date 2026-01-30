@@ -297,6 +297,134 @@ pub fn sys_shmunmap(shm_id: usize) -> i64 {
     }
 }
 
+/// Get the physical address of an SHM region (for kernel-side access)
+///
+/// Since the kernel has identity mapping, this address can be used directly.
+/// Returns 0 if the SHM doesn't exist.
+pub fn get_shm_phys_addr(shm_id: usize) -> usize {
+    if shm_id >= MAX_SHM_REGIONS {
+        return 0;
+    }
+
+    unsafe {
+        let region = &SHM_REGIONS[shm_id];
+        if !region.in_use || region.num_frames == 0 {
+            return 0;
+        }
+
+        // Return the physical address of the first frame
+        match region.frames[0] {
+            Some(paddr) => paddr.0,
+            None => 0,
+        }
+    }
+}
+
+/// Map shared memory for a specific task (used by IPC reply completion)
+///
+/// This is like sys_shmmap but takes an explicit task_id instead of current()
+pub fn sys_shmmap_for_task(task_id: TaskId, shm_id: usize, vaddr_hint: usize) -> i64 {
+    if shm_id >= MAX_SHM_REGIONS {
+        return SHM_ERR_INVALID;
+    }
+
+    unsafe {
+        let region = &mut SHM_REGIONS[shm_id];
+
+        if !region.in_use {
+            return SHM_ERR_INVALID;
+        }
+
+        // Check permission
+        if !region.granted[task_id.0] {
+            return SHM_ERR_PERMISSION;
+        }
+
+        // Check if already mapped
+        if region.mapped_vaddr[task_id.0].is_some() {
+            // Already mapped, just return the address
+            return region.mapped_vaddr[task_id.0].unwrap() as i64;
+        }
+
+        // Determine virtual address
+        let vaddr = if vaddr_hint != 0 {
+            vaddr_hint & !(PAGE_SIZE - 1)
+        } else {
+            let addr = NEXT_SHM_VADDR[task_id.0];
+            NEXT_SHM_VADDR[task_id.0] += region.size;
+            addr
+        };
+
+        // Get the task's page table
+        let task = &mut TASKS[task_id.0];
+        if task.state == TaskState::Free {
+            return SHM_ERR_INVALID;
+        }
+
+        let page_table_addr = task.page_table.0;
+        if page_table_addr == 0 {
+            return SHM_ERR_INVALID;
+        }
+
+        // Map each frame
+        for i in 0..region.num_frames {
+            if let Some(frame) = region.frames[i] {
+                let page_vaddr = vaddr + i * PAGE_SIZE;
+                if !map_4kb_direct(page_table_addr, page_vaddr, frame) {
+                    // Unmap on failure
+                    for j in 0..i {
+                        let unmap_vaddr = vaddr + j * PAGE_SIZE;
+                        unmap_4kb_direct(page_table_addr, unmap_vaddr);
+                    }
+                    return SHM_ERR_NO_MEMORY;
+                }
+            }
+        }
+
+        region.mapped_vaddr[task_id.0] = Some(vaddr);
+        invalidate_tlb();
+
+        vaddr as i64
+    }
+}
+
+/// Unmap shared memory for a specific task (used by IPC reply completion)
+pub fn sys_shmunmap_for_task(task_id: TaskId, shm_id: usize) -> i64 {
+    if shm_id >= MAX_SHM_REGIONS {
+        return SHM_ERR_INVALID;
+    }
+
+    unsafe {
+        let region = &mut SHM_REGIONS[shm_id];
+
+        if !region.in_use {
+            return SHM_ERR_INVALID;
+        }
+
+        // Check if mapped
+        let vaddr = match region.mapped_vaddr[task_id.0] {
+            Some(v) => v,
+            None => return SHM_OK, // Not mapped, that's fine
+        };
+
+        // Get task's page table
+        let task = &TASKS[task_id.0];
+        let page_table_addr = task.page_table.0;
+
+        if page_table_addr != 0 {
+            for i in 0..region.num_frames {
+                let page_vaddr = vaddr + i * PAGE_SIZE;
+                unmap_4kb_direct(page_table_addr, page_vaddr);
+            }
+        }
+
+        region.mapped_vaddr[task_id.0] = None;
+        invalidate_tlb();
+
+        SHM_OK
+    }
+}
+
 /// Grant another task permission to map the shared memory region
 ///
 /// # Arguments

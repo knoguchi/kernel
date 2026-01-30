@@ -1,6 +1,12 @@
 /// Page size: 4KB
 pub const PAGE_SIZE: usize = 4096;
 
+/// 2MB block size (for page table block mappings)
+pub const BLOCK_SIZE_2MB: usize = 2 * 1024 * 1024;
+
+/// Pages per 2MB block (2MB / 4KB = 512)
+const PAGES_PER_2MB_BLOCK: usize = BLOCK_SIZE_2MB / PAGE_SIZE;
+
 /// Maximum number of pages (1GB / 4KB = 262144)
 const MAX_PAGES: usize = 262144;
 
@@ -74,6 +80,79 @@ impl FrameAllocator {
         }
 
         None // Out of memory
+    }
+
+    /// Allocate multiple contiguous frames that are all within the same 2MB block.
+    /// This is needed for 2MB block mappings in page tables.
+    /// Returns the starting PhysAddr of the allocated region, or None if not possible.
+    pub fn alloc_contiguous_in_2mb_block(&mut self, count: usize) -> Option<PhysAddr> {
+        if !self.initialized || count == 0 {
+            return None;
+        }
+
+        // Can't allocate more than a 2MB block worth of pages
+        if count > PAGES_PER_2MB_BLOCK {
+            return None;
+        }
+
+        let total_pages = (self.memory_end - self.memory_start) / PAGE_SIZE;
+
+        // Start searching from next_free
+        let mut search_start = self.next_free;
+
+        // Search for a contiguous region within a single 2MB block
+        for _ in 0..2 {
+            // Two passes: from next_free to end, then from 0 to next_free
+            let search_end = if search_start == self.next_free {
+                total_pages
+            } else {
+                self.next_free
+            };
+
+            let mut i = search_start;
+            while i < search_end {
+                // Calculate the 2MB block this page belongs to
+                let page_addr = self.memory_start + i * PAGE_SIZE;
+                let block_base = page_addr & !(BLOCK_SIZE_2MB - 1);
+                let offset_in_block = page_addr - block_base;
+                let page_offset_in_block = offset_in_block / PAGE_SIZE;
+
+                // How many pages remain in this 2MB block?
+                let pages_remaining_in_block = PAGES_PER_2MB_BLOCK - page_offset_in_block;
+
+                if pages_remaining_in_block < count {
+                    // Not enough room in this block, skip to next 2MB block
+                    i += pages_remaining_in_block;
+                    continue;
+                }
+
+                // Check if 'count' contiguous pages starting at i are all free
+                let mut all_free = true;
+                for j in 0..count {
+                    if i + j >= total_pages || self.get_bit(i + j) {
+                        all_free = false;
+                        break;
+                    }
+                }
+
+                if all_free {
+                    // Found a suitable region, allocate all pages
+                    for j in 0..count {
+                        self.set_bit(i + j, true);
+                    }
+                    self.next_free = i + count;
+                    self.used_count += count;
+                    return Some(PhysAddr::new(self.memory_start + i * PAGE_SIZE));
+                }
+
+                i += 1;
+            }
+
+            // Second pass: search from beginning
+            search_start = 0;
+        }
+
+        None // No suitable contiguous region found
     }
 
     /// Free a physical frame
@@ -186,6 +265,11 @@ pub fn init_allocator(memory_start: usize, memory_end: usize, kernel_end: usize)
 /// Allocate a frame from the global allocator
 pub fn alloc_frame() -> Option<PhysAddr> {
     unsafe { ALLOCATOR.alloc() }
+}
+
+/// Allocate multiple contiguous frames within the same 2MB block
+pub fn alloc_frames_in_2mb_block(count: usize) -> Option<PhysAddr> {
+    unsafe { ALLOCATOR.alloc_contiguous_in_2mb_block(count) }
 }
 
 /// Free a frame to the global allocator

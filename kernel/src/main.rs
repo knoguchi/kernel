@@ -100,6 +100,12 @@ extern "C" {
     // Block device server ELF (created fourth, gets task ID 4)
     static __blkdev_elf_start: u8;
     static __blkdev_elf_end: u8;
+    // Network device server ELF (created fifth, gets task ID 5)
+    static __netdev_elf_start: u8;
+    static __netdev_elf_end: u8;
+    // Pipe server ELF (created sixth, gets task ID 6)
+    static __pipeserv_elf_start: u8;
+    static __pipeserv_elf_end: u8;
 }
 
 struct Uart {
@@ -333,6 +339,38 @@ pub extern "C" fn kernel_main() -> ! {
         println!("  Created blkdev server (id={}) - runs in EL0 with VirtIO access", id.0);
     } else {
         println!("  ERROR: Failed to create blkdev server!");
+    }
+    println!();
+
+    // Create netdev server (task ID 5)
+    println!("Creating netdev server...");
+    let netdev_start = unsafe { &__netdev_elf_start as *const u8 };
+    let netdev_end = unsafe { &__netdev_elf_end as *const u8 };
+    let netdev_size = netdev_end as usize - netdev_start as usize;
+    let netdev_data = unsafe { core::slice::from_raw_parts(netdev_start, netdev_size) };
+
+    println!("  Netdev ELF at {:#010x}, size {} bytes", netdev_start as usize, netdev_size);
+
+    if let Some(id) = sched::create_netdev_server_from_elf("netdev", netdev_data) {
+        println!("  Created netdev server (id={}) - runs in EL0 with VirtIO access", id.0);
+    } else {
+        println!("  ERROR: Failed to create netdev server!");
+    }
+    println!();
+
+    // Create pipeserv server (task ID 6)
+    println!("Creating pipeserv server...");
+    let pipeserv_start = unsafe { &__pipeserv_elf_start as *const u8 };
+    let pipeserv_end = unsafe { &__pipeserv_elf_end as *const u8 };
+    let pipeserv_size = pipeserv_end as usize - pipeserv_start as usize;
+    let pipeserv_data = unsafe { core::slice::from_raw_parts(pipeserv_start, pipeserv_size) };
+
+    println!("  Pipeserv ELF at {:#010x}, size {} bytes", pipeserv_start as usize, pipeserv_size);
+
+    if let Some(id) = sched::create_user_task_from_elf("pipeserv", pipeserv_data) {
+        println!("  Created pipeserv server (id={}) - runs in EL0", id.0);
+    } else {
+        println!("  ERROR: Failed to create pipeserv server!");
     }
     println!();
 

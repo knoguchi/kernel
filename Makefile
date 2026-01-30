@@ -29,6 +29,8 @@ user:
 	cp user/target/aarch64-kenix-user/release/vfs user/vfs.elf
 	cp user/target/aarch64-kenix-user/release/hello user/hello.elf
 	cp user/target/aarch64-kenix-user/release/blkdev user/blkdev.elf
+	cp user/target/aarch64-kenix-user/release/netdev user/netdev.elf
+	cp user/target/aarch64-kenix-user/release/pipeserv user/pipeserv.elf
 
 kernel: user
 	cd kernel && cargo +nightly build --release --target aarch64-kenix.json -Zbuild-std=core,alloc
@@ -57,13 +59,15 @@ run-kernel: kernel $(DISK_IMG)
 		-global virtio-mmio.force-legacy=false \
 		-device virtio-blk-device,drive=disk0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
+		-device virtio-net-device,netdev=net0 \
+		-netdev user,id=net0 \
 		-kernel kernel.elf \
 		-nographic \
 		-serial mon:stdio
 
 clean:
 	rm -rf esp kernel.elf $(DISK_IMG)
-	rm -f user/console.elf user/init.elf user/vfs.elf user/blkdev.elf
+	rm -f user/console.elf user/init.elf user/vfs.elf user/blkdev.elf user/netdev.elf user/pipeserv.elf
 	cd boot && cargo clean
 	cd kernel && cargo clean
 	cd user && cargo clean 2>/dev/null || true

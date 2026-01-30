@@ -24,8 +24,10 @@ pub enum FdKind {
     None,
     /// Console (stdin/stdout/stderr)
     Console,
-    /// Pipe (future)
-    Pipe,
+    /// Pipe read end
+    PipeRead,
+    /// Pipe write end
+    PipeWrite,
     /// VFS-managed file (future)
     File,
 }
@@ -130,6 +132,38 @@ impl TaskId {
     }
 }
 
+/// Pending syscall that needs IPC reply to complete
+#[derive(Debug, Clone, Copy)]
+pub enum PendingSyscall {
+    /// No pending syscall
+    None,
+    /// Pipe create: waiting for pipeserv to return pipe_id
+    /// Reply will allocate fds and return (read_fd, write_fd)
+    PipeCreate,
+    /// Pipe read: waiting for pipeserv to fill SHM buffer
+    PipeRead {
+        /// User buffer address to copy data to
+        user_buf: usize,
+        /// Maximum bytes to read
+        max_len: usize,
+        /// SHM ID for data transfer
+        shm_id: usize,
+    },
+    /// Pipe write: waiting for pipeserv to consume SHM buffer
+    PipeWrite {
+        /// SHM ID for data transfer (needs cleanup)
+        shm_id: usize,
+    },
+    /// Pipe close: waiting for pipeserv acknowledgment
+    PipeClose,
+}
+
+impl PendingSyscall {
+    pub const fn is_none(&self) -> bool {
+        matches!(self, PendingSyscall::None)
+    }
+}
+
 /// Task state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -150,6 +184,10 @@ pub enum TaskState {
     Terminated = 6,
     /// Task is blocked waiting for an IRQ
     IrqBlocked = 7,
+    /// Task is blocked waiting for notification bits
+    NotifyBlocked = 8,
+    /// Task is blocked waiting for pipe data
+    PipeBlocked = 9,
 }
 
 /// IPC Message structure
@@ -276,6 +314,12 @@ pub struct Task {
     pub ipc: IpcState,
     /// File descriptor table
     pub fds: [FileDescriptor; MAX_FDS],
+    /// Pending notification bits (set by notify())
+    pub notify_pending: u64,
+    /// Notification bits the task is waiting for
+    pub notify_waiting: u64,
+    /// Pending syscall waiting for IPC reply to complete
+    pub pending_syscall: PendingSyscall,
 }
 
 impl Task {
@@ -295,6 +339,9 @@ impl Task {
             name: [0; 16],
             ipc: IpcState::empty(),
             fds: [EMPTY_FD; MAX_FDS],
+            notify_pending: 0,
+            notify_waiting: 0,
+            pending_syscall: PendingSyscall::None,
         }
     }
 
