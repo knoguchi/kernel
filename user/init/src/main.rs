@@ -295,6 +295,33 @@ fn main() -> ! {
     print("\n");
 
     // ========================================
+    // Test execve (error cases only - can't replace init!)
+    // ========================================
+    print("\n--- Execve Test ---\n");
+
+    // Test execve with non-existent file (should fail with ENOENT)
+    let noent_path = b"/nonexistent\0";
+    let argv: [*const u8; 2] = [noent_path.as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 1] = [core::ptr::null()];
+
+    let result = syscall::execve(noent_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+    if result == -2 {  // ENOENT
+        print("execve(/nonexistent): ENOENT (expected)\n");
+    } else {
+        print("execve(/nonexistent): error ");
+        print_num((-result) as usize);
+        print("\n");
+    }
+
+    // Test execve with a directory (should fail)
+    let dir_path = b"/disk\0";
+    let argv_dir: [*const u8; 2] = [dir_path.as_ptr(), core::ptr::null()];
+    let result = syscall::execve(dir_path.as_ptr(), argv_dir.as_ptr(), envp.as_ptr());
+    print("execve(/disk): error ");
+    print_num((-result) as usize);
+    print(" (expected EISDIR or similar)\n");
+
+    // ========================================
     // Spawn hello from embedded ELF
     // ========================================
     print("\n--- Spawn Test ---\n");

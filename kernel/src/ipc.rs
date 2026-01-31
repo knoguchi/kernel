@@ -15,6 +15,24 @@ use crate::sched::{self, current};
 use crate::exception::ExceptionContext;
 use crate::shm;
 
+/// Result of completing a pending syscall
+enum PendingSyscallResult {
+    /// Syscall is complete, return these values to userspace
+    Complete(i64, Option<i64>),
+    /// Syscall needs to continue with another IPC call (multi-stage operation)
+    Continue {
+        new_pending: PendingSyscall,
+        target: TaskId,
+        msg: Message,
+    },
+}
+
+/// VFS server task ID for multi-stage operations
+const VFS_TID: TaskId = TaskId(3);
+
+/// VFS IPC message tags for multi-stage operations
+const VFS_READ_SHM: u64 = 110;
+
 /// Write sys_recv return values to a task's saved exception context
 ///
 /// When a task is woken from RecvBlocked, we must set up the return
@@ -323,31 +341,55 @@ pub fn sys_reply(msg: Message) -> i64 {
 
         // Check if this reply completes a pending syscall
         let pending = caller_task.pending_syscall;
-        let (x0_val, x1_opt) = complete_pending_syscall(caller_id, pending, &msg);
+        let result = complete_pending_syscall(caller_id, pending, &msg);
 
-        // Set up return values in caller's saved context
-        if !pending.is_none() {
-            // Pending syscall - set x0 (and optionally x1) directly
-            let task = &TASKS[caller_id.0];
-            let ctx = task.kernel_stack_top as *mut ExceptionContext;
-            if !ctx.is_null() {
-                (*ctx).gpr[0] = x0_val as u64;
-                if let Some(x1_val) = x1_opt {
-                    (*ctx).gpr[1] = x1_val as u64;
+        match result {
+            PendingSyscallResult::Complete(x0_val, x1_opt) => {
+                // Set up return values in caller's saved context
+                if !pending.is_none() {
+                    // Pending syscall - set x0 (and optionally x1) directly
+                    let task = &TASKS[caller_id.0];
+                    let ctx = task.kernel_stack_top as *mut ExceptionContext;
+                    if !ctx.is_null() {
+                        (*ctx).gpr[0] = x0_val as u64;
+                        if let Some(x1_val) = x1_opt {
+                            (*ctx).gpr[1] = x1_val as u64;
+                        }
+                    }
+                } else {
+                    // Normal IPC - use standard return format
+                    set_call_return(caller_id, &msg);
+                }
+
+                // Clear pending syscall
+                let caller_task = &mut TASKS[caller_id.0];
+                caller_task.pending_syscall = PendingSyscall::None;
+
+                // Wake up caller
+                caller_task.state = TaskState::Ready;
+                sched::enqueue_task(caller_id);
+            }
+            PendingSyscallResult::Continue { new_pending, target, msg: next_msg } => {
+                // Multi-stage syscall - caller stays blocked, chain to next IPC
+                let caller_task = &mut TASKS[caller_id.0];
+                caller_task.pending_syscall = new_pending;
+
+                // Set up IPC to target server
+                caller_task.ipc.reply_to = Some(target);
+                caller_task.state = TaskState::ReplyBlocked;
+
+                // Transfer message to target server
+                let target_task = &mut TASKS[target.0];
+                target_task.ipc.pending_msg = next_msg;
+                target_task.ipc.caller = Some(caller_id);
+
+                // Wake target if it's waiting for messages
+                if target_task.state == TaskState::RecvBlocked {
+                    target_task.state = TaskState::Ready;
+                    sched::enqueue_task(target);
                 }
             }
-        } else {
-            // Normal IPC - use standard return format
-            set_call_return(caller_id, &msg);
         }
-
-        // Clear pending syscall
-        let caller_task = &mut TASKS[caller_id.0];
-        caller_task.pending_syscall = PendingSyscall::None;
-
-        // Wake up caller
-        caller_task.state = TaskState::Ready;
-        sched::enqueue_task(caller_id);
 
         // Clear our caller field
         let server_task = &mut TASKS[server_id.0];
@@ -359,19 +401,19 @@ pub fn sys_reply(msg: Message) -> i64 {
 
 /// Complete a pending syscall using the IPC reply from a server
 ///
-/// Returns (x0_value, optional_x1_value) for the syscall return
-unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, reply: &Message) -> (i64, Option<i64>) {
+/// Returns PendingSyscallResult indicating whether to wake the caller or continue with another IPC
+unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, reply: &Message) -> PendingSyscallResult {
     match pending {
         PendingSyscall::None => {
             // No pending syscall, use reply tag directly
-            (reply.tag as i64, None)
+            PendingSyscallResult::Complete(reply.tag as i64, None)
         }
         PendingSyscall::PipeCreate => {
             let pipe_id = reply.tag as i64;
 
             // Check if pipeserv returned an error
             if pipe_id < 0 {
-                return (pipe_id, Some(pipe_id)); // Both fds are error
+                return PendingSyscallResult::Complete(pipe_id, Some(pipe_id)); // Both fds are error
             }
 
             let caller_task = &mut TASKS[caller_id.0];
@@ -379,7 +421,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             // Allocate read fd
             let read_fd = match caller_task.alloc_fd() {
                 Some(fd) => fd,
-                None => return (-12, Some(-12)), // ENOMEM
+                None => return PendingSyscallResult::Complete(-12, Some(-12)), // ENOMEM
             };
             caller_task.fds[read_fd] = FileDescriptor {
                 kind: FdKind::PipeRead,
@@ -393,7 +435,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 Some(fd) => fd,
                 None => {
                     caller_task.close_fd(read_fd);
-                    return (-12, Some(-12)); // ENOMEM
+                    return PendingSyscallResult::Complete(-12, Some(-12)); // ENOMEM
                 }
             };
             caller_task.fds[write_fd] = FileDescriptor {
@@ -403,7 +445,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 handle: pipe_id as u64,
             };
 
-            (read_fd as i64, Some(write_fd as i64))
+            PendingSyscallResult::Complete(read_fd as i64, Some(write_fd as i64))
         }
         PendingSyscall::PipeRead { user_buf, max_len: _, shm_id } => {
             let bytes_read = reply.tag as i64;
@@ -455,7 +497,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             // Clean up: unmap from caller's space if mapped, then destroy SHM
             shm::sys_shmunmap_for_task(caller_id, shm_id);
 
-            (bytes_read, None)
+            PendingSyscallResult::Complete(bytes_read, None)
         }
         PendingSyscall::PipeWrite { shm_id } => {
             let bytes_written = reply.tag as i64;
@@ -463,11 +505,11 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             // Clean up: unmap from caller's space if mapped
             shm::sys_shmunmap_for_task(caller_id, shm_id);
 
-            (bytes_written, None)
+            PendingSyscallResult::Complete(bytes_written, None)
         }
         PendingSyscall::PipeClose => {
             // Just return success
-            (0, None)
+            PendingSyscallResult::Complete(0, None)
         }
         PendingSyscall::VfsOpen { fd, flags, shm_id } => {
             let vnode = reply.tag as i64;
@@ -480,7 +522,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 // Release the pre-allocated fd
                 let caller_task = &mut TASKS[caller_id.0];
                 caller_task.close_fd(fd);
-                return (vnode, None); // Return the error code
+                return PendingSyscallResult::Complete(vnode, None); // Return the error code
             }
 
             // Set up the file descriptor
@@ -498,7 +540,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             };
 
             let _ = is_dir; // We track this in handle for now
-            (fd as i64, None)
+            PendingSyscallResult::Complete(fd as i64, None)
         }
         PendingSyscall::VfsStat { statbuf } => {
             let result = reply.tag as i64;
@@ -542,7 +584,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 );
             }
 
-            (result, None)
+            PendingSyscallResult::Complete(result, None)
         }
         PendingSyscall::VfsGetdents { buf, count: _, shm_id } => {
             let bytes_read = reply.tag as i64;
@@ -580,7 +622,147 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             // Clean up SHM
             shm::sys_shmunmap_for_task(caller_id, shm_id);
 
-            (bytes_read, None)
+            PendingSyscallResult::Complete(bytes_read, None)
+        }
+        PendingSyscall::VfsRead { user_buf, max_len: _, shm_id } => {
+            let bytes_read = reply.tag as i64;
+
+            if bytes_read > 0 {
+                // Copy from SHM to user buffer
+                let shm_phys = shm::get_shm_phys_addr(shm_id);
+                if shm_phys != 0 {
+                    let caller_task = &TASKS[caller_id.0];
+                    let caller_ttbr0 = caller_task.page_table.0 as u64;
+
+                    let saved_ttbr0: u64;
+                    core::arch::asm!(
+                        "mrs {0}, ttbr0_el1",
+                        "msr ttbr0_el1, {1}",
+                        "isb", "dsb sy", "tlbi vmalle1is", "dsb sy", "isb",
+                        out(reg) saved_ttbr0,
+                        in(reg) caller_ttbr0,
+                    );
+
+                    core::ptr::copy_nonoverlapping(
+                        shm_phys as *const u8,
+                        user_buf as *mut u8,
+                        bytes_read as usize,
+                    );
+
+                    core::arch::asm!(
+                        "msr ttbr0_el1, {0}",
+                        "isb", "dsb sy", "tlbi vmalle1is", "dsb sy", "isb",
+                        in(reg) saved_ttbr0,
+                    );
+                }
+            }
+
+            // Clean up SHM
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            PendingSyscallResult::Complete(bytes_read, None)
+        }
+        PendingSyscall::VfsWrite { shm_id } => {
+            let bytes_written = reply.tag as i64;
+
+            // Clean up SHM
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            PendingSyscallResult::Complete(bytes_written, None)
+        }
+        PendingSyscall::ExecveOpen { shm_id } => {
+            // Stage 1: VFS_OPEN completed - get vnode and read the ELF
+            let vnode = reply.tag as i64;
+
+            // Clean up path SHM
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            // Check if VFS returned an error
+            if vnode < 0 {
+                return PendingSyscallResult::Complete(vnode, None); // Return the error (ENOENT, etc.)
+            }
+
+            // Create SHM for reading the ELF file (256KB should be enough for small ELFs)
+            const EXECVE_SHM_SIZE: usize = 256 * 1024;
+            let data_shm_id = shm::sys_shmcreate(EXECVE_SHM_SIZE);
+            if data_shm_id < 0 {
+                // Close the vnode via VFS_CLOSE
+                // For now, just return error (vnode will leak)
+                return PendingSyscallResult::Complete(-12, None); // ENOMEM
+            }
+            let data_shm_id = data_shm_id as usize;
+
+            // Grant VFS access to the SHM
+            shm::sys_shmgrant(data_shm_id, VFS_TID.0);
+
+            // Chain to stage 2: read the ELF file via VFS_READ_SHM
+            let msg = Message::new(VFS_READ_SHM, [
+                vnode as u64,         // vnode handle
+                data_shm_id as u64,   // SHM ID for data
+                EXECVE_SHM_SIZE as u64, // max bytes to read
+                0,                    // offset = 0
+            ]);
+
+            PendingSyscallResult::Continue {
+                new_pending: PendingSyscall::ExecveRead {
+                    vnode: vnode as u64,
+                    shm_id: data_shm_id,
+                },
+                target: VFS_TID,
+                msg,
+            }
+        }
+        PendingSyscall::ExecveRead { vnode, shm_id } => {
+            // Stage 2: VFS_READ_SHM completed - parse ELF and replace the task
+            let bytes_read = reply.tag as i64;
+
+            // Close the vnode (we don't need it anymore)
+            // For simplicity, we do this synchronously by sending VFS_CLOSE
+            // But since we can't do another IPC here easily, we'll skip closing for now
+            // TODO: proper cleanup
+            let _ = vnode;
+
+            if bytes_read <= 0 {
+                // Read failed
+                shm::sys_shmunmap_for_task(caller_id, shm_id);
+                return PendingSyscallResult::Complete(-5, None); // EIO
+            }
+
+            // Get the ELF data from SHM
+            let shm_phys = shm::get_shm_phys_addr(shm_id);
+            if shm_phys == 0 {
+                return PendingSyscallResult::Complete(-12, None); // ENOMEM
+            }
+
+            let elf_data = core::slice::from_raw_parts(shm_phys as *const u8, bytes_read as usize);
+
+            // Replace the current task with the new ELF
+            match crate::sched::replace_task_with_elf(caller_id, elf_data) {
+                Ok(entry_point) => {
+                    // Clean up SHM
+                    shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+                    // Set the entry point in the task's saved context
+                    let task = &TASKS[caller_id.0];
+                    let ctx = task.kernel_stack_top as *mut ExceptionContext;
+                    if !ctx.is_null() {
+                        (*ctx).elr = entry_point as u64;
+                        // execve on success returns 0, but we set it at the new entry point
+                        // Actually, execve doesn't return on success - execution starts fresh
+                        // We set x0 = 0 for argc (simplified, no argv/envp support yet)
+                        (*ctx).gpr[0] = 0;
+                    }
+
+                    // Return 0 but note: caller won't actually see this because
+                    // execution will start from the new entry point
+                    PendingSyscallResult::Complete(0, None)
+                }
+                Err(e) => {
+                    // Clean up SHM
+                    shm::sys_shmunmap_for_task(caller_id, shm_id);
+                    PendingSyscallResult::Complete(e, None)
+                }
+            }
         }
     }
 }

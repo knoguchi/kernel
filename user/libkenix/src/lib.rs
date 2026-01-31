@@ -100,6 +100,7 @@ pub mod syscall {
     pub const SYS_FSTAT: u64 = 80;
     pub const SYS_EXIT: u64 = 93;
     pub const SYS_BRK: u64 = 214;
+    pub const SYS_EXECVE: u64 = 221;
     pub const SYS_WAIT4: u64 = 260;
 
     /// Exit the process
@@ -601,6 +602,37 @@ pub mod syscall {
         }
         ret
     }
+
+    /// Execute a program, replacing the current process image
+    ///
+    /// # Arguments
+    /// * `pathname` - Path to the executable (null-terminated)
+    /// * `argv` - Argument array (null-terminated array of null-terminated strings)
+    /// * `envp` - Environment array (null-terminated array of null-terminated strings)
+    ///
+    /// # Returns
+    /// * On success: does not return (replaced by new program)
+    /// * On failure: negative error code
+    ///
+    /// # Safety
+    /// The caller must ensure:
+    /// - pathname points to a valid null-terminated string
+    /// - argv and envp point to valid null-terminated arrays
+    /// - All string pointers in argv and envp are valid
+    pub fn execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u8) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") pathname => ret,
+                in("x1") argv,
+                in("x2") envp,
+                in("x8") SYS_EXECVE,
+                options(nostack)
+            );
+        }
+        ret
+    }
 }
 
 // ============================================================================
@@ -860,7 +892,9 @@ pub mod msg {
     pub const VFS_READ: u64 = 102;
     pub const VFS_WRITE: u64 = 103;
     pub const VFS_STAT: u64 = 104;
+    pub const VFS_READDIR: u64 = 105;   // Read directory entries
     pub const VFS_READ_SHM: u64 = 110;  // Read via shared memory
+    pub const VFS_WRITE_SHM: u64 = 111; // Write via shared memory
 
     // Block device server messages
     pub const BLK_READ: u64 = 200;      // Read sectors

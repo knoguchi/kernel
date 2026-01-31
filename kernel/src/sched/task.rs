@@ -185,6 +185,32 @@ pub enum PendingSyscall {
         /// SHM ID for data transfer
         shm_id: usize,
     },
+    /// VFS read: waiting for VFS to fill SHM buffer with file data
+    VfsRead {
+        /// User buffer address to copy data to
+        user_buf: usize,
+        /// Maximum bytes to read
+        max_len: usize,
+        /// SHM ID for data transfer
+        shm_id: usize,
+    },
+    /// VFS write: waiting for VFS to consume SHM buffer
+    VfsWrite {
+        /// SHM ID for data transfer (needs cleanup)
+        shm_id: usize,
+    },
+    /// Execve stage 1: waiting for VFS to open the executable file
+    ExecveOpen {
+        /// SHM ID containing path (needs cleanup)
+        shm_id: usize,
+    },
+    /// Execve stage 2: waiting for VFS to read the executable file contents
+    ExecveRead {
+        /// VFS vnode handle for the executable
+        vnode: u64,
+        /// SHM ID for file data transfer
+        shm_id: usize,
+    },
 }
 
 impl PendingSyscall {

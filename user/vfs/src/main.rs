@@ -536,16 +536,47 @@ fn handle_open(client: usize, msg_data: &[u64; 4]) -> i64 {
         return ERR_INVAL;
     }
 
-    let path_len = (msg_data[0] & 0xFF) as usize;
-    if path_len > 31 {
+    // New SHM-based format: data[0] = shm_id, data[1] = path_len, data[2] = flags
+    let shm_id = msg_data[0];
+    let path_len = msg_data[1] as usize;
+    let _flags = msg_data[2] as u32;
+
+    if path_len == 0 || path_len > 255 {
         return ERR_INVAL;
     }
 
-    let mut path_buf = [0u8; 32];
-    let msg_bytes = unsafe {
-        core::slice::from_raw_parts(msg_data.as_ptr() as *const u8, 32)
-    };
-    path_buf[..path_len].copy_from_slice(&msg_bytes[1..1 + path_len]);
+    // Read path from SHM (scope the borrow to avoid conflicts later)
+    let mut path_buf = [0u8; 256];
+    {
+        let client_state = unsafe { &mut CLIENTS[client] };
+
+        // Map SHM if not already mapped or different SHM
+        if client_state.shm_id != Some(shm_id) {
+            if let Some(old_id) = client_state.shm_id {
+                shm::unmap(old_id);
+                client_state.shm_id = None;
+                client_state.shm_addr = None;
+            }
+
+            let addr = shm::map(shm_id, 0);
+            if addr < 0 {
+                return ERR_INVAL;
+            }
+            client_state.shm_id = Some(shm_id);
+            client_state.shm_addr = Some(addr as usize);
+        }
+
+        let shm_base = match client_state.shm_addr {
+            Some(a) => a,
+            None => return ERR_INVAL,
+        };
+
+        // Read path from SHM
+        let src_ptr = shm_base as *const u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src_ptr, path_buf.as_mut_ptr(), path_len);
+        }
+    } // client_state borrow ends here
 
     // Check if this is a /disk/ path
     if is_disk_path(&path_buf, path_len) {
@@ -744,6 +775,261 @@ fn handle_stat(client: usize, msg_data: &[u64; 4], reply_data: &mut [u64; 4]) ->
     ERR_OK
 }
 
+/// Handle VFS_READDIR: read directory entries
+/// msg_data[0] = handle (VFS file handle)
+/// msg_data[1] = shm_id
+/// msg_data[2] = count (max bytes)
+/// Returns: bytes written to SHM, or negative error
+fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
+    if client >= MAX_CLIENTS {
+        return ERR_INVAL;
+    }
+
+    let handle = msg_data[0] as usize;
+    let shm_id = msg_data[1];
+    let count = msg_data[2] as usize;
+
+    if handle >= MAX_OPEN_FILES {
+        return ERR_BADF;
+    }
+
+    let client_state = unsafe { &mut CLIENTS[client] };
+
+    // Map SHM if not already mapped
+    if client_state.shm_id != Some(shm_id) {
+        if let Some(old_id) = client_state.shm_id {
+            shm::unmap(old_id);
+            client_state.shm_id = None;
+            client_state.shm_addr = None;
+        }
+
+        let addr = shm::map(shm_id, 0);
+        if addr < 0 {
+            return ERR_INVAL;
+        }
+        client_state.shm_id = Some(shm_id);
+        client_state.shm_addr = Some(addr as usize);
+    }
+
+    let shm_base = match client_state.shm_addr {
+        Some(a) => a,
+        None => return ERR_INVAL,
+    };
+
+    let file = &client_state.files[handle];
+    if !file.in_use {
+        return ERR_BADF;
+    }
+
+    // Directory entry constants
+    const DT_REG: u8 = 8;
+    const DT_DIR: u8 = 4;
+
+    let mut bytes_written: usize = 0;
+    let mut entry_offset: i64 = 0;
+
+    match file.source {
+        FileSource::RamFs => {
+            // Check if it's a directory
+            let dir_data = match unsafe { &RAMFS.inodes[file.handle].data } {
+                InodeData::Dir(d) => d,
+                _ => return ERR_NOTDIR,
+            };
+
+            // Write dirent64 entries for each directory entry
+            for i in 0..dir_data.count {
+                let entry = &dir_data.entries[i];
+                let name_len = entry.name_len;
+
+                // Calculate record length: header (19 bytes) + name + null + padding to 8-byte alignment
+                // dirent64: d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + d_name[...]
+                let header_size = 8 + 8 + 2 + 1; // 19 bytes
+                let reclen_unaligned = header_size + name_len + 1; // +1 for null terminator
+                let reclen = (reclen_unaligned + 7) & !7; // Align to 8 bytes
+
+                if bytes_written + reclen > count {
+                    break; // No more space
+                }
+
+                entry_offset += reclen as i64;
+
+                // Get the inode type
+                let d_type = match unsafe { RAMFS.inodes[entry.inode].itype } {
+                    InodeType::File => DT_REG,
+                    InodeType::Directory => DT_DIR,
+                    _ => 0,
+                };
+
+                // Write dirent64 structure to SHM
+                let dest = shm_base + bytes_written;
+                unsafe {
+                    // d_ino at offset 0
+                    core::ptr::write_unaligned(dest as *mut u64, entry.inode as u64);
+                    // d_off at offset 8
+                    core::ptr::write_unaligned((dest + 8) as *mut i64, entry_offset);
+                    // d_reclen at offset 16
+                    core::ptr::write_unaligned((dest + 16) as *mut u16, reclen as u16);
+                    // d_type at offset 18
+                    core::ptr::write_unaligned((dest + 18) as *mut u8, d_type);
+                    // d_name at offset 19
+                    let name_dest = (dest + 19) as *mut u8;
+                    core::ptr::copy_nonoverlapping(entry.name.as_ptr(), name_dest, name_len);
+                    // Null terminator
+                    core::ptr::write_unaligned(name_dest.add(name_len), 0u8);
+                }
+
+                bytes_written += reclen;
+            }
+        }
+        FileSource::Fat32 => {
+            // For FAT32 directories, we need to iterate through the directory
+            // The handle points to an open FAT32 file/directory
+            let fat32_file = unsafe { &FAT32_FILES[file.handle] };
+            if !fat32_file.in_use {
+                return ERR_BADF;
+            }
+
+            let fs = unsafe {
+                match &FAT32_FS {
+                    Some(fs) => fs,
+                    None => return ERR_IO,
+                }
+            };
+
+            // Read directory entries from FAT32
+            let mut current_cluster = fat32_file.file.first_cluster;
+            let blk = unsafe { &BLK_CLIENT };
+            let mut sector_buf = [0u8; SECTOR_SIZE];
+
+            'outer: loop {
+                if current_cluster < 2 || current_cluster >= 0x0FFFFFF8 {
+                    break;
+                }
+
+                let first_sector = fs.cluster_to_sector(current_cluster);
+
+                // Read the cluster
+                for sec_offset in 0..fs.sectors_per_cluster as u32 {
+                    if !blk.read_sector((first_sector + sec_offset) as u64, &mut sector_buf) {
+                        return ERR_IO;
+                    }
+
+                    // Parse directory entries (32 bytes each)
+                    for entry_idx in 0..(SECTOR_SIZE / 32) {
+                        let entry_offset_in_sector = entry_idx * 32;
+                        let first_byte = sector_buf[entry_offset_in_sector];
+
+                        // End of directory
+                        if first_byte == 0x00 {
+                            break 'outer;
+                        }
+                        // Deleted entry
+                        if first_byte == 0xE5 {
+                            continue;
+                        }
+                        // Long filename entry (skip for now)
+                        if sector_buf[entry_offset_in_sector + 11] == 0x0F {
+                            continue;
+                        }
+
+                        // Parse the 8.3 filename
+                        let mut name_buf = [0u8; 13]; // "filename.ext" + null
+                        let mut name_pos = 0;
+
+                        // Base name (8 chars, space-padded)
+                        for j in 0..8 {
+                            let c = sector_buf[entry_offset_in_sector + j];
+                            if c != b' ' {
+                                name_buf[name_pos] = c;
+                                name_pos += 1;
+                            }
+                        }
+
+                        // Extension (3 chars)
+                        let ext_start = entry_offset_in_sector + 8;
+                        let has_ext = sector_buf[ext_start] != b' ';
+                        if has_ext {
+                            name_buf[name_pos] = b'.';
+                            name_pos += 1;
+                            for j in 0..3 {
+                                let c = sector_buf[ext_start + j];
+                                if c != b' ' {
+                                    name_buf[name_pos] = c;
+                                    name_pos += 1;
+                                }
+                            }
+                        }
+
+                        let name_len = name_pos;
+
+                        // Calculate record length
+                        let header_size = 8 + 8 + 2 + 1; // 19 bytes
+                        let reclen_unaligned = header_size + name_len + 1;
+                        let reclen = (reclen_unaligned + 7) & !7;
+
+                        if bytes_written + reclen > count {
+                            break 'outer;
+                        }
+
+                        entry_offset += reclen as i64;
+
+                        // Get attributes
+                        let attr = sector_buf[entry_offset_in_sector + 11];
+                        let d_type = if attr & 0x10 != 0 { DT_DIR } else { DT_REG };
+
+                        // Get cluster number (for inode)
+                        let cluster_hi = u16::from_le_bytes([
+                            sector_buf[entry_offset_in_sector + 20],
+                            sector_buf[entry_offset_in_sector + 21],
+                        ]) as u32;
+                        let cluster_lo = u16::from_le_bytes([
+                            sector_buf[entry_offset_in_sector + 26],
+                            sector_buf[entry_offset_in_sector + 27],
+                        ]) as u32;
+                        let d_ino = (cluster_hi << 16) | cluster_lo;
+
+                        // Write dirent64 structure to SHM
+                        let dest = shm_base + bytes_written;
+                        unsafe {
+                            core::ptr::write_unaligned(dest as *mut u64, d_ino as u64);
+                            core::ptr::write_unaligned((dest + 8) as *mut i64, entry_offset);
+                            core::ptr::write_unaligned((dest + 16) as *mut u16, reclen as u16);
+                            core::ptr::write_unaligned((dest + 18) as *mut u8, d_type);
+                            let name_dest = (dest + 19) as *mut u8;
+                            core::ptr::copy_nonoverlapping(name_buf.as_ptr(), name_dest, name_len);
+                            core::ptr::write_unaligned(name_dest.add(name_len), 0u8);
+                        }
+
+                        bytes_written += reclen;
+                    }
+                }
+
+                // Follow FAT chain to next cluster
+                current_cluster = fat32_next_cluster(fs, blk, current_cluster);
+            }
+        }
+        FileSource::None => return ERR_BADF,
+    }
+
+    bytes_written as i64
+}
+
+/// Get next cluster from FAT
+fn fat32_next_cluster(fs: &Fat32, blk: &BlkClient, cluster: u32) -> u32 {
+    let fat_sector = fs.fat_sector_for_cluster(cluster);
+    let entry_offset = fs.fat_offset_for_cluster(cluster);
+    let mut sector_buf = [0u8; SECTOR_SIZE];
+    if !blk.read_sector(fat_sector as u64, &mut sector_buf) {
+        return 0x0FFFFFFF; // End of chain on error
+    }
+    u32::from_le_bytes([
+        sector_buf[entry_offset],
+        sector_buf[entry_offset + 1],
+        sector_buf[entry_offset + 2],
+        sector_buf[entry_offset + 3],
+    ]) & 0x0FFFFFFF
+}
+
 fn handle_read_shm(client: usize, msg_data: &[u64; 4]) -> i64 {
     if client >= MAX_CLIENTS {
         return ERR_INVAL;
@@ -827,6 +1113,73 @@ fn handle_read_shm(client: usize, msg_data: &[u64; 4]) -> i64 {
     }
 }
 
+fn handle_write_shm(client: usize, msg_data: &[u64; 4]) -> i64 {
+    if client >= MAX_CLIENTS {
+        return ERR_INVAL;
+    }
+
+    let handle = msg_data[0] as usize;
+    let shm_id = msg_data[1];
+    let shm_offset = msg_data[2] as usize;
+    let len = msg_data[3] as usize;
+
+    if handle >= MAX_OPEN_FILES {
+        return ERR_BADF;
+    }
+
+    let client_state = unsafe { &mut CLIENTS[client] };
+
+    // Map SHM if not already mapped
+    if client_state.shm_id != Some(shm_id) {
+        if let Some(old_id) = client_state.shm_id {
+            shm::unmap(old_id);
+            client_state.shm_id = None;
+            client_state.shm_addr = None;
+        }
+
+        let addr = shm::map(shm_id, 0);
+        if addr < 0 {
+            return ERR_INVAL;
+        }
+        client_state.shm_id = Some(shm_id);
+        client_state.shm_addr = Some(addr as usize);
+    }
+
+    let shm_base = match client_state.shm_addr {
+        Some(a) => a,
+        None => return ERR_INVAL,
+    };
+
+    let file = &mut client_state.files[handle];
+    if !file.in_use {
+        return ERR_BADF;
+    }
+
+    match file.source {
+        FileSource::RamFs => {
+            // Get data from SHM
+            let src_ptr = (shm_base + shm_offset) as *const u8;
+            let buf = unsafe {
+                core::slice::from_raw_parts(src_ptr, len)
+            };
+
+            // Write to RAM filesystem
+            match unsafe { RAMFS.write(file.handle, file.offset, buf) } {
+                Ok(n) => {
+                    file.offset += n;
+                    n as i64
+                }
+                Err(e) => e,
+            }
+        }
+        FileSource::Fat32 => {
+            // FAT32 write not yet supported
+            ERR_IO
+        }
+        FileSource::None => ERR_BADF,
+    }
+}
+
 fn handle_write(client: usize, handle: u64, buf_ptr: u64, len: u64) -> i64 {
     if client >= MAX_CLIENTS || handle as usize >= MAX_OPEN_FILES {
         return ERR_BADF;
@@ -905,7 +1258,9 @@ fn main() -> ! {
             VFS_READ => handle_read(client, recv.msg.data[0], recv.msg.data[1], &mut reply_data),
             VFS_STAT => handle_stat(client, &recv.msg.data, &mut reply_data),
             VFS_READ_SHM => handle_read_shm(client, &recv.msg.data),
+            VFS_WRITE_SHM => handle_write_shm(client, &recv.msg.data),
             VFS_WRITE => handle_write(client, recv.msg.data[0], recv.msg.data[1], recv.msg.data[2]),
+            VFS_READDIR => handle_readdir(client, &recv.msg.data),
             _ => ERR_INVAL,
         };
 

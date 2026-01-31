@@ -1471,3 +1471,180 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
 
     Some(task_id)
 }
+
+/// Replace an existing task's address space with a new ELF image (for execve).
+/// Preserves: task id, kernel stack, file descriptors, parent, cwd
+/// Resets: address space, entry point, heap, IPC state, notifications
+/// Returns entry_point on success, or negative error code.
+pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, i64> {
+    use crate::elf::Elf64Header;
+
+    // Parse ELF header
+    if elf_data.len() < core::mem::size_of::<Elf64Header>() {
+        return Err(-1); // EPERM - invalid ELF
+    }
+
+    let elf_header = unsafe { &*(elf_data.as_ptr() as *const Elf64Header) };
+
+    // Verify ELF magic
+    if &elf_header.e_ident[0..4] != b"\x7fELF" {
+        return Err(-1); // Invalid ELF magic
+    }
+
+    let entry_point = elf_header.e_entry as usize;
+
+    // Find the range of memory needed for all LOAD segments
+    let mut min_vaddr = usize::MAX;
+    let mut max_vaddr = 0usize;
+
+    let ph_offset = elf_header.e_phoff as usize;
+    let ph_size = elf_header.e_phentsize as usize;
+    let ph_count = elf_header.e_phnum as usize;
+
+    for i in 0..ph_count {
+        let ph_start = ph_offset + i * ph_size;
+        if ph_start + ph_size > elf_data.len() {
+            break;
+        }
+        let phdr = unsafe { &*(elf_data.as_ptr().add(ph_start) as *const crate::elf::Elf64Phdr) };
+
+        // PT_LOAD = 1
+        if phdr.p_type == 1 {
+            let seg_start = phdr.p_vaddr as usize;
+            let seg_end = seg_start + phdr.p_memsz as usize;
+            if seg_start < min_vaddr {
+                min_vaddr = seg_start;
+            }
+            if seg_end > max_vaddr {
+                max_vaddr = seg_end;
+            }
+        }
+    }
+
+    if min_vaddr == usize::MAX {
+        return Err(-1); // No loadable segments
+    }
+
+    // Calculate how many frames we need (4KB pages)
+    let code_size = max_vaddr - min_vaddr;
+    let num_code_frames = (code_size + 4095) / 4096;
+
+    if num_code_frames > MAX_CODE_FRAMES {
+        return Err(-12); // ENOMEM - ELF too large
+    }
+
+    // Allocate frames contiguously within a 2MB block
+    let first_frame = match mm::frame::alloc_frames_in_2mb_block(num_code_frames) {
+        Some(frame) => frame,
+        None => return Err(-12), // ENOMEM
+    };
+    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
+
+    // Zero the entire 2MB block
+    unsafe {
+        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, BLOCK_SIZE_2MB);
+    }
+
+    // Load LOAD segments into the 2MB block
+    for i in 0..ph_count {
+        let ph_start = ph_offset + i * ph_size;
+        if ph_start + ph_size > elf_data.len() {
+            break;
+        }
+        let phdr = unsafe { &*(elf_data.as_ptr().add(ph_start) as *const crate::elf::Elf64Phdr) };
+
+        if phdr.p_type == 1 {
+            let file_offset = phdr.p_offset as usize;
+            let file_size = phdr.p_filesz as usize;
+            let vaddr = phdr.p_vaddr as usize;
+
+            // Calculate physical offset within the 2MB block
+            let phys_offset = vaddr - min_vaddr;
+            let dest_addr = phys_base_2mb.0 + phys_offset;
+
+            if file_offset + file_size <= elf_data.len() {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        elf_data.as_ptr().add(file_offset),
+                        dest_addr as *mut u8,
+                        file_size,
+                    );
+                }
+            }
+        }
+    }
+
+    // Create new address space with user code mapped at virtual address 0
+    let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Some(as_) => as_,
+        None => return Err(-12), // ENOMEM - couldn't create address space
+    };
+
+    // Map code at 0 (ELF is typically linked at address 0 for simplicity)
+    unsafe {
+        if !addr_space.map_2mb(0, phys_base_2mb, PageFlags::user_code()) {
+            return Err(-12); // ENOMEM
+        }
+    }
+
+    // Allocate a separate stack frame
+    let stack_frame = match mm::frame::alloc_frames_in_2mb_block(16) {
+        Some(frame) => frame,
+        None => return Err(-12), // ENOMEM
+    };
+    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let user_stack_top = USER_STACK_VADDR_BASE + (16 * 4096);
+
+    // Map stack at USER_STACK_VADDR_BASE
+    unsafe {
+        if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
+            return Err(-12); // ENOMEM
+        }
+    }
+
+    let new_page_table = PhysAddr(addr_space.ttbr0() as usize);
+
+    // Update the task, preserving what POSIX requires
+    unsafe {
+        let task = &mut TASKS[task_id.0];
+
+        // Free old page table (we'll need to implement proper cleanup later)
+        // For now, just replace it
+        let _old_page_table = task.page_table;
+
+        // Update with new address space
+        task.page_table = new_page_table;
+        task.entry_point = entry_point;
+
+        // Reset heap to default
+        task.heap_brk = DEFAULT_HEAP_START;
+
+        // Reset IPC state
+        task.ipc = task::IpcState::empty();
+        task.pending_syscall = task::PendingSyscall::None;
+
+        // Reset notifications
+        task.notify_pending = 0;
+        task.notify_waiting = 0;
+
+        // Reset time slice
+        task.time_slice = DEFAULT_TIME_SLICE;
+
+        // Set up exception context for new entry point
+        let kernel_stack_top = task.kernel_stack_base.0 + KERNEL_STACK_SIZE;
+        let ctx_addr = kernel_stack_top - EXCEPTION_CONTEXT_SIZE;
+        let ctx = ctx_addr as *mut ExceptionContext;
+
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = entry_point as u64;
+        (*ctx).spsr = 0x000; // EL0, interrupts enabled
+        (*ctx).sp = user_stack_top as u64;
+
+        task.kernel_stack_top = ctx_addr;
+
+        // Forget the address space so it's not dropped
+        core::mem::forget(addr_space);
+    }
+
+    Ok(entry_point)
+}

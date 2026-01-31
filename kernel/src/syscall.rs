@@ -68,6 +68,17 @@ pub const SYS_FSTAT: u16 = 80;   // Get file status
 pub const SYS_EXIT: u16 = 93;    // Terminate process
 pub const SYS_WAIT4: u16 = 260;  // Wait for child process
 pub const SYS_BRK: u16 = 214;    // Change data segment size
+pub const SYS_EXECVE: u16 = 221; // Execute program
+
+// Stub syscalls (return success or reasonable defaults)
+pub const SYS_FCNTL: u16 = 25;   // File control (stub)
+pub const SYS_IOCTL: u16 = 29;   // I/O control (stub)
+pub const SYS_FACCESSAT: u16 = 48;  // Check file access (stub)
+pub const SYS_UNAME: u16 = 160;  // Get system name (stub)
+pub const SYS_GETUID: u16 = 174; // Get user ID (stub)
+pub const SYS_GETEUID: u16 = 175; // Get effective user ID (stub)
+pub const SYS_GETGID: u16 = 176; // Get group ID (stub)
+pub const SYS_GETEGID: u16 = 177; // Get effective group ID (stub)
 
 /// Error codes (Linux-compatible)
 pub const ESUCCESS: i64 = 0;   // Success
@@ -297,6 +308,14 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             ctx.gpr[0] = sys_spawn(elf_ptr, elf_len) as u64;
         }
 
+        // SYS_EXECVE: x0=pathname, x1=argv, x2=envp → returns error (doesn't return on success)
+        SYS_EXECVE => {
+            let pathname = ctx.gpr[0] as usize;
+            let argv = ctx.gpr[1] as usize;
+            let envp = ctx.gpr[2] as usize;
+            ctx.gpr[0] = sys_execve(ctx, pathname, argv, envp) as u64;
+        }
+
         // IRQ syscalls
         // SYS_IRQ_REGISTER: x0=irq → returns result in x0
         SYS_IRQ_REGISTER => {
@@ -315,6 +334,28 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         SYS_IRQ_ACK => {
             let irq_num = ctx.gpr[0] as u32;
             ctx.gpr[0] = sys_irq_ack(irq_num) as u64;
+        }
+
+        // Stub syscalls - return reasonable defaults for compatibility
+        SYS_FCNTL => {
+            // fcntl(fd, cmd, arg) - return 0 for most commands
+            ctx.gpr[0] = 0;
+        }
+        SYS_IOCTL => {
+            // ioctl(fd, request, arg) - return 0 (success) for now
+            ctx.gpr[0] = 0;
+        }
+        SYS_FACCESSAT => {
+            // faccessat(dirfd, pathname, mode, flags) - return 0 (file accessible)
+            ctx.gpr[0] = 0;
+        }
+        SYS_UNAME => {
+            // uname(buf) - fill in basic system info
+            ctx.gpr[0] = sys_uname(ctx.gpr[0] as *mut u8) as u64;
+        }
+        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => {
+            // Return 0 (root) for all user/group IDs
+            ctx.gpr[0] = 0;
         }
 
         _ => {
@@ -431,6 +472,39 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
             // The return value is set by complete_pending_syscall in ipc.rs
             0 // Placeholder - never actually returned
         }
+        FdKind::File => {
+            let vnode = fd_entry.handle;
+            if len == 0 {
+                return 0;
+            }
+
+            // Create SHM for data transfer
+            let shm_id_i64 = shm::sys_shmcreate(len);
+            if shm_id_i64 < 0 {
+                return ENOMEM;
+            }
+            let shm_id = shm_id_i64 as usize;
+
+            // Grant VFS access to SHM
+            shm::sys_shmgrant(shm_id, VFS_TID.0);
+
+            // Set up pending syscall
+            unsafe {
+                let task = &mut TASKS[current_id.0];
+                task.pending_syscall = PendingSyscall::VfsRead {
+                    user_buf: buf,
+                    max_len: len,
+                    shm_id,
+                };
+            }
+
+            // Send VFS_READ_SHM request
+            // data[0] = vnode, data[1] = shm_id, data[2] = shm_offset, data[3] = max_len
+            let msg = Message::new(VFS_READ_SHM, [vnode, shm_id as u64, 0, len as u64]);
+            ipc::sys_call(ctx, VFS_TID, msg);
+
+            0 // Placeholder
+        }
         _ => EBADF,
     }
 }
@@ -529,6 +603,49 @@ fn sys_write(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i
             // Send PIPE_WRITE request to pipeserv
             let msg = Message::new(PIPE_WRITE, [pipe_id, shm_id as u64, len as u64, 0]);
             ipc::sys_call(ctx, PIPESERV_TID, msg);
+
+            // Return value set by complete_pending_syscall
+            0 // Placeholder
+        }
+        FdKind::File => {
+            let vnode = fd_entry.handle;
+            if len == 0 {
+                return 0;
+            }
+
+            // Create SHM for data transfer
+            let shm_id_i64 = shm::sys_shmcreate(len);
+            if shm_id_i64 < 0 {
+                return ENOMEM;
+            }
+            let shm_id = shm_id_i64 as usize;
+
+            // Map SHM and copy data from user buffer
+            let shm_addr = shm::sys_shmmap(shm_id, 0);
+            if shm_addr < 0 {
+                return ENOMEM;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf as *const u8,
+                    shm_addr as *mut u8,
+                    len,
+                );
+            }
+
+            // Grant VFS access to SHM
+            shm::sys_shmgrant(shm_id, VFS_TID.0);
+
+            // Set up pending syscall
+            unsafe {
+                let task = &mut TASKS[current_id.0];
+                task.pending_syscall = PendingSyscall::VfsWrite { shm_id };
+            }
+
+            // Send VFS_WRITE_SHM request to VFS
+            // data[0] = vnode, data[1] = shm_id, data[2] = shm_offset, data[3] = len
+            let msg = Message::new(VFS_WRITE_SHM, [vnode, shm_id as u64, 0, len as u64]);
+            ipc::sys_call(ctx, VFS_TID, msg);
 
             // Return value set by complete_pending_syscall
             0 // Placeholder
@@ -655,9 +772,20 @@ fn sys_spawn(elf_ptr: usize, elf_len: usize) -> i64 {
         core::slice::from_raw_parts(elf_ptr as *const u8, elf_len)
     };
 
+    // Get current task (will be parent)
+    let parent_id = sched::current();
+
     // Create the task using the existing ELF loader
     match sched::create_user_task_from_elf("spawned", elf_data) {
-        Some(task_id) => task_id.0 as i64,
+        Some(task_id) => {
+            // Set parent for waitpid support
+            if let Some(pid) = parent_id {
+                unsafe {
+                    TASKS[task_id.0].parent = Some(pid);
+                }
+            }
+            task_id.0 as i64
+        }
         None => ENOMEM,
     }
 }
@@ -891,6 +1019,9 @@ const VFS_TID: TaskId = TaskId(3);
 
 /// VFS IPC message tags
 const VFS_OPEN: u64 = 100;
+const VFS_CLOSE: u64 = 101;
+const VFS_READ_SHM: u64 = 110;
+const VFS_WRITE_SHM: u64 = 111;
 const VFS_STAT: u64 = 104;
 const VFS_READDIR: u64 = 105;
 
@@ -1320,4 +1451,117 @@ fn sys_brk(addr: usize) -> i64 {
         task.heap_brk = addr;
         addr as i64
     }
+}
+
+/// SYS_UNAME - Get system information
+fn sys_uname(buf: *mut u8) -> i64 {
+    if buf.is_null() {
+        return EFAULT;
+    }
+
+    // Linux utsname struct: 6 fields of 65 bytes each
+    const FIELD_LEN: usize = 65;
+
+    unsafe {
+        // sysname
+        let sysname = b"Kenix\0";
+        core::ptr::copy_nonoverlapping(sysname.as_ptr(), buf, sysname.len());
+
+        // nodename (hostname)
+        let nodename = b"kenix\0";
+        core::ptr::copy_nonoverlapping(nodename.as_ptr(), buf.add(FIELD_LEN), nodename.len());
+
+        // release
+        let release = b"0.1.0\0";
+        core::ptr::copy_nonoverlapping(release.as_ptr(), buf.add(FIELD_LEN * 2), release.len());
+
+        // version
+        let version = b"#1\0";
+        core::ptr::copy_nonoverlapping(version.as_ptr(), buf.add(FIELD_LEN * 3), version.len());
+
+        // machine
+        let machine = b"aarch64\0";
+        core::ptr::copy_nonoverlapping(machine.as_ptr(), buf.add(FIELD_LEN * 4), machine.len());
+
+        // domainname
+        let domainname = b"(none)\0";
+        core::ptr::copy_nonoverlapping(domainname.as_ptr(), buf.add(FIELD_LEN * 5), domainname.len());
+    }
+
+    ESUCCESS
+}
+
+/// SYS_EXECVE - Replace current process with new program
+///
+/// # Arguments
+/// * `ctx` - Exception context (for IPC blocking)
+/// * `pathname` - Path to executable (user pointer)
+/// * `_argv` - Argument array (currently ignored)
+/// * `_envp` - Environment array (currently ignored)
+///
+/// # Returns
+/// * On success: Does not return (current process is replaced)
+/// * On failure: Negative error code
+fn sys_execve(ctx: &mut ExceptionContext, pathname: usize, _argv: usize, _envp: usize) -> i64 {
+    use crate::sched::task::TASKS;
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    // Read pathname from user memory (max 255 chars)
+    let path_bytes = unsafe {
+        let mut len = 0;
+        while len < 255 {
+            let c = core::ptr::read_volatile((pathname + len) as *const u8);
+            if c == 0 {
+                break;
+            }
+            len += 1;
+        }
+        core::slice::from_raw_parts(pathname as *const u8, len)
+    };
+
+    if path_bytes.is_empty() {
+        return ENOENT;
+    }
+
+    // Create SHM for path transfer
+    let shm_id_i64 = shm::sys_shmcreate(256);
+    if shm_id_i64 < 0 {
+        return ENOMEM;
+    }
+    let shm_id = shm_id_i64 as usize;
+
+    // Map SHM and copy path
+    let shm_addr = shm::sys_shmmap(shm_id, 0);
+    if shm_addr < 0 {
+        return ENOMEM;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            shm_addr as *mut u8,
+            path_bytes.len(),
+        );
+        // Null-terminate
+        core::ptr::write_volatile((shm_addr as usize + path_bytes.len()) as *mut u8, 0);
+    }
+
+    // Grant VFS access
+    shm::sys_shmgrant(shm_id, VFS_TID.0);
+
+    // Set up pending syscall (stage 1: open the executable)
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::ExecveOpen { shm_id };
+    }
+
+    // Send VFS_OPEN request
+    // data[0] = shm_id, data[1] = path_len, data[2] = flags (O_RDONLY = 0)
+    let msg = Message::new(VFS_OPEN, [shm_id as u64, path_bytes.len() as u64, 0, 0]);
+    ipc::sys_call(ctx, VFS_TID, msg);
+
+    0 // Placeholder - actual return set by complete_pending_syscall (or replaced on success)
 }

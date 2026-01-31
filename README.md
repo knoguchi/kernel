@@ -1,6 +1,18 @@
 # Kenix
 
-Micro kernel written in Rust for AArch64
+A microkernel written in Rust for AArch64, featuring L4-style synchronous IPC,
+user-space device drivers, and a VFS layer with FAT32 support.
+
+## Current Status
+
+The kernel boots on QEMU virt and runs multiple user-space servers:
+- **Console server** - UART driver, handles stdin/stdout
+- **VFS server** - Virtual filesystem with ramfs and FAT32
+- **Block device server** - VirtIO-blk driver
+- **Network device server** - VirtIO-net driver
+- **Init process** - System tests and process spawning
+
+Tested features: IPC, shared memory, pipes, file operations, process spawn/execve.
 
 ## Target
 
@@ -24,17 +36,40 @@ brew install mtools  # macOS
 apt install mtools   # Linux
 ```
 
-## build & run
+## Build & Run
 
 ```bash
-# get UEFI firmware
-make fetch-ovmf
+# Build the kernel and user-space programs
+make
 
-# exec via UEFI bootloader
-make run
-
-# exec without UEFI
+# Run on QEMU (recommended - direct kernel boot)
 make run-kernel
+
+# Run with UEFI bootloader (WIP - currently a stub)
+make fetch-ovmf
+make run
+```
+
+### Sample Output
+
+```
+[console] Server started
+[vfs] Server started
+[blkdev] VirtIO ready
+[netdev] MAC: 52:54:00:12:34:56
+[pipeserv] ok, ready!
+
+=== Init Process ===
+Testing IPC, VFS, Spawn
+--- Basic VFS Test ---
+Read /hello.txt: Hello from ramfs!
+--- Pipe Test ---
+Created pipe: read_fd=3, write_fd=4
+Read from pipe: Hello, pipe!
+--- Spawn Test ---
+[hello] I was spawned!
+[hello] My PID is: 7
+=== Init complete ===
 ```
 
 ## Project Structure
@@ -141,7 +176,17 @@ kenix/
 - [x] write() syscall
 - [x] close() syscall
 - [x] pipe() syscall (kernel-level pipes)
-- [ ] dup/dup2
+- [x] dup/dup2/dup3 syscalls
+
+### Process Management
+- [x] spawn() syscall (create process from ELF in memory)
+- [x] execve() syscall (execute program from VFS path)
+- [x] getpid() syscall
+- [x] exit() syscall
+- [x] brk() syscall (heap management)
+- [x] getcwd/chdir syscalls (working directory)
+- [ ] fork()
+- [ ] wait/waitpid
 
 ### Memory Management
 - [ ] Demand paging
@@ -151,7 +196,9 @@ kenix/
 ### Hardware Support
 - [x] VirtIO-blk driver (block device)
 - [x] VirtIO-net driver (network)
-- [ ] Interrupts beyond timer (keyboard, network)
+- [x] ARM GIC (Generic Interrupt Controller)
+- [x] ARM timer interrupts (preemption)
+- [ ] VirtIO interrupt-driven I/O
 - [ ] Raspberry Pi 4/5 support
 - [ ] ARM Chromebook support
 
