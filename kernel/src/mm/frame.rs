@@ -155,18 +155,69 @@ impl FrameAllocator {
         None // No suitable contiguous region found
     }
 
+    /// Allocate contiguous frames at the START of a 2MB block.
+    /// This is needed when mapping ELFs linked at virtual address 0 with 2MB block mappings,
+    /// because virtual 0 maps to the physical 2MB block base.
+    /// Returns the starting PhysAddr (which will be 2MB-aligned), or None if not possible.
+    pub fn alloc_at_2mb_boundary(&mut self, count: usize) -> Option<PhysAddr> {
+        if !self.initialized || count == 0 {
+            return None;
+        }
+
+        // Can't allocate more than a 2MB block worth of pages
+        if count > PAGES_PER_2MB_BLOCK {
+            return None;
+        }
+
+        let total_pages = (self.memory_end - self.memory_start) / PAGE_SIZE;
+
+        // Find the first 2MB boundary in our memory range
+        let first_2mb_boundary = (self.memory_start + BLOCK_SIZE_2MB - 1) & !(BLOCK_SIZE_2MB - 1);
+        let first_boundary_page = (first_2mb_boundary - self.memory_start) / PAGE_SIZE;
+
+        // Iterate through all 2MB boundaries
+        let mut i = first_boundary_page;
+        while i < total_pages {
+            // Check if 'count' contiguous pages starting at i are all free
+            let mut all_free = true;
+            for j in 0..count {
+                if i + j >= total_pages || self.get_bit(i + j) {
+                    all_free = false;
+                    break;
+                }
+            }
+
+            if all_free {
+                // Found a suitable region at a 2MB boundary.
+                // Mark the ENTIRE 2MB block as used to prevent fragmentation.
+                for j in 0..PAGES_PER_2MB_BLOCK {
+                    if i + j < total_pages {
+                        self.set_bit(i + j, true);
+                    }
+                }
+                self.used_count += PAGES_PER_2MB_BLOCK.min(total_pages - i);
+                return Some(PhysAddr::new(self.memory_start + i * PAGE_SIZE));
+            }
+
+            // Skip to next 2MB boundary
+            i += PAGES_PER_2MB_BLOCK;
+        }
+
+        None // No suitable 2MB-aligned region found
+    }
+
     /// Free a physical frame
     pub fn free(&mut self, addr: PhysAddr) {
         if !self.initialized {
             return;
         }
 
-        let addr = addr.as_usize();
-        if addr < self.memory_start || addr >= self.memory_end {
+        let addr_val = addr.as_usize();
+        if addr_val < self.memory_start || addr_val >= self.memory_end {
             return; // Invalid address
         }
 
-        let page_index = (addr - self.memory_start) / PAGE_SIZE;
+        let page_index = (addr_val - self.memory_start) / PAGE_SIZE;
 
         // Only decrement if page was actually allocated
         if self.get_bit(page_index) {
@@ -270,6 +321,11 @@ pub fn alloc_frame() -> Option<PhysAddr> {
 /// Allocate multiple contiguous frames within the same 2MB block
 pub fn alloc_frames_in_2mb_block(count: usize) -> Option<PhysAddr> {
     unsafe { ALLOCATOR.alloc_contiguous_in_2mb_block(count) }
+}
+
+/// Allocate frames at the START of a 2MB block (for ELFs linked at virtual address 0)
+pub fn alloc_frames_at_2mb_boundary(count: usize) -> Option<PhysAddr> {
+    unsafe { ALLOCATOR.alloc_at_2mb_boundary(count) }
 }
 
 /// Free a frame to the global allocator

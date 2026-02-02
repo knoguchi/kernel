@@ -14,11 +14,18 @@
 //! - 0: SYS_YIELD - Voluntarily yield the CPU
 
 use crate::exception::ExceptionContext;
-use crate::sched::{self, TaskId, Message, TaskState, FileDescriptor, PendingSyscall};
-use crate::sched::task::FdFlags;
+use crate::sched::{self, TaskId, Message, TaskState, FileDescriptor, PendingSyscall, KERNEL_STACK_SIZE};
+use crate::sched::task::{FdFlags, find_free_slot};
 use crate::ipc;
 use crate::shm;
 use crate::irq;
+use crate::mm::{PhysAddr, KERNEL_VIRT_OFFSET, BLOCK_SIZE_2MB};
+use crate::mm::frame::{alloc_frame, free_frame, PAGE_SIZE};
+use crate::mm::paging::{PageTable, l1_index};
+use crate::mm::address_space::AddressSpace; // Add AddressSpace
+use core::ptr;
+use alloc::vec::Vec; // Add Vec for alloc_kernel_stack_frames
+use crate::println;
 
 /// Pipe server task ID
 const PIPESERV_TID: TaskId = TaskId(6);
@@ -47,6 +54,7 @@ pub const SYS_NOTIFY: u16 = 7;   // Send async notification
 pub const SYS_WAIT_NOTIFY: u16 = 8;  // Wait for notification
 pub const SYS_GETPID: u16 = 20;  // Get current task ID
 pub const SYS_SPAWN: u16 = 21;   // Create new task from ELF
+pub const SYS_FORK: u16 = 22;    // Create child process (fork)
 
 /// Syscall numbers - IRQ handling
 pub const SYS_IRQ_REGISTER: u16 = 30;  // Register for IRQ handling
@@ -295,7 +303,8 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
 
         SYS_EXIT => {
             let exit_code = ctx.gpr[0] as i32;
-            ctx.gpr[0] = sys_exit(exit_code) as u64;
+            sys_exit_with_switch(ctx, exit_code);
+            // Never returns
         }
 
         SYS_GETPID => {
@@ -306,6 +315,10 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             let elf_ptr = ctx.gpr[0] as usize;
             let elf_len = ctx.gpr[1] as usize;
             ctx.gpr[0] = sys_spawn(elf_ptr, elf_len) as u64;
+        }
+
+        SYS_FORK => {
+            ctx.gpr[0] = sys_fork(ctx) as u64;
         }
 
         // SYS_EXECVE: x0=pathname, x1=argv, x2=envp → returns error (doesn't return on success)
@@ -371,10 +384,12 @@ fn sys_yield() -> i64 {
     ESUCCESS
 }
 
-/// SYS_EXIT - Terminate the current task
-fn sys_exit(_exit_code: i32) -> i64 {
-    sched::exit();
-    // Never returns, but need return type for consistency
+/// SYS_EXIT - Terminate the current task with proper context switch
+fn sys_exit_with_switch(ctx: &mut ExceptionContext, exit_code: i32) {
+    unsafe {
+        sched::exit_with_switch(ctx, exit_code);
+    }
+    // Never returns
 }
 
 use sched::task::{TASKS, FdKind};
@@ -733,6 +748,95 @@ fn sys_getpid() -> i64 {
         Some(id) => id.0 as i64,
         None => EINVAL,
     }
+}
+
+/// SYS_FORK - Create child process (fork)
+fn sys_fork(ctx: &mut ExceptionContext) -> i64 {
+    // 1. Find a free task slot for the child
+    let child_id = match find_free_slot() {
+        Some(id) => id,
+        None => return ENOMEM,
+    };
+
+    let parent_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL, // Should not happen if a task is running
+    };
+
+    // Get mutable references to parent and child tasks
+    // Safety: We ensure child_id and parent_id are valid and distinct.
+    let (parent_task, child_task) = unsafe {
+        let ptr = ptr::addr_of_mut!(sched::task::TASKS);
+        let parent_ptr = ptr.cast::<sched::task::Task>().add(parent_id.0);
+        let child_ptr = ptr.cast::<sched::task::Task>().add(child_id.0);
+
+        (&mut *parent_ptr, &mut *child_ptr)
+    };
+
+    // 2. Allocate kernel stack for the child
+    let child_kstack_paddr = match sched::task::alloc_kernel_stack_frames() {
+        Some(paddr) => paddr,
+        None => return ENOMEM,
+    };
+    // Kernel uses identity mapping (virtual == physical for RAM)
+    let child_kstack_top_virt = child_kstack_paddr.0 + KERNEL_STACK_SIZE;
+
+    // 3. Duplicate parent's page table
+    let child_addr_space = unsafe {
+        parent_task.addr_space.as_ref().and_then(|parent_as| {
+            AddressSpace::clone_for_fork(parent_as)
+        })
+    };
+    let child_addr_space = match child_addr_space {
+        Some(aspace) => aspace,
+        None => {
+            sched::task::free_kernel_stack_frames(child_kstack_paddr);
+            return ENOMEM;
+        }
+    };
+    // 4. Initialize child task
+    *child_task = sched::task::Task::empty(); // Reset to empty state
+    child_task.id = child_id;
+    child_task.state = TaskState::Ready;
+    child_task.kernel_stack_base = child_kstack_paddr; // Store the physical address
+    child_task.kernel_stack_top = child_kstack_top_virt;
+    child_task.addr_space = Some(child_addr_space); // Assign the cloned address space
+    child_task.set_name(parent_task.name_str()); // Copy name
+    child_task.parent = Some(parent_id);
+    child_task.cwd = parent_task.cwd;
+    child_task.heap_brk = parent_task.heap_brk;
+    child_task.time_slice = parent_task.time_slice; // Inherit time slice
+
+    // 5. Set up child's execution context
+    // Copy the parent's exception context (registers) onto the child's kernel stack
+    let child_exception_ctx = (child_kstack_top_virt - core::mem::size_of::<ExceptionContext>()) as *mut ExceptionContext;
+
+    unsafe {
+        ptr::write_volatile(child_exception_ctx, *ctx);
+        // Child's return value from fork is 0
+        (*child_exception_ctx).gpr[0] = 0;
+    }
+
+    // Set kernel_stack_top to point to the ExceptionContext.
+    // The scheduler's switch_context_and_restore() will use this to restore
+    // the ExceptionContext and ERET back to user space.
+    child_task.kernel_stack_top = child_exception_ctx as usize;
+
+
+    // 6. Duplicate file descriptors
+    for i in 0..sched::MAX_FDS {
+        if parent_task.fds[i].is_valid() {
+            child_task.fds[i] = parent_task.fds[i];
+            // TODO: Increment reference counts for underlying file/pipe objects
+            // This is crucial for proper resource management. For now, sharing implicitly.
+        }
+    }
+
+    // 7. Add child to ready queue
+    sched::enqueue_task(child_id);
+
+    // 8. Parent returns child's TID
+    child_id.0 as i64
 }
 
 /// Maximum ELF size we'll accept for spawn (1MB should be plenty for user programs)
@@ -1356,67 +1460,67 @@ fn sys_wait4(ctx: &mut ExceptionContext, pid: i32, wstatus: usize, options: u32)
     };
 
     unsafe {
-        // Find a terminated child
-        let mut found_child: Option<TaskId> = None;
-        let mut has_children = false;
+        loop {
+            // Find a terminated child
+            let mut found_child: Option<TaskId> = None;
+            let mut has_children = false;
 
-        for i in 0..MAX_TASKS {
-            let task = &TASKS[i];
-            if task.parent == Some(current_id) {
-                has_children = true;
+            for i in 0..MAX_TASKS {
+                let task = &TASKS[i];
+                if task.parent == Some(current_id) {
+                    has_children = true;
 
-                // Check if this child matches the pid filter
-                let matches = if pid == -1 {
-                    true // Any child
-                } else if pid > 0 {
-                    i == pid as usize
-                } else {
-                    true // TODO: process groups not implemented
-                };
+                    // Check if this child matches the pid filter
+                    let matches = if pid == -1 {
+                        true // Any child
+                    } else if pid > 0 {
+                        i == pid as usize
+                    } else {
+                        true // TODO: process groups not implemented
+                    };
 
-                if matches && task.state == TaskState::Terminated {
-                    found_child = Some(TaskId(i));
-                    break;
+                    if matches && task.state == TaskState::Terminated {
+                        found_child = Some(TaskId(i));
+                        break;
+                    }
                 }
             }
-        }
 
-        if !has_children {
-            return ECHILD;
-        }
-
-        if let Some(child_id) = found_child {
-            // Reap the child
-            let child = &mut TASKS[child_id.0];
-            let exit_code = child.exit_code;
-
-            // Write status if pointer provided
-            if wstatus != 0 {
-                // Linux encodes exit code as (code << 8)
-                let status = (exit_code as u32) << 8;
-                core::ptr::write_volatile(wstatus as *mut i32, status as i32);
+            if !has_children {
+                return ECHILD;
             }
 
-            // Free the child task slot
-            child.state = TaskState::Free;
-            child.parent = None;
+            if let Some(child_id) = found_child {
+                // Reap the child
+                let child = &mut TASKS[child_id.0];
+                let exit_code = child.exit_code;
 
-            return child_id.0 as i64;
+                // Write status if pointer provided
+                if wstatus != 0 {
+                    // Linux encodes exit code as (code << 8)
+                    let status = (exit_code as u32) << 8;
+                    core::ptr::write_volatile(wstatus as *mut i32, status as i32);
+                }
+
+                // Free the child task slot
+                child.state = TaskState::Free;
+                child.parent = None;
+
+                return child_id.0 as i64;
+            }
+
+            // No terminated child found
+            if options & WNOHANG != 0 {
+                return 0; // Non-blocking, no child ready
+            }
+
+            // Block waiting for child - child will wake us when it exits
+            let task = &mut TASKS[current_id.0];
+            task.state = TaskState::WaitBlocked;
+            sched::context_switch_blocking(ctx);
+
+            // When we wake up, loop back and try again to find the terminated child
         }
-
-        // No terminated child found
-        if options & WNOHANG != 0 {
-            return 0; // Non-blocking, no child ready
-        }
-
-        // Block waiting for child
-        let task = &mut TASKS[current_id.0];
-        task.state = TaskState::WaitBlocked;
-        sched::context_switch_blocking(ctx);
-
-        // When we wake up, try again (recursive would be cleaner but let's avoid stack growth)
-        // For now, just return ECHILD - proper implementation needs a loop or retry
-        ECHILD
     }
 }
 

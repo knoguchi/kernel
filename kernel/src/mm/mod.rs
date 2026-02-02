@@ -3,9 +3,11 @@ pub mod paging;
 mod mmu;
 pub mod address_space;
 
+pub const KERNEL_VIRT_OFFSET: usize = 0xC000_0000;
+
 pub use frame::{alloc_frame, free_frame, total_pages, free_pages, PhysAddr};
 pub use address_space::{AddressSpace, PageFlags};
-pub use paging::{l1_index, l2_index, l3_index, PageTableEntry, ENTRIES_PER_TABLE};
+pub use paging::{l1_index, l2_index, l3_index, PageTableEntry, ENTRIES_PER_TABLE, BLOCK_SIZE_2MB};
 pub use mmu::kernel_ttbr0;
 
 /// Initialize the physical memory allocator

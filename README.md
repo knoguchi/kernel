@@ -66,9 +66,13 @@ Read /hello.txt: Hello from ramfs!
 --- Pipe Test ---
 Created pipe: read_fd=3, write_fd=4
 Read from pipe: Hello, pipe!
+--- Fork Test ---
+[parent] fork() returned child PID=8
+[child] I'm the child! PID=8
+[parent] Child exited with status=0
 --- Spawn Test ---
 [hello] I was spawned!
-[hello] My PID is: 7
+[hello] My PID is: 9
 === Init complete ===
 ```
 
@@ -185,8 +189,8 @@ kenix/
 - [x] exit() syscall
 - [x] brk() syscall (heap management)
 - [x] getcwd/chdir syscalls (working directory)
-- [ ] fork()
-- [ ] wait/waitpid
+- [x] fork() syscall (copy-on-write not yet implemented, full copy)
+- [x] wait/waitpid syscalls
 
 ### Memory Management
 - [ ] Demand paging

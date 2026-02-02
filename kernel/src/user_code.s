@@ -44,3 +44,10 @@ __netdev_elf_end:
 __pipeserv_elf_start:
 .incbin "../user/pipeserv.elf"
 __pipeserv_elf_end:
+
+// Forktest ELF
+.global __forktest_elf_start
+.global __forktest_elf_end
+__forktest_elf_start:
+.incbin "../user/forktest.elf"
+__forktest_elf_end:

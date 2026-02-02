@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 #![feature(linkage)]
+#![feature(alloc)]
+
+extern crate alloc;
 
 use core::panic::PanicInfo;
 use core::fmt::Write;
@@ -16,6 +19,7 @@ mod elf;
 mod ipc;
 mod shm;
 mod irq;
+mod allocator;
 
 // Memory intrinsics required by compiler
 #[no_mangle]
@@ -106,6 +110,9 @@ extern "C" {
     // Pipe server ELF (created sixth, gets task ID 6)
     static __pipeserv_elf_start: u8;
     static __pipeserv_elf_end: u8;
+    // Forktest ELF
+    static __forktest_elf_start: u8;
+    static __forktest_elf_end: u8;
 }
 
 struct Uart {
@@ -371,6 +378,28 @@ pub extern "C" fn kernel_main() -> ! {
         println!("  Created pipeserv server (id={}) - runs in EL0", id.0);
     } else {
         println!("  ERROR: Failed to create pipeserv server!");
+    }
+    println!();
+
+    // Create forktest task from ELF
+    println!("Creating forktest task...");
+    let forktest_start = unsafe { &__forktest_elf_start as *const u8 };
+    let forktest_end = unsafe { &__forktest_elf_end as *const u8 };
+    let forktest_size = forktest_end as usize - forktest_start as usize;
+    let forktest_data = unsafe { core::slice::from_raw_parts(forktest_start, forktest_size) };
+
+    println!("  Forktest ELF at {:#010x}, size {} bytes", forktest_start as usize, forktest_size);
+
+    if let Ok(elf_file) = elf::ElfFile::parse(forktest_data) {
+        println!("  Entry point: {:#010x}", elf_file.entry_point());
+    } else {
+        println!("  ERROR: Failed to parse forktest ELF for entry point!");
+    }
+
+    if let Some(id) = sched::create_user_task_from_elf("forktest", forktest_data) {
+        println!("  Created forktest task (id={}) - runs in EL0", id.0);
+    } else {
+        println!("  ERROR: Failed to create forktest task!");
     }
     println!();
 

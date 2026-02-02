@@ -7,6 +7,9 @@
 //! - IPC state (message passing)
 
 use crate::mm::PhysAddr;
+use crate::mm::frame::{alloc_frame, free_frame};
+use crate::mm::address_space::AddressSpace;
+use alloc::vec::Vec;
 
 /// Maximum number of tasks in the system
 pub const MAX_TASKS: usize = 64;
@@ -358,7 +361,7 @@ pub struct Task {
     /// Top of kernel stack (initial SP value)
     pub kernel_stack_top: usize,
     /// Page table physical address (TTBR0_EL1)
-    pub page_table: PhysAddr,
+    pub addr_space: Option<AddressSpace>,
     /// Entry point address (for new tasks)
     pub entry_point: usize,
     /// Remaining time slice (decremented each tick)
@@ -405,7 +408,7 @@ impl Task {
             context_ptr: core::ptr::null_mut(),
             kernel_stack_base: PhysAddr(0),
             kernel_stack_top: 0,
-            page_table: PhysAddr(0),
+            addr_space: None,
             entry_point: 0,
             time_slice: DEFAULT_TIME_SLICE,
             next: None,
@@ -604,4 +607,84 @@ pub unsafe fn find_sender(receiver_id: TaskId, from_filter: Option<TaskId>) -> O
         current = TASKS[curr_id.0].ipc.sender_next;
     }
     None
+}
+
+/// Unblock all tasks waiting to send to a task that is exiting
+///
+/// When a task exits, any tasks in SendBlocked waiting to send to it
+/// need to be woken up with an error.
+///
+/// # Safety
+/// Caller must ensure exiting_task_id is valid.
+pub unsafe fn wake_blocked_senders(exiting_task_id: TaskId) {
+    use crate::exception::ExceptionContext;
+    use super::enqueue_task;
+
+    let exiting_task = &mut TASKS[exiting_task_id.0];
+
+    // Process all tasks in the sender queue
+    while let Some(sender_id) = exiting_task.ipc.sender_queue_head {
+        let sender = &mut TASKS[sender_id.0];
+        exiting_task.ipc.sender_queue_head = sender.ipc.sender_next;
+        sender.ipc.sender_next = None;
+
+        // Set error return value in sender's saved context
+        if sender.state == TaskState::SendBlocked || sender.state == TaskState::ReplyBlocked {
+            let sender_ctx = sender.kernel_stack_top as *mut ExceptionContext;
+            if !sender_ctx.is_null() {
+                // Return error code in x0 (IPC_ERR_TASK_TERMINATED = -10)
+                (*sender_ctx).gpr[0] = (-10i64) as u64;
+            }
+            sender.state = TaskState::Ready;
+            enqueue_task(sender_id);
+        }
+    }
+    exiting_task.ipc.sender_queue_tail = None;
+
+    // Also check if any task is in ReplyBlocked waiting for a reply from this task
+    for i in 0..MAX_TASKS {
+        let task = &mut TASKS[i];
+        if task.state == TaskState::ReplyBlocked && task.ipc.reply_to == Some(exiting_task_id) {
+            let task_ctx = task.kernel_stack_top as *mut ExceptionContext;
+            if !task_ctx.is_null() {
+                (*task_ctx).gpr[0] = (-10i64) as u64;
+            }
+            task.state = TaskState::Ready;
+            enqueue_task(TaskId(i));
+        }
+    }
+}
+
+/// Allocate physical frames for a kernel stack (KERNEL_STACK_SIZE)
+///
+/// Returns the physical address of the base of the allocated stack,
+/// or None if allocation fails.
+pub fn alloc_kernel_stack_frames() -> Option<PhysAddr> {
+    let stack_pages = KERNEL_STACK_SIZE / crate::mm::frame::PAGE_SIZE;
+    let mut allocated_frames = Vec::new(); // Use Vec to manage allocated frames for cleanup
+
+    for _i in 0..stack_pages {
+        if let Some(frame) = alloc_frame() {
+            allocated_frames.push(frame);
+        } else {
+            // Allocation failed, free all previously allocated frames
+            for frame in allocated_frames {
+                free_frame(frame);
+            }
+            return None;
+        }
+    }
+    // Return the base address (first frame)
+    allocated_frames.first().copied()
+}
+
+/// Free physical frames previously allocated for a kernel stack.
+///
+/// # Arguments
+/// * `stack_base` - The physical address of the base of the kernel stack.
+pub fn free_kernel_stack_frames(stack_base: PhysAddr) {
+    let stack_pages = KERNEL_STACK_SIZE / crate::mm::frame::PAGE_SIZE;
+    for i in 0..stack_pages {
+        free_frame(PhysAddr(stack_base.0 + i * crate::mm::frame::PAGE_SIZE));
+    }
 }

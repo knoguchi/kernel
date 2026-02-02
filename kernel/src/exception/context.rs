@@ -11,6 +11,7 @@
 /// - 0x108: spsr_el1 (saved processor status)
 /// - 0x110: esr_el1 (exception syndrome)
 /// - 0x118: far_el1 (fault address)
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ExceptionContext {
     /// General purpose registers x0-x30

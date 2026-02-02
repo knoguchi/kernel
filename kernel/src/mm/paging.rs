@@ -15,6 +15,7 @@
 //! [0]     Valid bit
 
 use super::frame::PAGE_SIZE;
+use super::address_space::PageFlags;
 
 /// Memory attribute index for Device-nGnRnE (MAIR Attr0)
 pub const MATTR_DEVICE: u64 = 0;
@@ -44,7 +45,7 @@ const PXN: u64 = 1 << 53;
 /// Page table entry for AArch64 4KB granule
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-pub struct PageTableEntry(u64);
+pub struct PageTableEntry(pub u64);
 
 impl PageTableEntry {
     /// Create an invalid (empty) entry
@@ -120,9 +121,46 @@ impl PageTableEntry {
         self.is_valid() && (self.0 & 0b10) == 0
     }
 
+    /// Check if entry is a page descriptor (bits [1:0] == 0b11)
+    /// In L3, this means a 4KB page mapping
+    pub fn is_page(&self) -> bool {
+        self.is_valid() && (self.0 & 0b10) != 0 // L3 uses type bit 1
+    }
+
     /// Get the physical address from a table descriptor
     pub fn table_addr(&self) -> u64 {
         self.0 & 0x0000_FFFF_FFFF_F000
+    }
+
+    /// Extract the PageFlags from this entry
+    pub fn page_flags(&self) -> super::address_space::PageFlags {
+        let ap = (self.0 >> 6) & 0b11; // AP bits
+        let uxn = (self.0 >> 54) & 1; // UXN bit
+        let pxn = (self.0 >> 53) & 1; // PXN bit
+        let mattr = (self.0 >> 2) & 0b111; // AttrIndx bits
+
+        let user = match ap {
+            0b00 => false, // EL1 R/W, EL0 no access
+            0b01 => true,  // EL1 R/W, EL0 R/W
+            0b10 => false, // EL1 R/O, EL0 no access
+            0b11 => true,  // EL1 R/O, EL0 R/O
+            _ => false, // Should not happen
+        };
+
+        let writable = match ap {
+            0b00 | 0b01 => true, // R/W
+            0b10 | 0b11 => false, // R/O
+            _ => false,
+        };
+
+        let executable = !((uxn != 0 && user) || (pxn != 0 && !user));
+
+        super::address_space::PageFlags {
+            mattr,
+            writable,
+            executable,
+            user,
+        }
     }
 }
 

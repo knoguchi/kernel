@@ -164,8 +164,8 @@ impl Scheduler {
         // If we're switching to a different task, switch to its stack and restore context
         if current_id != Some(next_id) {
             // Switch page table if needed
-            if next_task.page_table.0 != 0 {
-                let ttbr0 = next_task.page_table.0 as u64;
+            if let Some(ref addr_space) = next_task.addr_space {
+                let ttbr0 = addr_space.ttbr0();
                 core::arch::asm!(
                     "msr ttbr0_el1, {0}",
                     "isb",
@@ -223,8 +223,8 @@ impl Scheduler {
         // Switch to new task's stack
         if current_id != Some(next_id) {
             // Switch page table if needed
-            if next_task.page_table.0 != 0 {
-                let ttbr0 = next_task.page_table.0 as u64;
+            if let Some(ref addr_space) = next_task.addr_space {
+                let ttbr0 = addr_space.ttbr0();
                 core::arch::asm!(
                     "msr ttbr0_el1, {0}",
                     "isb",
@@ -242,11 +242,25 @@ impl Scheduler {
     }
 
     /// Terminate the current task
-    pub fn exit_current(&mut self) {
+    pub fn exit_current(&mut self, exit_code: i32) {
         if let Some(current_id) = self.current {
             unsafe {
+                // Wake up any tasks waiting to send to or waiting for reply from this task
+                task::wake_blocked_senders(current_id);
+
                 let task = &mut TASKS[current_id.0];
+                task.exit_code = exit_code;
                 task.state = TaskState::Terminated;
+
+                // Wake up parent if it's waiting for us (WaitBlocked)
+                if let Some(parent_id) = task.parent {
+                    let parent = &mut TASKS[parent_id.0];
+                    if parent.state == TaskState::WaitBlocked {
+                        parent.state = TaskState::Ready;
+                        enqueue_task(parent_id);
+                    }
+                }
+
                 self.current = None;
             }
         }
@@ -285,7 +299,7 @@ pub unsafe fn init() {
     idle.id = TaskId(0);
     idle.state = TaskState::Running; // Idle task starts as "running"
     idle.set_name("idle");
-    idle.page_table = PhysAddr(0); // Use kernel page table
+    idle.addr_space = None; // Idle task initially runs in kernel's address space
     idle.entry_point = idle_task_entry as *const () as usize;
     idle.kernel_stack_top = 0; // Will be set when we first switch away
     idle.time_slice = DEFAULT_TIME_SLICE;
@@ -324,7 +338,7 @@ pub fn create_task(name: &str, entry_point: fn()) -> Option<TaskId> {
         task.state = TaskState::Ready;
         task.set_name(name);
         task.kernel_stack_base = stack_base;
-        task.page_table = PhysAddr(0); // Use kernel page table for now
+        task.addr_space = None; // Kernel tasks initially run in kernel's address space
         task.entry_point = entry_addr;
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
@@ -456,8 +470,8 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
         task.state = TaskState::Ready;
         task.set_name(name);
         task.kernel_stack_base = kernel_stack_base;
-        // Store the page table physical address
-        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        // Store the AddressSpace directly
+        task.addr_space = Some(addr_space);
         task.entry_point = user_entry_point;
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
@@ -491,9 +505,6 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
         // Enqueue to ready queue
         SCHEDULER.enqueue(task_id);
 
-        // Prevent AddressSpace from being dropped (we need to keep the page tables alive)
-        // The page table pointer is stored in task.page_table
-        core::mem::forget(addr_space);
     }
 
     Some(task_id)
@@ -571,68 +582,41 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         return None;
     }
 
-    // Allocate all code frames contiguously within the same 2MB block
-    // This ensures the 2MB block mapping will work correctly
-    let first_frame = mm::frame::alloc_frames_in_2mb_block(num_frames)?;
-    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let first_frame_offset = first_frame.0 - phys_base_2mb.0;
+    // Allocate code frames at the START of a 2MB block.
+    // Since ELFs are linked at virtual address 0 and we map virtual 0 to phys_base_2mb,
+    // the code must be at the start of the physical block.
+    let first_frame = mm::frame::alloc_frames_at_2mb_boundary(num_frames)?;
+    let phys_base_2mb = first_frame; // first_frame IS the 2MB block base
+    let first_frame_offset = 0; // Always 0 now
 
-    // Build the code_frames array from the contiguous allocation
-    let mut code_frames: [PhysAddr; MAX_CODE_FRAMES] = [PhysAddr(0); MAX_CODE_FRAMES];
-    for i in 0..num_frames {
-        code_frames[i] = PhysAddr(first_frame.0 + i * mm::frame::PAGE_SIZE);
-        // Zero each frame
-        unsafe {
-            core::ptr::write_bytes(code_frames[i].0 as *mut u8, 0, mm::frame::PAGE_SIZE);
-        }
+    // Zero only the range we'll use for code (up to max_vaddr to ensure .bss is zeroed)
+    unsafe {
+        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, max_vaddr);
     }
 
-    // Copy all segments to the appropriate frames
-    // The ELF is linked at block_base (typically 0), and we copy it to our frames.
-    // The frames will be mapped at virtual address first_frame_offset.
-    // So segment at vaddr X will be at virtual first_frame_offset + (X - block_base).
+    // Copy all segments directly into the 2MB physical block
+    // The ELF is linked at virtual address `vaddr`, which maps to `phys_base_2mb.0 + vaddr`
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
         let filesz = phdr.p_filesz as usize;
-        let memsz = phdr.p_memsz as usize;
 
-        if memsz == 0 || filesz == 0 {
+        if filesz == 0 { // Empty segment
             continue;
         }
 
         // Get segment data from ELF
         let segment_data = elf.segment_data(phdr).ok()?;
 
-        // Calculate offset within our allocated frames
-        // The segment's vaddr relative to block_base tells us where within our frames to copy
-        let offset_in_frames = vaddr - block_base;
+        // Calculate destination physical address
+        let dest_paddr = phys_base_2mb.0 + vaddr;
 
-        // Copy the segment, handling frame boundaries
-        let mut bytes_copied = 0usize;
-        while bytes_copied < filesz {
-            let current_offset = offset_in_frames + bytes_copied;
-            let frame_idx = current_offset / mm::frame::PAGE_SIZE;
-            let offset_in_frame = current_offset % mm::frame::PAGE_SIZE;
-
-            if frame_idx >= num_frames {
-                // Beyond our allocated frames
-                break;
-            }
-
-            // Calculate how many bytes we can copy to this frame
-            let bytes_left_in_frame = mm::frame::PAGE_SIZE - offset_in_frame;
-            let bytes_left_to_copy = filesz - bytes_copied;
-            let copy_size = bytes_left_in_frame.min(bytes_left_to_copy);
-
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    segment_data.as_ptr().add(bytes_copied),
-                    (code_frames[frame_idx].0 + offset_in_frame) as *mut u8,
-                    copy_size,
-                );
-            }
-
-            bytes_copied += copy_size;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                segment_data.as_ptr(),
+                dest_paddr as *mut u8,
+                filesz,
+            );
+            // .bss section (if memsz > filesz) is already zeroed by the initial memset
         }
     }
 
@@ -640,17 +624,10 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     // If any segment is executable, we need execute permission
     // If any segment is writable, we need write permission
     // With 2MB granularity, we may need both R+W+X if segments are mixed
-    let flags = if has_executable && has_writable {
-        // Need both execute and write - use RWX
-        // Note: W+X is less secure but required for 2MB granularity with mixed segments
-        PageFlags::user_code_data()
-    } else if has_executable {
-        PageFlags::user_code()
-    } else if has_writable {
-        PageFlags::user_data()
-    } else {
-        PageFlags::user_code() // Read-only
-    };
+    // With 2MB granularity, we use RWX for all user code blocks.
+    // The ELF segments may not properly mark .bss as writable, and user programs
+    // need to write to global variables. Using RWX is less secure but necessary.
+    let flags = PageFlags::user_code_data();
 
     // Map the 2MB block at virtual address 0
     // The code will be at virtual address first_frame_offset within this block
@@ -660,26 +637,26 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         }
     }
 
-    // Allocate and map user stack (2MB block)
-    let stack_frame = mm::alloc_frame()?;
-    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+    // Allocate user stack at start of a 2MB block (just like code).
+    // This ensures each task has its own exclusive 2MB stack region.
+    let stack_frame = mm::frame::alloc_frames_at_2mb_boundary(1)?;
+    let stack_phys_base_2mb = stack_frame; // first_frame IS the 2MB block base
 
     unsafe {
-        // Zero the stack frame
+        // Zero the first page of the stack
         core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
         if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return None;
         }
     }
 
-    // User stack pointer: top of the allocated frame
-    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    // User stack pointer: top of the allocated 2MB region (minus alignment)
+    let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
 
-    // Entry point: ELF entry + frame offset within 2MB block
     // The ELF is linked at 0, and we copied it starting at first_frame_offset.
-    // So the actual entry point is first_frame_offset + elf.entry_point()
-    let user_entry_point = first_frame_offset + elf.entry_point() as usize;
+    // The user entry point should be just the ELF's specified entry point, as the
+    // virtual address 0 is mapped to the physical 2MB block base.
+    let user_entry_point = elf.entry_point() as usize;
 
     // Allocate kernel stack for syscalls/interrupts
     let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
@@ -701,7 +678,7 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         task.state = TaskState::Ready;
         task.set_name(name);
         task.kernel_stack_base = kernel_stack_base;
-        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        task.addr_space = Some(addr_space);
         task.entry_point = user_entry_point;
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
@@ -728,9 +705,6 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
 
         // Enqueue to ready queue
         SCHEDULER.enqueue(task_id);
-
-        // Prevent AddressSpace from being dropped
-        core::mem::forget(addr_space);
     }
 
     Some(task_id)
@@ -938,7 +912,7 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
         task.state = TaskState::Ready;
         task.set_name(name);
         task.kernel_stack_base = kernel_stack_base;
-        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        task.addr_space = Some(addr_space);
         task.entry_point = user_entry_point;
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
@@ -956,7 +930,6 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
         task.kernel_stack_top = ctx_addr;
 
         SCHEDULER.enqueue(task_id);
-        core::mem::forget(addr_space);
     }
 
     Some(task_id)
@@ -1011,10 +984,20 @@ pub unsafe fn context_switch_blocking(ctx: &mut ExceptionContext) {
     SCHEDULER.context_switch_blocking(ctx);
 }
 
-/// Exit the current task
+/// Exit the current task (with context switch to next task)
+///
+/// # Safety
+/// Must be called from exception context with ctx pointing to saved context.
+pub unsafe fn exit_with_switch(ctx: &mut ExceptionContext, exit_code: i32) {
+    SCHEDULER.exit_current(exit_code);
+    context_switch_blocking(ctx);
+    // Never returns
+}
+
+/// Exit the current task (legacy - spins forever, deprecated)
 pub fn exit() -> ! {
     unsafe {
-        SCHEDULER.exit_current();
+        SCHEDULER.exit_current(0);
     }
     // Should never return, but just in case
     loop {
@@ -1227,7 +1210,7 @@ pub fn create_blkdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         task.state = TaskState::Ready;
         task.set_name(name);
         task.kernel_stack_base = kernel_stack_base;
-        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        task.addr_space = Some(addr_space);
         task.entry_point = user_entry_point;
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
@@ -1248,7 +1231,6 @@ pub fn create_blkdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         task.kernel_stack_top = ctx_addr;
 
         SCHEDULER.enqueue(task_id);
-        core::mem::forget(addr_space);
     }
 
     Some(task_id)
@@ -1445,7 +1427,7 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         task.state = TaskState::Ready;
         task.set_name(name);
         task.kernel_stack_base = kernel_stack_base;
-        task.page_table = PhysAddr(addr_space.ttbr0() as usize);
+        task.addr_space = Some(addr_space);
         task.entry_point = user_entry_point;
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
@@ -1466,7 +1448,6 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         task.kernel_stack_top = ctx_addr;
 
         SCHEDULER.enqueue(task_id);
-        core::mem::forget(addr_space);
     }
 
     Some(task_id)
@@ -1574,15 +1555,14 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
         }
     }
 
-    // Create new address space with user code mapped at virtual address 0
-    let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
+    let mut new_addr_space = match unsafe { AddressSpace::new_for_user() } {
         Some(as_) => as_,
         None => return Err(-12), // ENOMEM - couldn't create address space
     };
 
     // Map code at 0 (ELF is typically linked at address 0 for simplicity)
     unsafe {
-        if !addr_space.map_2mb(0, phys_base_2mb, PageFlags::user_code()) {
+        if !new_addr_space.map_2mb(0, phys_base_2mb, PageFlags::user_code()) {
             return Err(-12); // ENOMEM
         }
     }
@@ -1597,23 +1577,17 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
 
     // Map stack at USER_STACK_VADDR_BASE
     unsafe {
-        if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
+        if !new_addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return Err(-12); // ENOMEM
         }
     }
-
-    let new_page_table = PhysAddr(addr_space.ttbr0() as usize);
 
     // Update the task, preserving what POSIX requires
     unsafe {
         let task = &mut TASKS[task_id.0];
 
-        // Free old page table (we'll need to implement proper cleanup later)
-        // For now, just replace it
-        let _old_page_table = task.page_table;
-
-        // Update with new address space
-        task.page_table = new_page_table;
+        // Replace old address space with new one. The old one will be dropped automatically.
+        task.addr_space = Some(new_addr_space);
         task.entry_point = entry_point;
 
         // Reset heap to default
@@ -1642,8 +1616,6 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
 
         task.kernel_stack_top = ctx_addr;
 
-        // Forget the address space so it's not dropped
-        core::mem::forget(addr_space);
     }
 
     Ok(entry_point)

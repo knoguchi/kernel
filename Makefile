@@ -20,9 +20,10 @@ boot:
 # Build all user-space programs (all Rust now)
 # Build hello first since init embeds it via include_bytes!
 user:
-	cd user && cargo +nightly build --release --target aarch64-kenix-user.json -Zbuild-std=core -p libkenix -p hello
+	cd user && cargo +nightly build --release --target aarch64-kenix-user.json -Zbuild-std=core -p libkenix -p hello -p forktest
 	mkdir -p user/init/data
 	cp user/target/aarch64-kenix-user/release/hello user/init/data/hello.elf
+	cp user/target/aarch64-kenix-user/release/forktest user/forktest.elf
 	cd user && cargo +nightly build --release --target aarch64-kenix-user.json -Zbuild-std=core
 	cp user/target/aarch64-kenix-user/release/console user/console.elf
 	cp user/target/aarch64-kenix-user/release/init user/init.elf
@@ -67,10 +68,8 @@ run-kernel: kernel $(DISK_IMG)
 
 clean:
 	rm -rf esp kernel.elf $(DISK_IMG)
-	rm -f user/console.elf user/init.elf user/vfs.elf user/blkdev.elf user/netdev.elf user/pipeserv.elf
+	rm -f user/console.elf user/init.elf user/vfs.elf user/hello.elf user/blkdev.elf user/netdev.elf user/pipeserv.elf user/forktest.elf
 	cd boot && cargo clean
-	cd kernel && cargo clean
-	cd user && cargo clean 2>/dev/null || true
 
 # Note: UEFI firmware is provided by QEMU (Homebrew) at /opt/homebrew/share/qemu/
 # For other installations, set OVMF to the path of your edk2-aarch64-code.fd

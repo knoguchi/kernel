@@ -322,6 +322,43 @@ fn main() -> ! {
     print(" (expected EISDIR or similar)\n");
 
     // ========================================
+    // Test fork
+    // ========================================
+    print("\n--- Fork Test ---\n");
+
+    let pid = syscall::fork();
+    if pid < 0 {
+        print("fork() failed: ");
+        print_num((-pid) as usize);
+        print("\n");
+    } else if pid == 0 {
+        // Child process
+        print("[child] I'm the child! PID=");
+        print_num(syscall::getpid() as usize);
+        print("\n");
+        print("[child] Exiting...\n");
+        syscall::exit(42);
+    } else {
+        // Parent process
+        print("[parent] fork() returned child PID=");
+        print_num(pid as usize);
+        print("\n");
+
+        // Wait for child to exit
+        print("[parent] Waiting for child...\n");
+        let (wait_result, status) = syscall::waitpid(pid as i32, 0);
+        if wait_result >= 0 {
+            print("[parent] Child exited with status=");
+            print_num(status as usize);
+            print("\n");
+        } else {
+            print("[parent] waitpid() failed: ");
+            print_num((-wait_result) as usize);
+            print("\n");
+        }
+    }
+
+    // ========================================
     // Spawn hello from embedded ELF
     // ========================================
     print("\n--- Spawn Test ---\n");

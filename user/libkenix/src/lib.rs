@@ -84,6 +84,7 @@ pub mod syscall {
     pub const SYS_SHMGRANT: u64 = 13;
     pub const SYS_GETPID: u64 = 20;
     pub const SYS_SPAWN: u64 = 21;
+    pub const SYS_FORK: u64 = 22;
     pub const SYS_IRQ_REGISTER: u64 = 30;
     pub const SYS_IRQ_WAIT: u64 = 31;
     pub const SYS_IRQ_ACK: u64 = 32;
@@ -202,6 +203,25 @@ pub mod syscall {
                 inout("x0") elf_data.as_ptr() => ret,
                 in("x1") elf_data.len(),
                 in("x8") SYS_SPAWN,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Create child process (fork)
+    ///
+    /// # Returns
+    /// * In parent: child's PID (>= 0)
+    /// * In child: 0
+    /// * On failure: negative error code
+    pub fn fork() -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                out("x0") ret,
+                in("x8") SYS_FORK,
                 options(nostack)
             );
         }

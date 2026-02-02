@@ -5,8 +5,60 @@
 //! - Shared kernel mappings (copied from kernel page table)
 
 use super::frame::{alloc_frame, free_frame, PhysAddr, PAGE_SIZE};
-use super::paging::{PageTableEntry, MATTR_NORMAL, MATTR_DEVICE, ENTRIES_PER_TABLE, l1_index, l2_index, l3_index};
+use super::paging::{PageTableEntry, MATTR_NORMAL, MATTR_DEVICE, ENTRIES_PER_TABLE, l1_index, l2_index, l3_index, BLOCK_SIZE_2MB};
+use super::KERNEL_VIRT_OFFSET; // Import KERNEL_VIRT_OFFSET
 use core::ptr;
+use alloc::vec::Vec; // For AddressSpaceBuilder
+
+/// AddressSpaceBuilder is a helper struct to manage allocated frames during
+/// the cloning of an AddressSpace. Its Drop implementation ensures that
+/// any partially allocated resources are freed if the build process fails.
+struct AddressSpaceBuilder {
+    ttbr0: Option<PhysAddr>,
+    l2_tables: Vec<PhysAddr>,
+    l3_tables: Vec<PhysAddr>,
+    data_pages: Vec<PhysAddr>, // For copied user data pages
+}
+
+impl AddressSpaceBuilder {
+    fn new() -> Self {
+        Self {
+            ttbr0: None,
+            l2_tables: Vec::new(),
+            l3_tables: Vec::new(),
+            data_pages: Vec::new(),
+        }
+    }
+
+    /// Convert the builder into a complete AddressSpace, consuming itself.
+    fn build(self, l2_arr: [Option<PhysAddr>; MAX_L1_ENTRIES], l3_arr: [Option<PhysAddr>; L3_TABLES_COUNT]) -> AddressSpace {
+        let ttbr0 = self.ttbr0.expect("TTBR0 should be set for a successful build");
+        // Don't free resources when dropped, as ownership is transferred
+        core::mem::forget(self); 
+        AddressSpace {
+            ttbr0,
+            l2_tables: l2_arr,
+            l3_tables: l3_arr,
+        }
+    }
+}
+
+impl Drop for AddressSpaceBuilder {
+    fn drop(&mut self) {
+        if let Some(ttbr0_frame) = self.ttbr0 {
+            free_frame(ttbr0_frame);
+        }
+        for frame in self.l2_tables.iter() {
+            free_frame(*frame);
+        }
+        for frame in self.l3_tables.iter() {
+            free_frame(*frame);
+        }
+        for frame in self.data_pages.iter() {
+            free_frame(*frame);
+        }
+    }
+}
 
 /// Page flags for mapping
 #[derive(Clone, Copy)]
@@ -235,6 +287,16 @@ impl AddressSpace {
         self.ttbr0
     }
 
+    /// Get a reference to the array of L2 table physical addresses.
+    pub fn get_l2_tables(&self) -> &[Option<PhysAddr>; MAX_L1_ENTRIES] {
+        &self.l2_tables
+    }
+
+    /// Get a reference to the array of L3 table physical addresses.
+    pub fn get_l3_tables(&self) -> &[Option<PhysAddr>; L3_TABLES_COUNT] {
+        &self.l3_tables
+    }
+
     /// Map a 2MB block at the given virtual address
     ///
     /// # Safety
@@ -383,6 +445,167 @@ impl AddressSpace {
             ptr::write_volatile(l3_ptr.add(l3_idx), 0); // Invalid entry
         }
     }
+
+    /// Creates a new AddressSpace by duplicating an existing one for a fork operation.
+    ///
+    /// This performs a deep copy of user-space mappings and their underlying
+    /// physical memory, but shares kernel mappings.
+    ///
+    /// # Safety
+    /// - Requires proper memory management (alloc_frame, free_frame).
+    /// - Assumes the kernel mappings (0xC000_0000 and above) are shared.
+    pub unsafe fn clone_for_fork(parent_as: &AddressSpace) -> Option<Self> {
+        let mut builder = AddressSpaceBuilder::new();
+        let mut child_l2_tables_arr: [Option<PhysAddr>; MAX_L1_ENTRIES] = [None; MAX_L1_ENTRIES];
+        let mut child_l3_tables_arr: [Option<PhysAddr>; L3_TABLES_COUNT] = [None; L3_TABLES_COUNT];
+
+        // 1. Allocate new L1 table for the child
+        let child_l1_frame = alloc_frame()?;
+        builder.ttbr0 = Some(child_l1_frame); // Track L1 table in builder
+        let child_l1_ptr = (child_l1_frame.0) as *mut PageTableEntry;
+        
+        // Zero out the new L1 table
+        for i in 0..ENTRIES_PER_TABLE {
+            ptr::write_volatile(child_l1_ptr.add(i), PageTableEntry::invalid());
+        }
+
+        // Get parent's L1 table
+        let parent_l1_ptr = (parent_as.ttbr0.0) as *const PageTableEntry;
+
+        // --- Re-create initial device and RAM mappings for L1[0] and L1[1] ---
+        const GIC_BASE: u64 = 0x0800_0000;
+        const UART_BASE: u64 = 0x0900_0000;
+        const RAM_START: u64 = 0x4000_0000;
+
+        // For L1[0]: Create new L2 table with device mappings (GIC, UART)
+        let child_l2_0_frame = alloc_frame()?;
+        builder.l2_tables.push(child_l2_0_frame); // Track L2 table in builder
+        let child_l2_0_ptr = (child_l2_0_frame.0) as *mut PageTableEntry;
+        for i in 0..ENTRIES_PER_TABLE {
+            ptr::write_volatile(child_l2_0_ptr.add(i), PageTableEntry::invalid());
+        }
+        
+        let gic_l2_idx = l2_index(GIC_BASE as usize);
+        let gic_entry = PageTableEntry::block_2mb_device(GIC_BASE);
+        ptr::write_volatile(child_l2_0_ptr.add(gic_l2_idx), gic_entry);
+
+        let uart_l2_idx = l2_index(UART_BASE as usize);
+        let uart_entry = PageTableEntry::block_2mb_device(UART_BASE);
+        ptr::write_volatile(child_l2_0_ptr.add(uart_l2_idx), uart_entry);
+
+        let l1_0_entry = PageTableEntry::table(child_l2_0_frame.0 as u64);
+        ptr::write_volatile(child_l1_ptr.add(0), l1_0_entry);
+        child_l2_tables_arr[0] = Some(child_l2_0_frame);
+
+        // For L1[1]: Create a fresh L2 RAM table with identity mapping
+        let child_l2_1_frame = alloc_frame()?;
+        builder.l2_tables.push(child_l2_1_frame); // Track L2 table in builder
+        let child_l2_1_ptr = (child_l2_1_frame.0) as *mut PageTableEntry;
+        for i in 0..ENTRIES_PER_TABLE {
+            ptr::write_volatile(child_l2_1_ptr.add(i), PageTableEntry::invalid());
+        }
+
+        for i in 0..512 {
+            let paddr = RAM_START + (i as u64 * BLOCK_SIZE_2MB as u64);
+            let entry = PageTableEntry::block_2mb_normal(paddr);
+            ptr::write_volatile(child_l2_1_ptr.add(i), entry);
+        }
+        let l1_1_entry = PageTableEntry::table(child_l2_1_frame.0 as u64);
+        ptr::write_volatile(child_l1_ptr.add(1), l1_1_entry);
+        child_l2_tables_arr[1] = Some(child_l2_1_frame);
+        // --- End of re-creation ---
+
+
+        // Now, deep copy user space mappings in L1[0] only (0x00000000 - 0x40000000)
+        // L1[1] (RAM identity mapping) is shared and was already set up above
+        // We only need to copy the user data blocks in L1[0]
+        for l1_idx in 0..1 {  // Only L1[0] contains user-specific data
+            let parent_l1_entry = ptr::read_volatile(parent_l1_ptr.add(l1_idx));
+
+            if parent_l1_entry.is_valid() && parent_l1_entry.is_table() { // Parent has an L2 table
+                let parent_l2_frame = parent_as.l2_tables[l1_idx].unwrap(); // Assume it's tracked
+                let parent_l2_ptr = (parent_l2_frame.0) as *const PageTableEntry;
+
+                let child_l2_frame = alloc_frame()?; // New L2 table for child
+                builder.l2_tables.push(child_l2_frame); // Track L2 table
+                let child_l2_ptr = (child_l2_frame.0) as *mut PageTableEntry;
+                for i in 0..ENTRIES_PER_TABLE {
+                    ptr::write_volatile(child_l2_ptr.add(i), PageTableEntry::invalid());
+                }
+                let child_l1_entry = PageTableEntry::table(child_l2_frame.0 as u64);
+                ptr::write_volatile(child_l1_ptr.add(l1_idx), child_l1_entry);
+                child_l2_tables_arr[l1_idx] = Some(child_l2_frame);
+
+
+                for l2_idx in 0..ENTRIES_PER_TABLE {
+                    let parent_l2_entry = ptr::read_volatile(parent_l2_ptr.add(l2_idx));
+
+                    if parent_l2_entry.is_valid() {
+                        if parent_l2_entry.is_table() { // Parent has an L3 table
+                            let parent_l3_frame = parent_as.l3_tables[AddressSpace::l3_table_index(l1_idx, l2_idx)].unwrap(); // Assume tracked
+                            let parent_l3_ptr = (parent_l3_frame.0) as *const PageTableEntry;
+
+                            let child_l3_frame = alloc_frame()?; // New L3 table for child
+                            builder.l3_tables.push(child_l3_frame); // Track L3 table
+                            let child_l3_ptr = (child_l3_frame.0) as *mut PageTableEntry;
+                            for i in 0..ENTRIES_PER_TABLE {
+                                ptr::write_volatile(child_l3_ptr.add(i), PageTableEntry::invalid());
+                            }
+                            let child_l2_entry = PageTableEntry::table(child_l3_frame.0 as u64);
+                            ptr::write_volatile(child_l2_ptr.add(l2_idx), child_l2_entry);
+                            child_l3_tables_arr[AddressSpace::l3_table_index(l1_idx, l2_idx)] = Some(child_l3_frame);
+
+                            for l3_idx in 0..ENTRIES_PER_TABLE {
+                                let parent_l3_entry = ptr::read_volatile(parent_l3_ptr.add(l3_idx));
+
+                                if parent_l3_entry.is_valid() && parent_l3_entry.is_page() {
+                                    // It's a 4KB page, deep copy its content
+                                    let parent_paddr = PhysAddr(parent_l3_entry.table_addr() as usize);
+                                    let child_paddr = alloc_frame()?; // New physical page for child
+                                    builder.data_pages.push(child_paddr); // Track data page
+
+                                    // Copy content
+                                    let parent_kvaddr = (parent_paddr.0) as *const u8;
+                                    let child_kvaddr = (child_paddr.0) as *mut u8;
+                                    ptr::copy_nonoverlapping(parent_kvaddr, child_kvaddr, PAGE_SIZE);
+
+                                    // Create new L3 entry for child with reconstructed flags
+                                    let child_l3_entry = make_page_entry(child_paddr.0 as u64, parent_l3_entry.page_flags());
+                                    ptr::write_volatile(child_l3_ptr.add(l3_idx), PageTableEntry(child_l3_entry));
+                                }
+                            }
+                        } else if parent_l2_entry.is_block() { // Parent has a 2MB block mapping
+                            let parent_paddr_2mb = PhysAddr(parent_l2_entry.table_addr() as usize);
+
+                            // Skip device memory regions (below RAM_START).
+                            // Device mappings are already set up earlier and shouldn't be copied.
+                            if parent_paddr_2mb.0 < RAM_START as usize {
+                                // Just copy the entry as-is for device memory (shared mapping)
+                                ptr::write_volatile(child_l2_ptr.add(l2_idx), parent_l2_entry);
+                                continue;
+                            }
+
+                            // Allocate contiguous frames for a 2MB block for the child
+                            let child_paddr_2mb = super::frame::alloc_frames_in_2mb_block(BLOCK_SIZE_2MB / PAGE_SIZE)?;
+                            builder.data_pages.push(child_paddr_2mb);
+
+                            // Copy content of the 2MB block
+                            let parent_kvaddr_2mb = (parent_paddr_2mb.0) as *const u8;
+                            let child_kvaddr_2mb = (child_paddr_2mb.0) as *mut u8;
+                            ptr::copy_nonoverlapping(parent_kvaddr_2mb, child_kvaddr_2mb, BLOCK_SIZE_2MB);
+
+                            // Create new L2 block entry for child with reconstructed flags
+                            let child_l2_entry = make_block_entry(child_paddr_2mb.0 as u64, parent_l2_entry.page_flags());
+                            ptr::write_volatile(child_l2_ptr.add(l2_idx), PageTableEntry(child_l2_entry));
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(builder.build(child_l2_tables_arr, child_l3_tables_arr))
+    }
+
 }
 
 impl Drop for AddressSpace {

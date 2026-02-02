@@ -454,11 +454,8 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 // Get physical address of SHM (kernel has identity mapping)
                 let shm_phys = shm::get_shm_phys_addr(shm_id);
                 if shm_phys != 0 {
-                    // We need to copy to the caller's address space, but we're
-                    // currently running in the server's context. Temporarily
-                    // switch to the caller's page table for the copy.
                     let caller_task = &TASKS[caller_id.0];
-                    let caller_ttbr0 = caller_task.page_table.0 as u64;
+                    let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
                     // Save current TTBR0 and switch to caller's page table
                     let saved_ttbr0: u64;
@@ -549,7 +546,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 // VFS returns stat info in reply.data
                 // data[0] = size, data[1] = mode, data[2] = inode
                 let caller_task = &TASKS[caller_id.0];
-                let caller_ttbr0 = caller_task.page_table.0 as u64;
+                let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
                 // Switch to caller's address space to write stat
                 let saved_ttbr0: u64;
@@ -594,7 +591,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 let shm_phys = shm::get_shm_phys_addr(shm_id);
                 if shm_phys != 0 {
                     let caller_task = &TASKS[caller_id.0];
-                    let caller_ttbr0 = caller_task.page_table.0 as u64;
+                    let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
                     let saved_ttbr0: u64;
                     core::arch::asm!(
@@ -632,7 +629,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 let shm_phys = shm::get_shm_phys_addr(shm_id);
                 if shm_phys != 0 {
                     let caller_task = &TASKS[caller_id.0];
-                    let caller_ttbr0 = caller_task.page_table.0 as u64;
+                    let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
                     let saved_ttbr0: u64;
                     core::arch::asm!(

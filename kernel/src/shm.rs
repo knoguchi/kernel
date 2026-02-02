@@ -12,6 +12,7 @@
 use crate::mm::frame::{alloc_frame, free_frame, PhysAddr, PAGE_SIZE};
 use crate::sched::{TaskId, current};
 use crate::sched::task::{TASKS, MAX_TASKS, TaskState};
+use crate::mm::{AddressSpace, PageFlags};
 use core::ptr;
 
 /// Maximum number of shared memory regions
@@ -216,22 +217,20 @@ pub fn sys_shmmap(shm_id: usize, vaddr_hint: usize) -> i64 {
             return SHM_ERR_INVALID;
         }
 
-        let page_table_addr = task.page_table.0;
-        if page_table_addr == 0 {
-            return SHM_ERR_INVALID;
-        }
+        let addr_space = match task.addr_space.as_mut() {
+            Some(aspace) => aspace,
+            None => return SHM_ERR_INVALID, // Task should have an address space
+        };
 
         // Map each frame as a 4KB page
-        // We need to directly manipulate the page tables since we can't easily
-        // get a mutable reference to the AddressSpace
         for i in 0..region.num_frames {
             if let Some(frame) = region.frames[i] {
                 let page_vaddr = vaddr + i * PAGE_SIZE;
-                if !map_4kb_direct(page_table_addr, page_vaddr, frame) {
+                if !addr_space.map_4kb(page_vaddr, frame, PageFlags::user_data()) {
                     // Unmap already mapped pages on failure
                     for j in 0..i {
                         let unmap_vaddr = vaddr + j * PAGE_SIZE;
-                        unmap_4kb_direct(page_table_addr, unmap_vaddr);
+                        addr_space.unmap_4kb(unmap_vaddr);
                     }
                     return SHM_ERR_NO_MEMORY;
                 }
@@ -276,15 +275,16 @@ pub fn sys_shmunmap(shm_id: usize) -> i64 {
         };
 
         // Get task's page table
-        let task = &TASKS[task_id.0];
-        let page_table_addr = task.page_table.0;
+        let task = &mut TASKS[task_id.0];
+        let addr_space = match task.addr_space.as_mut() {
+            Some(aspace) => aspace,
+            None => return SHM_ERR_INVALID, // Task should have an address space
+        };
 
-        if page_table_addr != 0 {
-            // Unmap each page
-            for i in 0..region.num_frames {
-                let page_vaddr = vaddr + i * PAGE_SIZE;
-                unmap_4kb_direct(page_table_addr, page_vaddr);
-            }
+        // Unmap each page
+        for i in 0..region.num_frames {
+            let page_vaddr = vaddr + i * PAGE_SIZE;
+            addr_space.unmap_4kb(page_vaddr);
         }
 
         // Clear mapping record
@@ -361,20 +361,20 @@ pub fn sys_shmmap_for_task(task_id: TaskId, shm_id: usize, vaddr_hint: usize) ->
             return SHM_ERR_INVALID;
         }
 
-        let page_table_addr = task.page_table.0;
-        if page_table_addr == 0 {
-            return SHM_ERR_INVALID;
-        }
+        let addr_space = match task.addr_space.as_mut() {
+            Some(aspace) => aspace,
+            None => return SHM_ERR_INVALID, // Task should have an address space
+        };
 
         // Map each frame
         for i in 0..region.num_frames {
             if let Some(frame) = region.frames[i] {
                 let page_vaddr = vaddr + i * PAGE_SIZE;
-                if !map_4kb_direct(page_table_addr, page_vaddr, frame) {
+                if !addr_space.map_4kb(page_vaddr, frame, PageFlags::user_data()) {
                     // Unmap on failure
                     for j in 0..i {
                         let unmap_vaddr = vaddr + j * PAGE_SIZE;
-                        unmap_4kb_direct(page_table_addr, unmap_vaddr);
+                        addr_space.unmap_4kb(unmap_vaddr);
                     }
                     return SHM_ERR_NO_MEMORY;
                 }
@@ -408,14 +408,15 @@ pub fn sys_shmunmap_for_task(task_id: TaskId, shm_id: usize) -> i64 {
         };
 
         // Get task's page table
-        let task = &TASKS[task_id.0];
-        let page_table_addr = task.page_table.0;
+        let task = &mut TASKS[task_id.0];
+        let addr_space = match task.addr_space.as_mut() {
+            Some(aspace) => aspace,
+            None => return SHM_ERR_INVALID, // Task should have an address space
+        };
 
-        if page_table_addr != 0 {
-            for i in 0..region.num_frames {
-                let page_vaddr = vaddr + i * PAGE_SIZE;
-                unmap_4kb_direct(page_table_addr, page_vaddr);
-            }
+        for i in 0..region.num_frames {
+            let page_vaddr = vaddr + i * PAGE_SIZE;
+            addr_space.unmap_4kb(page_vaddr);
         }
 
         region.mapped_vaddr[task_id.0] = None;
