@@ -446,6 +446,40 @@ impl AddressSpace {
         }
     }
 
+    /// Translate a virtual address to its physical address
+    ///
+    /// Returns None if the address is not mapped.
+    /// Only works for 4KB pages in the mmap region (assumes L3 table exists).
+    pub fn virt_to_phys(&self, vaddr: usize) -> Option<PhysAddr> {
+        let l1_idx = l1_index(vaddr);
+        let l2_idx = l2_index(vaddr);
+        let l3_idx = l3_index(vaddr);
+
+        if l1_idx >= MAX_L1_ENTRIES {
+            return None;
+        }
+
+        let l3_table_idx = Self::l3_table_index(l1_idx, l2_idx);
+        let l3_frame = self.l3_tables[l3_table_idx]?;
+
+        // Read the L3 entry
+        unsafe {
+            let l3_ptr = l3_frame.0 as *const u64;
+            let entry = ptr::read_volatile(l3_ptr.add(l3_idx));
+
+            // Check if entry is valid (bit 0 set)
+            if entry & 1 == 0 {
+                return None;
+            }
+
+            // Extract physical address (bits 47:12 contain the physical frame number)
+            let phys_addr = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+            // Add the page offset
+            let offset = vaddr & 0xFFF;
+            Some(PhysAddr(phys_addr + offset))
+        }
+    }
+
     /// Creates a new AddressSpace by duplicating an existing one for a fork operation.
     ///
     /// This performs a deep copy of user-space mappings and their underlying

@@ -50,11 +50,20 @@ pub struct MmapRegion {
     /// Bitmap of which pages are allocated (for demand paging)
     /// Each bit represents one 4KB page
     pub allocated_pages: Vec<bool>,
+    /// For file-backed mappings: VFS vnode handle (0 = anonymous)
+    pub file_vnode: u64,
+    /// For file-backed mappings: offset in file
+    pub file_offset: i64,
 }
 
 impl MmapRegion {
-    /// Create a new mmap region
+    /// Create a new anonymous mmap region
     pub fn new(vaddr: usize, len: usize, prot: u32, flags: u32) -> Self {
+        Self::new_with_file(vaddr, len, prot, flags, 0, 0)
+    }
+
+    /// Create a new mmap region (possibly file-backed)
+    pub fn new_with_file(vaddr: usize, len: usize, prot: u32, flags: u32, file_vnode: u64, file_offset: i64) -> Self {
         let num_pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
         let mut allocated_pages = Vec::with_capacity(num_pages);
         for _ in 0..num_pages {
@@ -66,7 +75,14 @@ impl MmapRegion {
             prot,
             flags,
             allocated_pages,
+            file_vnode,
+            file_offset,
         }
+    }
+
+    /// Check if this is a file-backed mapping
+    pub fn is_file_backed(&self) -> bool {
+        self.file_vnode != 0
     }
 
     /// Check if an address falls within this region

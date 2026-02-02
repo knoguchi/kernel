@@ -13,7 +13,7 @@ The kernel boots on QEMU virt and runs multiple user-space servers:
 - **Init process** - System tests and process spawning
 
 Tested features: IPC, shared memory, pipes, file operations, process spawn/execve,
-mmap/munmap, clock_gettime, signals.
+mmap/munmap (anonymous and file-backed), clock_gettime, signal delivery, writev/readv.
 
 ## Target
 
@@ -82,6 +82,16 @@ Read from pipe: Hello, pipe!
 [TEST] mmap: allocated at 0x0000000010000000 write/read OK munmap OK
 [TEST] signals: sigaction OK sigprocmask OK kill OK
 [TEST] fork/wait: forked pid=10 exit=42 OK
+
+=== Phase 2 musl Startup Tests ===
+[TEST] set_tid_address: OK tid=9
+[TEST] getrandom: OK got 16 bytes: f7d84b2b...
+[TEST] prlimit64: OK stack_cur=2048KB max=2048KB
+[TEST] writev: Hello, writev world!
+[TEST] writev: OK wrote 21 bytes
+[TEST] ioctl TIOCGWINSZ: OK 80x24
+[TEST] signal delivery: OK handler called
+[TEST] file mmap: got fd=3 mapped at 0x10001000 content OK (Hello) munmap OK
 === Tests Complete ===
 
 === Init complete ===
@@ -210,16 +220,23 @@ kenix/
 ### Memory Management
 - [x] Anonymous mmap/munmap with demand paging
 - [x] mprotect (stub)
-- [ ] File-backed mmap
+- [x] File-backed mmap (pre-faulted)
 - [ ] Copy-on-write (COW)
 - [ ] Swapping
 
 ### Signals
 - [x] Signal state tracking (mask, pending, handlers)
-- [x] sigaction/sigprocmask/kill syscalls (stubs)
+- [x] sigaction/sigprocmask/kill syscalls
 - [x] SIGCHLD on child exit
-- [ ] Signal delivery to user handlers
-- [ ] sigreturn syscall
+- [x] Signal delivery to user handlers
+- [x] sigreturn syscall
+
+### Phase 2 musl/BusyBox Support
+- [x] set_tid_address syscall
+- [x] getrandom syscall
+- [x] prlimit64 syscall
+- [x] writev/readv syscalls
+- [x] ioctl TIOCGWINSZ (terminal size)
 
 ### Time
 - [x] clock_gettime (CLOCK_MONOTONIC, CLOCK_REALTIME)

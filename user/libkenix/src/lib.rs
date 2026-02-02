@@ -110,6 +110,12 @@ pub mod syscall {
     pub const SYS_MMAP: u64 = 222;
     pub const SYS_MPROTECT: u64 = 226;
     pub const SYS_WAIT4: u64 = 260;
+    pub const SYS_READV: u64 = 65;
+    pub const SYS_WRITEV: u64 = 66;
+    pub const SYS_PRLIMIT64: u64 = 261;
+    pub const SYS_GETRANDOM: u64 = 278;
+    pub const SYS_SET_TID_ADDRESS: u64 = 96;
+    pub const SYS_IOCTL: u64 = 29;
 
     /// Exit the process
     pub fn exit(code: i32) -> ! {
@@ -837,6 +843,176 @@ pub mod syscall {
                 inout("x0") pid as i64 => ret,
                 in("x1") sig as i64,
                 in("x8") SYS_KILL,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Syscall number for sigreturn
+    pub const SYS_RT_SIGRETURN: u64 = 139;
+
+    /// Return from signal handler
+    ///
+    /// This restores the context that was saved before the signal handler was invoked.
+    /// Must be called at the end of signal handlers.
+    pub fn sigreturn() -> ! {
+        unsafe {
+            asm!(
+                "svc #0",
+                in("x8") SYS_RT_SIGRETURN,
+                options(noreturn, nostack)
+            );
+        }
+    }
+
+    // ========================================================================
+    // musl startup syscalls
+    // ========================================================================
+
+    /// Set TID address for thread exit notification
+    ///
+    /// Returns the current task ID.
+    pub fn set_tid_address(tidptr: *mut i32) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") tidptr => ret,
+                in("x8") SYS_SET_TID_ADDRESS,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Resource limit constants
+    pub const RLIMIT_STACK: i32 = 3;
+    pub const RLIMIT_NOFILE: i32 = 7;
+
+    /// Rlimit structure
+    #[repr(C)]
+    pub struct Rlimit {
+        pub rlim_cur: u64,
+        pub rlim_max: u64,
+    }
+
+    /// Get/set resource limits
+    ///
+    /// If pid is 0, operates on the current process.
+    pub fn prlimit64(
+        pid: i32,
+        resource: i32,
+        new_limit: Option<&Rlimit>,
+        old_limit: Option<&mut Rlimit>,
+    ) -> isize {
+        let ret: isize;
+        let new_ptr = new_limit.map(|l| l as *const Rlimit).unwrap_or(core::ptr::null());
+        let old_ptr = old_limit.map(|l| l as *mut Rlimit).unwrap_or(core::ptr::null_mut());
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") pid as i64 => ret,
+                in("x1") resource as i64,
+                in("x2") new_ptr,
+                in("x3") old_ptr,
+                in("x8") SYS_PRLIMIT64,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// getrandom flags
+    pub const GRND_NONBLOCK: u32 = 1;
+    pub const GRND_RANDOM: u32 = 2;
+
+    /// Fill buffer with random bytes
+    pub fn getrandom(buf: &mut [u8], flags: u32) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") buf.as_mut_ptr() => ret,
+                in("x1") buf.len(),
+                in("x2") flags as u64,
+                in("x8") SYS_GETRANDOM,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    // ========================================================================
+    // Vector I/O (writev/readv)
+    // ========================================================================
+
+    /// I/O vector for scatter/gather I/O
+    #[repr(C)]
+    pub struct Iovec {
+        pub iov_base: *const u8,
+        pub iov_len: usize,
+    }
+
+    /// Write from multiple buffers (gather write)
+    pub fn writev(fd: usize, iov: &[Iovec]) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") fd => ret,
+                in("x1") iov.as_ptr(),
+                in("x2") iov.len(),
+                in("x8") SYS_WRITEV,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Read into multiple buffers (scatter read)
+    pub fn readv(fd: usize, iov: &mut [Iovec]) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") fd => ret,
+                in("x1") iov.as_mut_ptr(),
+                in("x2") iov.len(),
+                in("x8") SYS_READV,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    // ========================================================================
+    // IOCTL
+    // ========================================================================
+
+    /// Terminal window size
+    #[repr(C)]
+    pub struct Winsize {
+        pub ws_row: u16,
+        pub ws_col: u16,
+        pub ws_xpixel: u16,
+        pub ws_ypixel: u16,
+    }
+
+    /// IOCTL request codes
+    pub const TIOCGWINSZ: u64 = 0x5413;
+    pub const TCGETS: u64 = 0x5401;
+
+    /// Perform ioctl on a file descriptor
+    pub fn ioctl(fd: usize, request: u64, arg: usize) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") fd => ret,
+                in("x1") request,
+                in("x2") arg,
+                in("x8") SYS_IOCTL,
                 options(nostack)
             );
         }

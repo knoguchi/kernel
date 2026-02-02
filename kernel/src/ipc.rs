@@ -796,6 +796,62 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 }
             }
         }
+        PendingSyscall::MmapFile { vaddr, len, vnode: _, shm_id } => {
+            // File-backed mmap: VFS_READ_SHM completed - copy data to mapped pages
+            let bytes_read = reply.tag as i64;
+
+            if bytes_read < 0 {
+                // Read failed - cleanup (pages already mapped, will be zero-filled)
+                shm::sys_shmunmap_for_task(caller_id, shm_id);
+                // Return error - caller should munmap the region
+                return PendingSyscallResult::Complete(bytes_read, None);
+            }
+
+            // Get SHM physical address (source of file data)
+            let shm_phys = shm::get_shm_phys_addr(shm_id);
+            if shm_phys != 0 && bytes_read > 0 {
+                let caller_task = &TASKS[caller_id.0];
+                let addr_space = match &caller_task.addr_space {
+                    Some(aspace) => aspace,
+                    None => {
+                        shm::sys_shmunmap_for_task(caller_id, shm_id);
+                        return PendingSyscallResult::Complete(-1, None);
+                    }
+                };
+
+                // Copy data from SHM to mapped region, page by page
+                // We use physical addresses to avoid permission issues (user pages may be read-only)
+                let copy_len = if (bytes_read as usize) < len { bytes_read as usize } else { len };
+                let mut copied = 0usize;
+
+                while copied < copy_len {
+                    let page_vaddr = vaddr + copied;
+                    let page_offset = page_vaddr & 0xFFF; // Offset within the page
+                    let bytes_this_page = core::cmp::min(
+                        crate::mm::frame::PAGE_SIZE - page_offset,
+                        copy_len - copied
+                    );
+
+                    // Get physical address of this page
+                    if let Some(phys_addr) = addr_space.virt_to_phys(page_vaddr) {
+                        // Copy using physical address (kernel has identity mapping)
+                        core::ptr::copy_nonoverlapping(
+                            (shm_phys + copied) as *const u8,
+                            phys_addr.0 as *mut u8,
+                            bytes_this_page,
+                        );
+                    }
+
+                    copied += bytes_this_page;
+                }
+            }
+
+            // Clean up SHM
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            // Return the virtual address of the mapped region
+            PendingSyscallResult::Complete(vaddr as i64, None)
+        }
     }
 }
 

@@ -248,6 +248,9 @@ extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
         // System call from userspace
         let syscall_num = ctx.svc_number();
         syscall::handle_syscall(ctx, syscall_num);
+
+        // Check for pending signals before returning to userspace
+        syscall::check_and_deliver_signals(ctx);
     } else if ctx.is_data_abort() {
         let fault_addr = ctx.far as usize;
 

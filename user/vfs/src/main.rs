@@ -289,8 +289,8 @@ impl Fat32OpenFile {
 // Open File Tracking
 // ============================================================================
 
-const MAX_CLIENTS: usize = 8;
-const MAX_OPEN_FILES: usize = 8;
+const MAX_CLIENTS: usize = 32;  // Support up to 32 concurrent clients
+const MAX_OPEN_FILES: usize = 32;
 
 /// File source type
 #[derive(Clone, Copy, PartialEq)]

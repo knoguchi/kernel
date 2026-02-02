@@ -215,6 +215,17 @@ pub enum PendingSyscall {
         /// SHM ID for file data transfer
         shm_id: usize,
     },
+    /// File-backed mmap: waiting for VFS to read file data into mmap region
+    MmapFile {
+        /// Virtual address of the mmap region
+        vaddr: usize,
+        /// Length of mapping
+        len: usize,
+        /// VFS vnode handle
+        vnode: u64,
+        /// SHM ID for file data transfer
+        shm_id: usize,
+    },
 }
 
 impl PendingSyscall {
@@ -399,6 +410,8 @@ pub struct Task {
     pub signal_pending: u64,
     /// Signal handlers (SIG_DFL=0, SIG_IGN=1, or handler address)
     pub signal_handlers: [u64; 32],
+    /// Pointer to write 0 on thread exit (for futex wakeup)
+    pub clear_child_tid: usize,
 }
 
 impl Task {
@@ -436,6 +449,7 @@ impl Task {
             signal_mask: 0,
             signal_pending: 0,
             signal_handlers: [0; 32],
+            clear_child_tid: 0,
         }
     }
 

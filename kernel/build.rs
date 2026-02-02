@@ -13,8 +13,19 @@ fn main() {
         ("src/user_code.s", "user_code.o"),
     ];
 
-    // user_code.s includes the user binary
-    println!("cargo:rerun-if-changed=../user/init.bin");
+    // user_code.s includes user ELF binaries - rebuild when they change
+    let user_elfs = [
+        "../user/console.elf",
+        "../user/init.elf",
+        "../user/vfs.elf",
+        "../user/blkdev.elf",
+        "../user/netdev.elf",
+        "../user/pipeserv.elf",
+        "../user/forktest.elf",
+    ];
+    for elf in &user_elfs {
+        println!("cargo:rerun-if-changed={}", elf);
+    }
 
     let mut object_files = Vec::new();
 

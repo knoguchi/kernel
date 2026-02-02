@@ -74,6 +74,8 @@ pub const SYS_PIPE: u16 = 59;    // Create pipe
 pub const SYS_GETDENTS64: u16 = 61;  // Get directory entries
 pub const SYS_READ: u16 = 63;    // Read from file descriptor
 pub const SYS_WRITE: u16 = 64;   // Write to file descriptor
+pub const SYS_READV: u16 = 65;   // Read into multiple buffers (scatter)
+pub const SYS_WRITEV: u16 = 66;  // Write from multiple buffers (gather)
 pub const SYS_FSTAT: u16 = 80;   // Get file status
 pub const SYS_EXIT: u16 = 93;    // Terminate process
 pub const SYS_WAIT4: u16 = 260;  // Wait for child process
@@ -95,6 +97,11 @@ pub const SYS_GETEGID: u16 = 177; // Get effective group ID (stub)
 pub const SYS_MUNMAP: u16 = 215;    // Unmap memory region
 pub const SYS_MMAP: u16 = 222;      // Map memory region
 pub const SYS_MPROTECT: u16 = 226;  // Change memory protection
+
+// musl startup syscalls
+pub const SYS_SET_TID_ADDRESS: u16 = 96;  // Set pointer for thread ID on exit
+pub const SYS_PRLIMIT64: u16 = 261;       // Get/set resource limits
+pub const SYS_GETRANDOM: u16 = 278;       // Get random bytes
 
 // Signal syscalls
 pub const SYS_KILL: u16 = 129;              // Send signal to process
@@ -239,6 +246,22 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             ctx.gpr[0] = sys_write(ctx, fd, buf, len) as u64;
         }
 
+        SYS_READV => {
+            // readv(fd, iov, iovcnt) - scatter read
+            let fd = ctx.gpr[0] as usize;
+            let iov = ctx.gpr[1] as usize;
+            let iovcnt = ctx.gpr[2] as usize;
+            ctx.gpr[0] = sys_readv(ctx, fd, iov, iovcnt) as u64;
+        }
+
+        SYS_WRITEV => {
+            // writev(fd, iov, iovcnt) - gather write
+            let fd = ctx.gpr[0] as usize;
+            let iov = ctx.gpr[1] as usize;
+            let iovcnt = ctx.gpr[2] as usize;
+            ctx.gpr[0] = sys_writev(ctx, fd, iov, iovcnt) as u64;
+        }
+
         SYS_CLOSE => {
             let fd = ctx.gpr[0] as usize;
             ctx.gpr[0] = sys_close(ctx, fd) as u64;
@@ -259,12 +282,14 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         }
 
         // SYS_OPENAT: x0=dirfd, x1=pathname, x2=flags, x3=mode → returns fd in x0
+        // Note: sys_open uses IPC and the actual return value is set by complete_pending_syscall
         SYS_OPENAT => {
             let _dirfd = ctx.gpr[0] as i32;  // AT_FDCWD = -100
             let pathname = ctx.gpr[1] as usize;
             let flags = ctx.gpr[2] as u32;
             let _mode = ctx.gpr[3] as u32;
-            ctx.gpr[0] = sys_open(ctx, pathname, flags) as u64;
+            sys_open(ctx, pathname, flags);
+            // Return value is set by complete_pending_syscall, don't overwrite it
         }
 
         // SYS_GETCWD: x0=buf, x1=size → returns buf address or error
@@ -370,8 +395,11 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             ctx.gpr[0] = 0;
         }
         SYS_IOCTL => {
-            // ioctl(fd, request, arg) - return 0 (success) for now
-            ctx.gpr[0] = 0;
+            // ioctl(fd, request, arg) - handle common terminal ioctls
+            let fd = ctx.gpr[0] as usize;
+            let request = ctx.gpr[1] as u64;
+            let arg = ctx.gpr[2] as usize;
+            ctx.gpr[0] = sys_ioctl(fd, request, arg) as u64;
         }
         SYS_FACCESSAT => {
             // faccessat(dirfd, pathname, mode, flags) - return 0 (file accessible)
@@ -398,7 +426,15 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             let flags = ctx.gpr[3] as u32;
             let fd = ctx.gpr[4] as i32;
             let offset = ctx.gpr[5] as i64;
-            ctx.gpr[0] = mmap::sys_mmap(addr, len, prot, flags, fd, offset) as u64;
+
+            // Check if this is anonymous or file-backed mmap
+            if (flags & mmap::MAP_ANONYMOUS) != 0 || fd == -1 {
+                // Anonymous mmap - handle synchronously
+                ctx.gpr[0] = mmap::sys_mmap(addr, len, prot, flags, fd, offset) as u64;
+            } else {
+                // File-backed mmap - requires IPC to VFS
+                sys_mmap_file(ctx, addr, len, prot, flags, fd, offset);
+            }
         }
         SYS_MUNMAP => {
             // munmap(addr, len)
@@ -434,8 +470,31 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             ctx.gpr[0] = sys_kill(pid, sig) as u64;
         }
         SYS_RT_SIGRETURN => {
-            // rt_sigreturn() - stub for now
-            ctx.gpr[0] = ESUCCESS as u64;
+            // rt_sigreturn() - restore context from signal frame
+            sys_rt_sigreturn(ctx);
+            // Note: sys_rt_sigreturn modifies ctx directly, no return value needed
+        }
+
+        // musl startup syscalls
+        SYS_SET_TID_ADDRESS => {
+            // set_tid_address(tidptr) - store pointer and return current TID
+            let _tidptr = ctx.gpr[0] as usize;
+            ctx.gpr[0] = sys_set_tid_address(_tidptr) as u64;
+        }
+        SYS_PRLIMIT64 => {
+            // prlimit64(pid, resource, new_limit, old_limit) - get/set resource limits
+            let pid = ctx.gpr[0] as i32;
+            let resource = ctx.gpr[1] as i32;
+            let new_limit = ctx.gpr[2] as usize;
+            let old_limit = ctx.gpr[3] as usize;
+            ctx.gpr[0] = sys_prlimit64(pid, resource, new_limit, old_limit) as u64;
+        }
+        SYS_GETRANDOM => {
+            // getrandom(buf, buflen, flags) - fill buffer with random bytes
+            let buf = ctx.gpr[0] as usize;
+            let buflen = ctx.gpr[1] as usize;
+            let flags = ctx.gpr[2] as u32;
+            ctx.gpr[0] = sys_getrandom(buf, buflen, flags) as u64;
         }
 
         _ => {
@@ -1214,6 +1273,193 @@ pub enum PendingVfsSyscall {
     Getdents { buf: usize, count: usize },
 }
 
+/// SYS_MMAP for file-backed mappings
+///
+/// Maps a file into memory. Pre-faults all pages and reads file content via VFS IPC.
+fn sys_mmap_file(ctx: &mut ExceptionContext, addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) {
+    use sched::task::FdKind;
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => {
+            ctx.gpr[0] = EINVAL as u64;
+            return;
+        }
+    };
+
+    // Validate length
+    if len == 0 {
+        ctx.gpr[0] = EINVAL as u64;
+        return;
+    }
+
+    // Must have either MAP_PRIVATE or MAP_SHARED
+    if (flags & (mmap::MAP_PRIVATE | mmap::MAP_SHARED)) == 0 {
+        ctx.gpr[0] = EINVAL as u64;
+        return;
+    }
+
+    // Validate fd and get vnode
+    let (vnode, fd_readable) = unsafe {
+        let task = &TASKS[current_id.0];
+        if fd < 0 || fd as usize >= sched::MAX_FDS {
+            ctx.gpr[0] = EBADF as u64;
+            return;
+        }
+        let fd_entry = task.fds[fd as usize];
+        if fd_entry.kind != FdKind::File {
+            ctx.gpr[0] = EBADF as u64;
+            return;
+        }
+        (fd_entry.handle, fd_entry.flags.readable)
+    };
+
+    // Must be readable for mmap
+    if !fd_readable {
+        ctx.gpr[0] = EBADF as u64;
+        return;
+    }
+
+    let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    // These will be set in the unsafe block and used for IPC
+    let final_vaddr: usize;
+    let final_shm_id: usize;
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // Determine the virtual address
+        let vaddr = if (flags & mmap::MAP_FIXED) != 0 {
+            let aligned_addr = addr & !(PAGE_SIZE - 1);
+            if aligned_addr < mmap::MMAP_BASE || aligned_addr + aligned_len > mmap::MMAP_END {
+                ctx.gpr[0] = EINVAL as u64;
+                return;
+            }
+            // Remove any existing mappings in this range
+            task.mmap_state.remove_region(aligned_addr, aligned_len);
+            aligned_addr
+        } else {
+            match task.mmap_state.find_free_region(aligned_len) {
+                Some(a) => a,
+                None => {
+                    ctx.gpr[0] = ENOMEM as u64;
+                    return;
+                }
+            }
+        };
+
+        // Check for maximum regions
+        if task.mmap_state.regions.len() >= mmap::MAX_MMAP_REGIONS {
+            ctx.gpr[0] = ENOMEM as u64;
+            return;
+        }
+
+        // Pre-allocate all physical pages and map them
+        let num_pages = aligned_len / PAGE_SIZE;
+        let addr_space = match &mut task.addr_space {
+            Some(aspace) => aspace,
+            None => {
+                ctx.gpr[0] = ENOMEM as u64;
+                return;
+            }
+        };
+
+        let page_flags = crate::mm::address_space::PageFlags {
+            mattr: 0, // Normal memory
+            writable: (prot & mmap::PROT_WRITE) != 0,
+            executable: (prot & mmap::PROT_EXEC) != 0,
+            user: true,
+        };
+
+        // Allocate and map all pages
+        for i in 0..num_pages {
+            let page_vaddr = vaddr + i * PAGE_SIZE;
+            let phys_frame = match alloc_frame() {
+                Some(f) => f,
+                None => {
+                    // Cleanup: unmap already allocated pages
+                    for j in 0..i {
+                        let prev_vaddr = vaddr + j * PAGE_SIZE;
+                        addr_space.unmap_4kb(prev_vaddr);
+                        // TODO: free the physical frame
+                    }
+                    ctx.gpr[0] = ENOMEM as u64;
+                    return;
+                }
+            };
+
+            // Zero the page
+            core::ptr::write_bytes(phys_frame.0 as *mut u8, 0, PAGE_SIZE);
+
+            // Map the page
+            if !addr_space.map_4kb(page_vaddr, phys_frame, page_flags) {
+                free_frame(phys_frame);
+                // Cleanup previous pages
+                for j in 0..i {
+                    let prev_vaddr = vaddr + j * PAGE_SIZE;
+                    addr_space.unmap_4kb(prev_vaddr);
+                }
+                ctx.gpr[0] = ENOMEM as u64;
+                return;
+            }
+        }
+
+        // TLB invalidate
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+
+        // Create mmap region with file info (all pages marked as allocated)
+        let mut region = mmap::MmapRegion::new_with_file(vaddr, aligned_len, prot, flags, vnode, offset);
+        for i in 0..num_pages {
+            region.mark_allocated(i);
+        }
+        task.mmap_state.add_region(region);
+
+        // Create SHM for reading file content
+        let shm_id = shm::sys_shmcreate(aligned_len);
+        if shm_id < 0 {
+            // Cleanup: unmap all pages
+            for i in 0..num_pages {
+                let page_vaddr = vaddr + i * PAGE_SIZE;
+                addr_space.unmap_4kb(page_vaddr);
+            }
+            task.mmap_state.remove_region(vaddr, aligned_len);
+            ctx.gpr[0] = ENOMEM as u64;
+            return;
+        }
+        let shm_id = shm_id as usize;
+
+        // Grant VFS access to the SHM
+        shm::sys_shmgrant(shm_id, VFS_TID.0);
+
+        // Set up pending syscall
+        task.pending_syscall = PendingSyscall::MmapFile {
+            vaddr,
+            len: aligned_len,
+            vnode,
+            shm_id,
+        };
+
+        // Save for use after unsafe block
+        final_vaddr = vaddr;
+        final_shm_id = shm_id;
+    }
+
+    // Send VFS_READ_SHM request
+    // data[0] = vnode, data[1] = shm_id, data[2] = file_offset, data[3] = max_len
+    let msg = Message::new(VFS_READ_SHM, [vnode, final_shm_id as u64, offset as u64, aligned_len as u64]);
+    ipc::sys_call(ctx, VFS_TID, msg);
+
+    // Note: The actual return value (vaddr) is set by complete_pending_syscall
+    let _ = final_vaddr; // Used to suppress unused warning - actual value set by IPC completion
+}
+
 /// SYS_OPENAT - Open a file
 ///
 /// Opens a file and returns a file descriptor.
@@ -1949,6 +2195,537 @@ pub fn signal_child_exit(parent_id: TaskId) {
                 let sigchld_bit = 1u64 << (SIGCHLD - 1);
                 parent.signal_pending |= sigchld_bit;
             }
+        }
+    }
+}
+
+// ============================================================================
+// Signal Delivery (P3)
+// ============================================================================
+
+/// Signal frame pushed onto user stack when delivering a signal
+///
+/// Layout matches Linux's rt_sigframe for AArch64 (simplified)
+#[repr(C)]
+pub struct SignalFrame {
+    /// Saved context (will be restored by sigreturn)
+    pub uc_mcontext: SavedContext,
+    /// Signal number
+    pub sig: u32,
+    /// Padding for alignment
+    pub _pad: u32,
+    /// Original signal mask (to restore after handler)
+    pub old_mask: u64,
+}
+
+/// Saved user context for signal frame
+#[repr(C)]
+pub struct SavedContext {
+    /// General purpose registers x0-x30
+    pub gpr: [u64; 31],
+    /// Stack pointer
+    pub sp: u64,
+    /// Program counter (return address after signal handler)
+    pub pc: u64,
+    /// Processor state
+    pub pstate: u64,
+}
+
+/// Check and deliver pending signals
+///
+/// Called before returning to user space. If a signal is pending and not masked,
+/// set up the signal frame and redirect execution to the handler.
+pub fn check_and_deliver_signals(ctx: &mut ExceptionContext) {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return,
+    };
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // Find first pending, unmasked signal
+        let deliverable = task.signal_pending & !task.signal_mask;
+        if deliverable == 0 {
+            return; // No signals to deliver
+        }
+
+        // Find the lowest numbered signal
+        let sig = deliverable.trailing_zeros() + 1;
+        if sig > 31 {
+            return;
+        }
+
+        let handler = task.signal_handlers[(sig - 1) as usize];
+
+        // Check if handler is SIG_IGN
+        if handler == SIG_IGN {
+            // Clear pending bit and return
+            task.signal_pending &= !(1u64 << (sig - 1));
+            return;
+        }
+
+        // Check if handler is SIG_DFL (default)
+        if handler == SIG_DFL {
+            // Default actions: most signals terminate the process
+            // SIGCHLD is ignored by default
+            if sig == SIGCHLD as u32 {
+                task.signal_pending &= !(1u64 << (sig - 1));
+                return;
+            }
+            // For other signals with SIG_DFL, just clear and return for now
+            // A real implementation would terminate/stop the process
+            task.signal_pending &= !(1u64 << (sig - 1));
+            return;
+        }
+
+        // Clear pending bit
+        task.signal_pending &= !(1u64 << (sig - 1));
+
+        // Set up signal frame on user stack
+        let frame_size = core::mem::size_of::<SignalFrame>();
+        let frame_addr = (ctx.sp as usize - frame_size) & !15; // 16-byte aligned
+
+        let frame = frame_addr as *mut SignalFrame;
+
+        // Save current context
+        (*frame).uc_mcontext.gpr.copy_from_slice(&ctx.gpr);
+        (*frame).uc_mcontext.sp = ctx.sp;
+        (*frame).uc_mcontext.pc = ctx.elr;
+        (*frame).uc_mcontext.pstate = ctx.spsr;
+        (*frame).sig = sig;
+        (*frame).old_mask = task.signal_mask;
+
+        // Block the signal during handler execution (SA_NODEFER not implemented)
+        task.signal_mask |= 1u64 << (sig - 1);
+
+        // Set up context to run the signal handler
+        ctx.sp = frame_addr as u64;
+        ctx.elr = handler;
+
+        // Handler arguments: x0 = signal number
+        ctx.gpr[0] = sig as u64;
+        // x1 = siginfo_t* (NULL for now)
+        ctx.gpr[1] = 0;
+        // x2 = ucontext_t* (pointer to signal frame)
+        ctx.gpr[2] = frame_addr as u64;
+
+        // Set up link register (x30) to point to sigreturn trampoline
+        // In a real implementation, the user would provide a restorer via sa_restorer
+        // For now, the handler must call sigreturn() explicitly
+        ctx.gpr[30] = 0; // No automatic return - handler must call sigreturn
+    }
+}
+
+/// SYS_RT_SIGRETURN - Restore context from signal frame
+///
+/// Called when the signal handler returns to restore the original context.
+fn sys_rt_sigreturn(ctx: &mut ExceptionContext) {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return,
+    };
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // The signal frame is at current SP
+        let frame = ctx.sp as *const SignalFrame;
+
+        // Restore context
+        ctx.gpr.copy_from_slice(&(*frame).uc_mcontext.gpr);
+        ctx.sp = (*frame).uc_mcontext.sp;
+        ctx.elr = (*frame).uc_mcontext.pc;
+        ctx.spsr = (*frame).uc_mcontext.pstate;
+
+        // Restore signal mask
+        task.signal_mask = (*frame).old_mask;
+    }
+}
+
+// ============================================================================
+// musl Startup System Calls (P1)
+// ============================================================================
+
+/// SYS_SET_TID_ADDRESS - Set pointer for thread exit TID write
+///
+/// musl calls this during startup. We store the pointer (for future use
+/// when the thread exits to clear it) and return the current task ID.
+fn sys_set_tid_address(tidptr: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    // Store the tid address for use during exit
+    // (When the task exits, we should write 0 to this address and wake futex waiters)
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.clear_child_tid = tidptr;
+    }
+
+    // Return current task ID
+    current_id.0 as i64
+}
+
+/// Resource limit constants (Linux-compatible)
+pub const RLIMIT_STACK: i32 = 3;
+pub const RLIMIT_NOFILE: i32 = 7;
+
+/// Rlimit structure
+#[repr(C)]
+pub struct Rlimit {
+    pub rlim_cur: u64,  // Soft limit
+    pub rlim_max: u64,  // Hard limit
+}
+
+/// Special value meaning "unlimited"
+pub const RLIM_INFINITY: u64 = !0u64;
+
+/// SYS_PRLIMIT64 - Get/set resource limits
+///
+/// musl calls this to query stack size and other limits.
+/// We return sensible defaults for our microkernel.
+fn sys_prlimit64(pid: i32, resource: i32, new_limit: usize, old_limit: usize) -> i64 {
+    // For now, only allow querying own process (pid 0 or current pid)
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    if pid != 0 && pid != current_id.0 as i32 {
+        return ESRCH;  // Can't query other processes
+    }
+
+    // Return current limits if old_limit is provided
+    if old_limit != 0 {
+        let rlim = old_limit as *mut Rlimit;
+        unsafe {
+            match resource {
+                RLIMIT_STACK => {
+                    // Stack limit: 2MB soft, 2MB hard
+                    (*rlim).rlim_cur = 2 * 1024 * 1024;
+                    (*rlim).rlim_max = 2 * 1024 * 1024;
+                }
+                RLIMIT_NOFILE => {
+                    // File descriptor limit: MAX_FDS
+                    (*rlim).rlim_cur = sched::MAX_FDS as u64;
+                    (*rlim).rlim_max = sched::MAX_FDS as u64;
+                }
+                _ => {
+                    // Unknown resource: return infinity (no limit)
+                    (*rlim).rlim_cur = RLIM_INFINITY;
+                    (*rlim).rlim_max = RLIM_INFINITY;
+                }
+            }
+        }
+    }
+
+    // We ignore new_limit for now (don't actually change limits)
+    let _ = new_limit;
+
+    ESUCCESS
+}
+
+/// SYS_GETRANDOM - Fill buffer with random bytes
+///
+/// We use the ARM physical counter as a source of entropy.
+/// This is not cryptographically secure but sufficient for musl startup.
+fn sys_getrandom(buf: usize, buflen: usize, _flags: u32) -> i64 {
+    if buf == 0 || buflen == 0 {
+        return 0;
+    }
+
+    // Limit to reasonable size
+    let len = buflen.min(4096);
+
+    // Use timer counter as pseudo-random source
+    // XORshift algorithm seeded with counter
+    let mut state = timer::read_counter();
+    if state == 0 {
+        state = 0xdeadbeef_cafebabe;  // Fallback seed
+    }
+
+    unsafe {
+        let ptr = buf as *mut u8;
+        for i in 0..len {
+            // Simple xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            core::ptr::write_volatile(ptr.add(i), state as u8);
+        }
+    }
+
+    len as i64
+}
+
+// ============================================================================
+// Vector I/O System Calls (P2)
+// ============================================================================
+
+/// I/O vector structure for readv/writev
+#[repr(C)]
+pub struct Iovec {
+    pub iov_base: usize,  // Pointer to buffer
+    pub iov_len: usize,   // Length of buffer
+}
+
+/// Maximum number of iovec elements
+const IOV_MAX: usize = 1024;
+
+/// SYS_WRITEV - Write from multiple buffers (gather write)
+///
+/// For console writes, we iterate through the iovec array and write each buffer.
+fn sys_writev(ctx: &mut ExceptionContext, fd: usize, iov: usize, iovcnt: usize) -> i64 {
+    // Validate iovcnt
+    if iovcnt == 0 {
+        return 0;
+    }
+    if iovcnt > IOV_MAX {
+        return EINVAL;
+    }
+
+    // Get current task's fd table
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EBADF,
+    };
+
+    let fd_entry = unsafe {
+        let task = &TASKS[current_id.0];
+        if fd >= sched::MAX_FDS {
+            return EBADF;
+        }
+        task.fds[fd]
+    };
+
+    // Check if fd is valid and writable
+    if fd_entry.kind == FdKind::None {
+        return EBADF;
+    }
+    if !fd_entry.flags.writable {
+        return EBADF;
+    }
+
+    // For console, iterate through iovecs and write each
+    if fd_entry.kind == FdKind::Console {
+        let mut total: i64 = 0;
+
+        const UART_BASE: usize = 0x0900_0000;
+        const UART_DR: usize = 0x000;
+        const UART_FR: usize = 0x018;
+        const UART_FR_TXFF: u32 = 1 << 5;
+
+        unsafe {
+            let iovecs = iov as *const Iovec;
+            for i in 0..iovcnt {
+                let iov_entry = &*iovecs.add(i);
+                let buf = iov_entry.iov_base;
+                let len = iov_entry.iov_len.min(4096);
+
+                for j in 0..len {
+                    let c = core::ptr::read_volatile((buf + j) as *const u8);
+                    let fr = (UART_BASE + UART_FR) as *const u32;
+                    while (core::ptr::read_volatile(fr) & UART_FR_TXFF) != 0 {
+                        core::hint::spin_loop();
+                    }
+                    let dr = (UART_BASE + UART_DR) as *mut u8;
+                    core::ptr::write_volatile(dr, c);
+                }
+                total += len as i64;
+            }
+        }
+
+        return total;
+    }
+
+    // For other fd types, fall back to iterating and calling sys_write
+    let mut total: i64 = 0;
+    unsafe {
+        let iovecs = iov as *const Iovec;
+        for i in 0..iovcnt {
+            let iov_entry = &*iovecs.add(i);
+            if iov_entry.iov_len > 0 {
+                let ret = sys_write(ctx, fd, iov_entry.iov_base, iov_entry.iov_len);
+                if ret < 0 {
+                    if total == 0 {
+                        return ret;  // Return error if nothing written yet
+                    }
+                    break;  // Return partial count on error
+                }
+                total += ret;
+            }
+        }
+    }
+
+    total
+}
+
+/// SYS_READV - Read into multiple buffers (scatter read)
+///
+/// Currently only implemented for console.
+fn sys_readv(ctx: &mut ExceptionContext, fd: usize, iov: usize, iovcnt: usize) -> i64 {
+    // Validate iovcnt
+    if iovcnt == 0 {
+        return 0;
+    }
+    if iovcnt > IOV_MAX {
+        return EINVAL;
+    }
+
+    // Get current task's fd table
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EBADF,
+    };
+
+    let fd_entry = unsafe {
+        let task = &TASKS[current_id.0];
+        if fd >= sched::MAX_FDS {
+            return EBADF;
+        }
+        task.fds[fd]
+    };
+
+    // Check if fd is valid and readable
+    if fd_entry.kind == FdKind::None {
+        return EBADF;
+    }
+    if !fd_entry.flags.readable {
+        return EBADF;
+    }
+
+    // For console and other types, iterate and call sys_read
+    let mut total: i64 = 0;
+    unsafe {
+        let iovecs = iov as *const Iovec;
+        for i in 0..iovcnt {
+            let iov_entry = &*iovecs.add(i);
+            if iov_entry.iov_len > 0 {
+                let ret = sys_read(ctx, fd, iov_entry.iov_base, iov_entry.iov_len);
+                if ret < 0 {
+                    if total == 0 {
+                        return ret;  // Return error if nothing read yet
+                    }
+                    break;  // Return partial count on error
+                }
+                if ret == 0 {
+                    break;  // EOF
+                }
+                total += ret;
+            }
+        }
+    }
+
+    total
+}
+
+// ============================================================================
+// Terminal IOCTL Support (P2)
+// ============================================================================
+
+/// IOCTL request codes (Linux AArch64)
+pub const TCGETS: u64 = 0x5401;          // Get terminal attributes
+pub const TCSETS: u64 = 0x5402;          // Set terminal attributes
+pub const TIOCGWINSZ: u64 = 0x5413;      // Get window size
+pub const TIOCSWINSZ: u64 = 0x5414;      // Set window size
+pub const TIOCGPGRP: u64 = 0x540F;       // Get foreground process group
+pub const TIOCSPGRP: u64 = 0x5410;       // Set foreground process group
+pub const TIOCSCTTY: u64 = 0x540E;       // Make controlling tty
+pub const TIOCNOTTY: u64 = 0x5422;       // Give up controlling tty
+
+/// Terminal window size structure
+#[repr(C)]
+pub struct Winsize {
+    pub ws_row: u16,    // Number of rows
+    pub ws_col: u16,    // Number of columns
+    pub ws_xpixel: u16, // Unused
+    pub ws_ypixel: u16, // Unused
+}
+
+/// Termios structure (simplified)
+#[repr(C)]
+pub struct Termios {
+    pub c_iflag: u32,   // Input mode flags
+    pub c_oflag: u32,   // Output mode flags
+    pub c_cflag: u32,   // Control mode flags
+    pub c_lflag: u32,   // Local mode flags
+    pub c_line: u8,     // Line discipline
+    pub c_cc: [u8; 19], // Control characters
+}
+
+/// SYS_IOCTL - I/O control
+///
+/// Handle common terminal ioctls for BusyBox compatibility.
+fn sys_ioctl(fd: usize, request: u64, arg: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EBADF,
+    };
+
+    let fd_entry = unsafe {
+        let task = &TASKS[current_id.0];
+        if fd >= sched::MAX_FDS {
+            return EBADF;
+        }
+        task.fds[fd]
+    };
+
+    if fd_entry.kind == FdKind::None {
+        return EBADF;
+    }
+
+    match request {
+        TIOCGWINSZ => {
+            // Return a reasonable default window size
+            if arg == 0 {
+                return EFAULT;
+            }
+            unsafe {
+                let ws = arg as *mut Winsize;
+                (*ws).ws_row = 24;      // Standard terminal height
+                (*ws).ws_col = 80;      // Standard terminal width
+                (*ws).ws_xpixel = 0;
+                (*ws).ws_ypixel = 0;
+            }
+            ESUCCESS
+        }
+        TCGETS => {
+            // Return reasonable default terminal attributes
+            if arg == 0 {
+                return EFAULT;
+            }
+            unsafe {
+                let termios = arg as *mut Termios;
+                // Set reasonable defaults (echo, canonical mode)
+                (*termios).c_iflag = 0;
+                (*termios).c_oflag = 0;
+                (*termios).c_cflag = 0;
+                (*termios).c_lflag = 0;
+                (*termios).c_line = 0;
+                (*termios).c_cc = [0; 19];
+            }
+            ESUCCESS
+        }
+        TCSETS | TIOCSWINSZ | TIOCSPGRP | TIOCSCTTY | TIOCNOTTY => {
+            // Accept but ignore these settings
+            ESUCCESS
+        }
+        TIOCGPGRP => {
+            // Return current task ID as process group
+            if arg == 0 {
+                return EFAULT;
+            }
+            unsafe {
+                let pgrp = arg as *mut i32;
+                *pgrp = current_id.0 as i32;
+            }
+            ESUCCESS
+        }
+        _ => {
+            // Unknown ioctl - return success (many ioctls can be safely ignored)
+            ESUCCESS
         }
     }
 }
