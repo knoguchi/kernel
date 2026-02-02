@@ -723,6 +723,15 @@ fn handle_read(client: usize, handle: u64, len: u64, reply_data: &mut [u64; 4]) 
     }
 }
 
+/// File type and mode constants
+const S_IFMT: u32 = 0o170000;   // File type mask
+const S_IFDIR: u32 = 0o040000;  // Directory
+const S_IFREG: u32 = 0o100000;  // Regular file
+
+/// Device IDs
+const DEV_RAMFS: u64 = 1;
+const DEV_FAT32: u64 = 2;
+
 fn handle_stat(client: usize, msg_data: &[u64; 4], reply_data: &mut [u64; 4]) -> i64 {
     if client >= MAX_CLIENTS {
         return ERR_INVAL;
@@ -748,8 +757,19 @@ fn handle_stat(client: usize, msg_data: &[u64; 4], reply_data: &mut [u64; 4]) ->
             Err(e) => return e,
         };
 
+        // reply_data[0] = size
+        // reply_data[1] = mode (S_IFDIR/S_IFREG | permissions)
+        // reply_data[2] = device (2 for FAT32)
+        // reply_data[3] = inode (cluster number)
         reply_data[0] = entry.file_size as u64;
-        reply_data[1] = if entry.is_directory() { 1 } else { 0 };
+        let mode = if entry.is_directory() {
+            S_IFDIR | 0o755
+        } else {
+            S_IFREG | 0o644
+        };
+        reply_data[1] = mode as u64;
+        reply_data[2] = DEV_FAT32;
+        reply_data[3] = entry.first_cluster() as u64;
         return ERR_OK;
     }
 
@@ -764,14 +784,21 @@ fn handle_stat(client: usize, msg_data: &[u64; 4], reply_data: &mut [u64; 4]) ->
         None => return ERR_NOENT,
     };
 
-    let is_dir = match unsafe { &RAMFS.inodes[ino].data } {
-        InodeData::Dir(_) => 1u64,
-        _ => 0u64,
+    let (mode, is_dir) = match unsafe { &RAMFS.inodes[ino].data } {
+        InodeData::Dir(_) => (S_IFDIR | 0o755, true),
+        _ => (S_IFREG | 0o644, false),
     };
 
+    // reply_data[0] = size
+    // reply_data[1] = mode (S_IFDIR/S_IFREG | permissions)
+    // reply_data[2] = device (1 for ramfs)
+    // reply_data[3] = inode
     reply_data[0] = size as u64;
-    reply_data[1] = is_dir;
+    reply_data[1] = mode as u64;
+    reply_data[2] = DEV_RAMFS;
+    reply_data[3] = ino as u64;
 
+    let _ = is_dir; // Used implicitly in mode
     ERR_OK
 }
 

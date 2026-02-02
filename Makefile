@@ -18,11 +18,12 @@ boot:
 	cp target/aarch64-unknown-uefi/release/kenix-boot.efi esp/EFI/BOOT/BOOTAA64.EFI
 
 # Build all user-space programs (all Rust now)
-# Build hello first since init embeds it via include_bytes!
+# Build hello and forktest first since init embeds them via include_bytes!
 user:
 	cd user && cargo +nightly build --release --target aarch64-kenix-user.json -Zbuild-std=core -p libkenix -p hello -p forktest
 	mkdir -p user/init/data
 	cp user/target/aarch64-kenix-user/release/hello user/init/data/hello.elf
+	cp user/target/aarch64-kenix-user/release/forktest user/init/data/forktest.elf
 	cp user/target/aarch64-kenix-user/release/forktest user/forktest.elf
 	cd user && cargo +nightly build --release --target aarch64-kenix-user.json -Zbuild-std=core
 	cp user/target/aarch64-kenix-user/release/console user/console.elf

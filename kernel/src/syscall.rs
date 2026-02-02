@@ -19,6 +19,8 @@ use crate::sched::task::{FdFlags, find_free_slot};
 use crate::ipc;
 use crate::shm;
 use crate::irq;
+use crate::timer;
+use crate::mmap;
 use crate::mm::{PhysAddr, KERNEL_VIRT_OFFSET, BLOCK_SIZE_2MB};
 use crate::mm::frame::{alloc_frame, free_frame, PAGE_SIZE};
 use crate::mm::paging::{PageTable, l1_index};
@@ -82,15 +84,28 @@ pub const SYS_EXECVE: u16 = 221; // Execute program
 pub const SYS_FCNTL: u16 = 25;   // File control (stub)
 pub const SYS_IOCTL: u16 = 29;   // I/O control (stub)
 pub const SYS_FACCESSAT: u16 = 48;  // Check file access (stub)
+pub const SYS_CLOCK_GETTIME: u16 = 113;  // Get clock time
 pub const SYS_UNAME: u16 = 160;  // Get system name (stub)
 pub const SYS_GETUID: u16 = 174; // Get user ID (stub)
 pub const SYS_GETEUID: u16 = 175; // Get effective user ID (stub)
 pub const SYS_GETGID: u16 = 176; // Get group ID (stub)
 pub const SYS_GETEGID: u16 = 177; // Get effective group ID (stub)
 
+// Memory mapping syscalls
+pub const SYS_MUNMAP: u16 = 215;    // Unmap memory region
+pub const SYS_MMAP: u16 = 222;      // Map memory region
+pub const SYS_MPROTECT: u16 = 226;  // Change memory protection
+
+// Signal syscalls
+pub const SYS_KILL: u16 = 129;              // Send signal to process
+pub const SYS_RT_SIGACTION: u16 = 134;      // Set signal handler
+pub const SYS_RT_SIGPROCMASK: u16 = 135;    // Set signal mask
+pub const SYS_RT_SIGRETURN: u16 = 139;      // Return from signal handler
+
 /// Error codes (Linux-compatible)
 pub const ESUCCESS: i64 = 0;   // Success
 pub const ENOENT: i64 = -2;    // No such file or directory
+pub const ESRCH: i64 = -3;     // No such process
 pub const ECHILD: i64 = -10;   // No child processes
 pub const EAGAIN: i64 = -11;   // Resource temporarily unavailable
 pub const ENOMEM: i64 = -12;   // Out of memory
@@ -362,6 +377,11 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             // faccessat(dirfd, pathname, mode, flags) - return 0 (file accessible)
             ctx.gpr[0] = 0;
         }
+        SYS_CLOCK_GETTIME => {
+            let clock_id = ctx.gpr[0] as i32;
+            let tp = ctx.gpr[1] as usize;
+            ctx.gpr[0] = sys_clock_gettime(clock_id, tp) as u64;
+        }
         SYS_UNAME => {
             // uname(buf) - fill in basic system info
             ctx.gpr[0] = sys_uname(ctx.gpr[0] as *mut u8) as u64;
@@ -369,6 +389,53 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => {
             // Return 0 (root) for all user/group IDs
             ctx.gpr[0] = 0;
+        }
+        SYS_MMAP => {
+            // mmap(addr, len, prot, flags, fd, offset)
+            let addr = ctx.gpr[0] as usize;
+            let len = ctx.gpr[1] as usize;
+            let prot = ctx.gpr[2] as u32;
+            let flags = ctx.gpr[3] as u32;
+            let fd = ctx.gpr[4] as i32;
+            let offset = ctx.gpr[5] as i64;
+            ctx.gpr[0] = mmap::sys_mmap(addr, len, prot, flags, fd, offset) as u64;
+        }
+        SYS_MUNMAP => {
+            // munmap(addr, len)
+            let addr = ctx.gpr[0] as usize;
+            let len = ctx.gpr[1] as usize;
+            ctx.gpr[0] = mmap::sys_munmap(addr, len) as u64;
+        }
+        SYS_MPROTECT => {
+            // mprotect(addr, len, prot)
+            let addr = ctx.gpr[0] as usize;
+            let len = ctx.gpr[1] as usize;
+            let prot = ctx.gpr[2] as u32;
+            ctx.gpr[0] = mmap::sys_mprotect(addr, len, prot) as u64;
+        }
+        SYS_RT_SIGACTION => {
+            // rt_sigaction(sig, act, oldact, sigsetsize)
+            let sig = ctx.gpr[0] as i32;
+            let act = ctx.gpr[1] as usize;
+            let oldact = ctx.gpr[2] as usize;
+            ctx.gpr[0] = sys_rt_sigaction(sig, act, oldact) as u64;
+        }
+        SYS_RT_SIGPROCMASK => {
+            // rt_sigprocmask(how, set, oldset, sigsetsize)
+            let how = ctx.gpr[0] as i32;
+            let set = ctx.gpr[1] as usize;
+            let oldset = ctx.gpr[2] as usize;
+            ctx.gpr[0] = sys_rt_sigprocmask(how, set, oldset) as u64;
+        }
+        SYS_KILL => {
+            // kill(pid, sig)
+            let pid = ctx.gpr[0] as i32;
+            let sig = ctx.gpr[1] as i32;
+            ctx.gpr[0] = sys_kill(pid, sig) as u64;
+        }
+        SYS_RT_SIGRETURN => {
+            // rt_sigreturn() - stub for now
+            ctx.gpr[0] = ESUCCESS as u64;
         }
 
         _ => {
@@ -1301,6 +1368,36 @@ fn sys_chdir(path: usize) -> i64 {
     ESUCCESS
 }
 
+/// Timespec structure for clock_gettime
+#[repr(C)]
+pub struct Timespec {
+    pub tv_sec: i64,   // Seconds
+    pub tv_nsec: i64,  // Nanoseconds
+}
+
+/// Clock IDs
+pub const CLOCK_REALTIME: i32 = 0;
+pub const CLOCK_MONOTONIC: i32 = 1;
+pub const CLOCK_BOOTTIME: i32 = 7;
+
+/// SYS_CLOCK_GETTIME - Get clock time
+fn sys_clock_gettime(clock_id: i32, tp: usize) -> i64 {
+    // We support CLOCK_MONOTONIC and CLOCK_REALTIME (both return time since boot)
+    // In a real implementation, CLOCK_REALTIME would need RTC support
+    match clock_id {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME => {
+            let ns = timer::get_time_ns();
+            unsafe {
+                let timespec = tp as *mut Timespec;
+                (*timespec).tv_sec = (ns / 1_000_000_000) as i64;
+                (*timespec).tv_nsec = (ns % 1_000_000_000) as i64;
+            }
+            ESUCCESS
+        }
+        _ => EINVAL,
+    }
+}
+
 /// Linux stat structure (simplified for AArch64)
 #[repr(C)]
 pub struct Stat {
@@ -1346,13 +1443,27 @@ fn sys_fstat(ctx: &mut ExceptionContext, fd: usize, statbuf: usize) -> i64 {
         task.fds[fd]
     };
 
-    // For console fds, return a simple stat
+    // Get boot time for timestamps
+    let time_ns = timer::get_time_ns();
+    let time_sec = (time_ns / 1_000_000_000) as i64;
+    let time_nsec = (time_ns % 1_000_000_000) as i64;
+
+    // For console fds, return a complete stat for character device
     if fd_entry.kind == FdKind::Console {
         unsafe {
             let stat = statbuf as *mut Stat;
             (*stat) = core::mem::zeroed();
-            (*stat).st_mode = 0o020666; // Character device
+            (*stat).st_dev = 0; // Device 0 for special files
+            (*stat).st_ino = 1; // Console inode
+            (*stat).st_mode = 0o020666; // Character device (S_IFCHR | rw-rw-rw-)
+            (*stat).st_nlink = 1;
             (*stat).st_blksize = 4096;
+            (*stat).st_atime = time_sec;
+            (*stat).st_atime_nsec = time_nsec;
+            (*stat).st_mtime = time_sec;
+            (*stat).st_mtime_nsec = time_nsec;
+            (*stat).st_ctime = time_sec;
+            (*stat).st_ctime_nsec = time_nsec;
         }
         return ESUCCESS;
     }
@@ -1362,8 +1473,17 @@ fn sys_fstat(ctx: &mut ExceptionContext, fd: usize, statbuf: usize) -> i64 {
         unsafe {
             let stat = statbuf as *mut Stat;
             (*stat) = core::mem::zeroed();
-            (*stat).st_mode = 0o010666; // FIFO/pipe
+            (*stat).st_dev = 0; // Device 0 for special files
+            (*stat).st_ino = fd_entry.handle; // Pipe ID as inode
+            (*stat).st_mode = 0o010666; // FIFO/pipe (S_IFIFO | rw-rw-rw-)
+            (*stat).st_nlink = 1;
             (*stat).st_blksize = 4096;
+            (*stat).st_atime = time_sec;
+            (*stat).st_atime_nsec = time_nsec;
+            (*stat).st_mtime = time_sec;
+            (*stat).st_mtime_nsec = time_nsec;
+            (*stat).st_ctime = time_sec;
+            (*stat).st_ctime_nsec = time_nsec;
         }
         return ESUCCESS;
     }
@@ -1668,4 +1788,167 @@ fn sys_execve(ctx: &mut ExceptionContext, pathname: usize, _argv: usize, _envp: 
     ipc::sys_call(ctx, VFS_TID, msg);
 
     0 // Placeholder - actual return set by complete_pending_syscall (or replaced on success)
+}
+
+// ============================================================================
+// Signal System Calls (Stubs)
+// ============================================================================
+
+/// Signal numbers (Linux-compatible)
+pub const SIGCHLD: i32 = 17;
+
+/// Signal action flags
+pub const SIG_DFL: u64 = 0;
+pub const SIG_IGN: u64 = 1;
+
+/// sigprocmask "how" values
+pub const SIG_BLOCK: i32 = 0;
+pub const SIG_UNBLOCK: i32 = 1;
+pub const SIG_SETMASK: i32 = 2;
+
+/// Sigaction structure (simplified - actual Linux structure is larger)
+#[repr(C)]
+pub struct Sigaction {
+    pub sa_handler: u64,     // Handler function or SIG_DFL/SIG_IGN
+    pub sa_flags: u64,       // SA_* flags
+    pub sa_restorer: u64,    // Signal trampoline
+    pub sa_mask: u64,        // Additional signals to block during handler
+}
+
+/// SYS_RT_SIGACTION - Set signal handler (stub)
+///
+/// This stub accepts and stores handlers but doesn't actually deliver signals yet.
+fn sys_rt_sigaction(sig: i32, act: usize, oldact: usize) -> i64 {
+    // Validate signal number (1-31, excluding 9=SIGKILL and 19=SIGSTOP)
+    if sig < 1 || sig > 31 {
+        return EINVAL;
+    }
+    // SIGKILL and SIGSTOP cannot be caught
+    if sig == 9 || sig == 19 {
+        return EINVAL;
+    }
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // If oldact is not null, copy current handler to it
+        if oldact != 0 {
+            let old = oldact as *mut Sigaction;
+            (*old).sa_handler = task.signal_handlers[(sig - 1) as usize];
+            (*old).sa_flags = 0;
+            (*old).sa_restorer = 0;
+            (*old).sa_mask = 0;
+        }
+
+        // If act is not null, set new handler
+        if act != 0 {
+            let new = act as *const Sigaction;
+            task.signal_handlers[(sig - 1) as usize] = (*new).sa_handler;
+        }
+    }
+
+    ESUCCESS
+}
+
+/// SYS_RT_SIGPROCMASK - Set signal mask (stub)
+///
+/// This stub tracks the mask but doesn't actually affect signal delivery yet.
+fn sys_rt_sigprocmask(how: i32, set: usize, oldset: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // If oldset is not null, return current mask
+        if oldset != 0 {
+            let oldset_ptr = oldset as *mut u64;
+            *oldset_ptr = task.signal_mask;
+        }
+
+        // If set is not null, modify mask
+        if set != 0 {
+            let set_ptr = set as *const u64;
+            let new_set = *set_ptr;
+
+            match how {
+                SIG_BLOCK => {
+                    task.signal_mask |= new_set;
+                }
+                SIG_UNBLOCK => {
+                    task.signal_mask &= !new_set;
+                }
+                SIG_SETMASK => {
+                    task.signal_mask = new_set;
+                }
+                _ => return EINVAL,
+            }
+        }
+    }
+
+    ESUCCESS
+}
+
+/// SYS_KILL - Send signal to process (stub)
+///
+/// This stub sets the pending bit but doesn't actually deliver the signal yet.
+fn sys_kill(pid: i32, sig: i32) -> i64 {
+    // Validate signal number
+    if sig < 1 || sig > 31 {
+        return EINVAL;
+    }
+
+    let target_id = if pid > 0 {
+        TaskId(pid as usize)
+    } else if pid == 0 {
+        // Send to all processes in current process group - just current for now
+        match sched::current() {
+            Some(id) => id,
+            None => return EINVAL,
+        }
+    } else {
+        // Negative pid: send to process group - not supported yet
+        return EINVAL;
+    };
+
+    // Check if target task exists
+    if target_id.0 >= sched::task::MAX_TASKS {
+        return ESRCH;
+    }
+
+    unsafe {
+        let task = &mut TASKS[target_id.0];
+        if task.state == TaskState::Free || task.state == TaskState::Terminated {
+            return ESRCH;
+        }
+
+        // Set the signal pending bit
+        let sig_bit = 1u64 << (sig - 1);
+        task.signal_pending |= sig_bit;
+    }
+
+    ESUCCESS
+}
+
+/// Set SIGCHLD pending on parent when child exits
+///
+/// Called from the scheduler when a child task terminates.
+pub fn signal_child_exit(parent_id: TaskId) {
+    unsafe {
+        if parent_id.0 < sched::task::MAX_TASKS {
+            let parent = &mut TASKS[parent_id.0];
+            if parent.state != TaskState::Free && parent.state != TaskState::Terminated {
+                // Set SIGCHLD pending
+                let sigchld_bit = 1u64 << (SIGCHLD - 1);
+                parent.signal_pending |= sigchld_bit;
+            }
+        }
+    }
 }

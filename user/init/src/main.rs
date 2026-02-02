@@ -14,6 +14,9 @@ use libkenix::tasks;
 // Embed the hello program directly
 static HELLO_ELF: &[u8] = include_bytes!("../data/hello.elf");
 
+// Embed the forktest program for Phase 1 BusyBox support tests
+static FORKTEST_ELF: &[u8] = include_bytes!("../data/forktest.elf");
+
 // ============================================================================
 // Console Client (IPC-based printing)
 // ============================================================================
@@ -392,6 +395,46 @@ fn main() -> ! {
     // Wait a bit for child to run
     for _ in 0..100 {
         syscall::yield_cpu();
+    }
+
+    // ========================================
+    // Run Phase 1 BusyBox Support Tests
+    // ========================================
+    print("\n--- Phase 1 BusyBox Tests ---\n");
+
+    print("Embedded forktest.elf size: ");
+    print_num(FORKTEST_ELF.len());
+    print(" bytes\n");
+
+    // Verify ELF magic
+    if FORKTEST_ELF.len() < 4 || &FORKTEST_ELF[0..4] != [0x7f, b'E', b'L', b'F'] {
+        print("ERROR: Invalid ELF magic for forktest!\n");
+    } else {
+        print("Spawning forktest...\n");
+
+        let test_pid = syscall::spawn(FORKTEST_ELF);
+
+        if test_pid >= 0 {
+            print("forktest PID: ");
+            print_num(test_pid as usize);
+            print("\n");
+
+            // Wait for forktest to complete
+            let (wait_result, status) = syscall::waitpid(test_pid as i32, 0);
+            if wait_result >= 0 {
+                print("forktest exited with status=");
+                print_num(status as usize);
+                print("\n");
+            } else {
+                print("waitpid(forktest) failed: ");
+                print_num((-wait_result) as usize);
+                print("\n");
+            }
+        } else {
+            print("Failed to spawn forktest: ");
+            print_num((-test_pid) as usize);
+            print("\n");
+        }
     }
 
     print("\n=== Init complete ===\n");

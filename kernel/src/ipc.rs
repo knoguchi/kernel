@@ -14,6 +14,7 @@ use crate::sched::task::{
 use crate::sched::{self, current};
 use crate::exception::ExceptionContext;
 use crate::shm;
+use crate::timer;
 
 /// Result of completing a pending syscall
 enum PendingSyscallResult {
@@ -543,8 +544,11 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             let result = reply.tag as i64;
 
             if result == 0 {
-                // VFS returns stat info in reply.data
-                // data[0] = size, data[1] = mode, data[2] = inode
+                // VFS returns stat info in reply.data:
+                // data[0] = size
+                // data[1] = mode (S_IFREG/S_IFDIR | permissions)
+                // data[2] = device (1=ramfs, 2=FAT32)
+                // data[3] = inode
                 let caller_task = &TASKS[caller_id.0];
                 let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
@@ -558,20 +562,51 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                     in(reg) caller_ttbr0,
                 );
 
-                // Write minimal stat info
+                // Get time since boot for timestamps
+                let time_ns = timer::get_time_ns();
+                let time_sec = (time_ns / 1_000_000_000) as i64;
+                let time_nsec = (time_ns % 1_000_000_000) as i64;
+
+                let size = reply.data[0] as i64;
+                let mode = reply.data[1] as u32;
+                let device = reply.data[2];
+                let inode = reply.data[3];
+
+                // Write complete stat structure (128 bytes)
+                // Zero the whole structure first
                 let stat_ptr = statbuf as *mut u64;
-                // Zero the whole structure first (128 bytes for stat)
                 for i in 0..16 {
                     core::ptr::write_volatile(stat_ptr.add(i), 0);
                 }
+
+                // st_dev at offset 0
+                core::ptr::write_volatile(stat_ptr.add(0), device);
                 // st_ino at offset 8
-                core::ptr::write_volatile(stat_ptr.add(1), reply.data[2]);
-                // st_mode at offset 16 (u32)
-                core::ptr::write_volatile((statbuf + 16) as *mut u32, reply.data[1] as u32);
+                core::ptr::write_volatile(stat_ptr.add(1), inode);
+                // st_mode at offset 16 (u32), st_nlink at offset 20 (u32)
+                core::ptr::write_volatile((statbuf + 16) as *mut u32, mode);
+                core::ptr::write_volatile((statbuf + 20) as *mut u32, 1); // st_nlink = 1
+                // st_uid at offset 24 (u32), st_gid at offset 28 (u32) - already 0 (root)
+                // st_rdev at offset 32 - already 0
+                // __pad1 at offset 40 - already 0
                 // st_size at offset 48
-                core::ptr::write_volatile((statbuf + 48) as *mut i64, reply.data[0] as i64);
+                core::ptr::write_volatile((statbuf + 48) as *mut i64, size);
                 // st_blksize at offset 56
-                core::ptr::write_volatile((statbuf + 56) as *mut i32, 4096);
+                core::ptr::write_volatile((statbuf + 56) as *mut i32, 512);
+                // __pad2 at offset 60 - already 0
+                // st_blocks at offset 64 (blocks = (size + 511) / 512)
+                let blocks = (size + 511) / 512;
+                core::ptr::write_volatile((statbuf + 64) as *mut i64, blocks);
+                // st_atime at offset 72, st_atime_nsec at offset 80
+                core::ptr::write_volatile((statbuf + 72) as *mut i64, time_sec);
+                core::ptr::write_volatile((statbuf + 80) as *mut i64, time_nsec);
+                // st_mtime at offset 88, st_mtime_nsec at offset 96
+                core::ptr::write_volatile((statbuf + 88) as *mut i64, time_sec);
+                core::ptr::write_volatile((statbuf + 96) as *mut i64, time_nsec);
+                // st_ctime at offset 104, st_ctime_nsec at offset 112
+                core::ptr::write_volatile((statbuf + 104) as *mut i64, time_sec);
+                core::ptr::write_volatile((statbuf + 112) as *mut i64, time_nsec);
+                // __unused at offset 120 - already 0
 
                 // Restore page table
                 core::arch::asm!(

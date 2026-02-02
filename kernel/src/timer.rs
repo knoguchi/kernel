@@ -166,3 +166,29 @@ pub fn acknowledge_and_reset() {
         }
     }
 }
+
+/// Read the physical counter value (CNTPCT_EL0)
+#[inline]
+pub fn read_counter() -> u64 {
+    let cnt: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, cntpct_el0",
+            out(reg) cnt,
+            options(nostack, preserves_flags)
+        );
+    }
+    cnt
+}
+
+/// Get current time in nanoseconds since boot
+pub fn get_time_ns() -> u64 {
+    let freq = frequency();
+    if freq == 0 {
+        return 0;
+    }
+    let cnt = read_counter();
+    // Use 128-bit arithmetic to avoid overflow: (cnt * 1e9) / freq
+    let ns = (cnt as u128 * 1_000_000_000) / (freq as u128);
+    ns as u64
+}

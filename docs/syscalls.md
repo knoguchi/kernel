@@ -29,8 +29,9 @@ SVC #0
 | 93 | `SYS_EXIT` | :white_check_mark: | Terminate current task |
 | 20 | `SYS_GETPID` | :white_check_mark: | Get current task ID |
 | 21 | `SYS_SPAWN` | :white_check_mark: | Create new task from ELF |
-| 22 | `SYS_WAIT` | :construction: | Wait for child task to exit |
-| 23 | `SYS_KILL` | :construction: | Send signal to task |
+| 22 | `SYS_FORK` | :white_check_mark: | Create child process |
+| 129 | `SYS_KILL` | :white_check_mark: | Send signal to task (stub) |
+| 260 | `SYS_WAIT4` | :white_check_mark: | Wait for child task to exit |
 
 ### SYS_YIELD (0)
 ```
@@ -233,13 +234,13 @@ Destroy a shared memory region (must be owner, unmaps from all tasks).
 | 57 | `SYS_CLOSE` | :white_check_mark: | Close file descriptor |
 | 63 | `SYS_READ` | :white_check_mark: | Read from fd |
 | 64 | `SYS_WRITE` | :white_check_mark: | Write to fd |
-| 56 | `SYS_OPENAT` | :construction: | Open file (via VFS) |
-| 23 | `SYS_DUP` | :construction: | Duplicate fd |
-| 24 | `SYS_DUP2` | :construction: | Duplicate fd to specific number |
+| 56 | `SYS_OPENAT` | :white_check_mark: | Open file (via VFS) |
+| 23 | `SYS_DUP` | :white_check_mark: | Duplicate fd |
+| 24 | `SYS_DUP3` | :white_check_mark: | Duplicate fd to specific number |
 | 59 | `SYS_PIPE` | :white_check_mark: | Create pipe pair |
 | 62 | `SYS_LSEEK` | :construction: | Seek in file |
-| 79 | `SYS_FSTAT` | :construction: | Get file status |
-| 80 | `SYS_FSTATAT` | :construction: | Get file status (path) |
+| 80 | `SYS_FSTAT` | :white_check_mark: | Get file status |
+| 79 | `SYS_FSTATAT` | :construction: | Get file status (path) |
 
 ### SYS_READ (63)
 ```
@@ -315,36 +316,45 @@ Reposition read/write file offset.
 
 | # | Name | Status | Description |
 |---|------|--------|-------------|
-| 222 | `SYS_MMAP` | :construction: | Map memory |
-| 215 | `SYS_MUNMAP` | :construction: | Unmap memory |
-| 226 | `SYS_MPROTECT` | :construction: | Change memory protection |
-| 214 | `SYS_BRK` | :grey_question: | Change data segment size |
+| 222 | `SYS_MMAP` | :white_check_mark: | Map memory (anonymous only) |
+| 215 | `SYS_MUNMAP` | :white_check_mark: | Unmap memory |
+| 226 | `SYS_MPROTECT` | :white_check_mark: | Change memory protection (stub) |
+| 214 | `SYS_BRK` | :white_check_mark: | Change data segment size |
 
-### SYS_MMAP (222) :construction:
+### SYS_MMAP (222)
 ```
-Args:   x0 = addr_hint
+Args:   x0 = addr_hint (0 for auto, or use MAP_FIXED)
         x1 = length
         x2 = prot (PROT_READ|PROT_WRITE|PROT_EXEC)
-        x3 = flags (MAP_PRIVATE|MAP_ANONYMOUS|...)
-        x4 = fd (-1 for anonymous)
-        x5 = offset
+        x3 = flags (MAP_PRIVATE|MAP_ANONYMOUS required)
+        x4 = fd (must be -1 for anonymous)
+        x5 = offset (must be 0 for anonymous)
 Return: x0 = mapped_addr or error
 ```
-Map memory into the address space.
+Map anonymous memory into the address space. Allocates in the 0x10000000-0x30000000
+region using 4KB pages with demand paging. File-backed mmap not yet supported.
 
-### SYS_MUNMAP (215) :construction:
+### SYS_MUNMAP (215)
 ```
-Args:   x0 = addr, x1 = length
+Args:   x0 = addr (page-aligned)
+        x1 = length
 Return: x0 = 0 or error
 ```
 Unmap memory from the address space.
 
-### SYS_MPROTECT (226) :construction:
+### SYS_MPROTECT (226)
 ```
 Args:   x0 = addr, x1 = length, x2 = prot
-Return: x0 = 0 or error
+Return: x0 = 0 (stub - always succeeds)
 ```
-Change protection on a memory region.
+Change protection on a memory region. Currently a stub that returns success.
+
+### SYS_BRK (214)
+```
+Args:   x0 = new_brk (0 to query current)
+Return: x0 = current/new brk address
+```
+Change the program break (heap end). Used by malloc implementations.
 
 ---
 
@@ -352,17 +362,19 @@ Change protection on a memory region.
 
 | # | Name | Status | Description |
 |---|------|--------|-------------|
-| 113 | `SYS_CLOCK_GETTIME` | :construction: | Get current time |
+| 113 | `SYS_CLOCK_GETTIME` | :white_check_mark: | Get current time |
 | 115 | `SYS_NANOSLEEP` | :construction: | Sleep for duration |
 | 116 | `SYS_TIMER_CREATE` | :grey_question: | Create timer |
 
-### SYS_CLOCK_GETTIME (113) :construction:
+### SYS_CLOCK_GETTIME (113)
 ```
-Args:   x0 = clock_id (0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC)
-        x1 = timespec_ptr
+Args:   x0 = clock_id (0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC, 7 = CLOCK_BOOTTIME)
+        x1 = timespec_ptr (struct { i64 tv_sec; i64 tv_nsec; })
 Return: x0 = 0 or error
 ```
-Get current time from specified clock.
+Get current time from specified clock. Reads the ARM physical counter (CNTPCT_EL0)
+and converts to timespec using the counter frequency (CNTFRQ_EL0). All clock types
+currently return time since boot.
 
 ### SYS_NANOSLEEP (115) :construction:
 ```
@@ -370,6 +382,48 @@ Args:   x0 = req_timespec_ptr, x1 = rem_timespec_ptr
 Return: x0 = 0 or -EINTR (remaining time in rem)
 ```
 Sleep for specified duration.
+
+---
+
+## 6.5. Signals
+
+| # | Name | Status | Description |
+|---|------|--------|-------------|
+| 134 | `SYS_RT_SIGACTION` | :white_check_mark: | Set signal handler (stub) |
+| 135 | `SYS_RT_SIGPROCMASK` | :white_check_mark: | Set signal mask (stub) |
+| 129 | `SYS_KILL` | :white_check_mark: | Send signal (stub) |
+| 139 | `SYS_RT_SIGRETURN` | :white_check_mark: | Return from handler (stub) |
+
+### SYS_RT_SIGACTION (134)
+```
+Args:   x0 = signal number (1-31, not 9 or 19)
+        x1 = new_action_ptr (or NULL)
+        x2 = old_action_ptr (or NULL)
+        x3 = sigsetsize (8)
+Return: x0 = 0 or error
+```
+Set signal handler. Currently stores handlers but doesn't deliver signals.
+Sigaction structure: `{ u64 sa_handler, u64 sa_flags, u64 sa_restorer, u64 sa_mask }`.
+`sa_handler` can be SIG_DFL (0), SIG_IGN (1), or a handler address.
+
+### SYS_RT_SIGPROCMASK (135)
+```
+Args:   x0 = how (SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2)
+        x1 = new_set_ptr (or NULL)
+        x2 = old_set_ptr (or NULL)
+        x3 = sigsetsize (8)
+Return: x0 = 0 or error
+```
+Set signal mask. Currently tracks mask but doesn't affect delivery.
+
+### SYS_KILL (129)
+```
+Args:   x0 = pid (target process)
+        x1 = signal number
+Return: x0 = 0 or error
+```
+Send signal to process. Currently sets pending bit but doesn't deliver.
+SIGCHLD (17) is automatically set on parent when child exits.
 
 ---
 
@@ -452,6 +506,7 @@ Reserved for future capability-based security model.
 | 0 | `ESUCCESS` | Success |
 | -1 | `EPERM` | Operation not permitted |
 | -2 | `ENOENT` | No such file or directory |
+| -3 | `ESRCH` | No such process |
 | -5 | `EIO` | I/O error |
 | -9 | `EBADF` | Bad file descriptor |
 | -11 | `EAGAIN` | Resource temporarily unavailable |

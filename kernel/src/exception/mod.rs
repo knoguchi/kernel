@@ -12,6 +12,7 @@ use crate::timer;
 use crate::sched;
 use crate::syscall;
 use crate::irq;
+use crate::mmap;
 
 extern "C" {
     /// Exception vector table defined in vectors.s
@@ -248,6 +249,18 @@ extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
         let syscall_num = ctx.svc_number();
         syscall::handle_syscall(ctx, syscall_num);
     } else if ctx.is_data_abort() {
+        let fault_addr = ctx.far as usize;
+
+        // Check if this is a demand-paging fault for an mmap region
+        if fault_addr >= mmap::MMAP_BASE && fault_addr < mmap::MMAP_END {
+            let result = mmap::handle_page_fault(fault_addr);
+            if result == 0 {
+                // Page allocated successfully, resume execution
+                return;
+            }
+        }
+
+        // Not an mmap fault or allocation failed - fatal error
         exception_println!();
         exception_println!("USER DATA ABORT!");
         exception_println!("Faulting address: {:#018x}", ctx.far);

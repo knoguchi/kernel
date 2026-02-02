@@ -12,7 +12,8 @@ The kernel boots on QEMU virt and runs multiple user-space servers:
 - **Network device server** - VirtIO-net driver
 - **Init process** - System tests and process spawning
 
-Tested features: IPC, shared memory, pipes, file operations, process spawn/execve.
+Tested features: IPC, shared memory, pipes, file operations, process spawn/execve,
+mmap/munmap, clock_gettime, signals.
 
 ## Target
 
@@ -73,6 +74,16 @@ Read from pipe: Hello, pipe!
 --- Spawn Test ---
 [hello] I was spawned!
 [hello] My PID is: 9
+
+--- Phase 1 BusyBox Tests ---
+=== Phase 1 BusyBox Support Tests ===
+[TEST] clock_gettime: OK (1.619s)
+[TEST] fstat: OK mode=0o666 nlink=1 blksize=4096
+[TEST] mmap: allocated at 0x0000000010000000 write/read OK munmap OK
+[TEST] signals: sigaction OK sigprocmask OK kill OK
+[TEST] fork/wait: forked pid=10 exit=42 OK
+=== Tests Complete ===
+
 === Init complete ===
 ```
 
@@ -94,7 +105,8 @@ kenix/
 │       ├── timer.rs       # ARM timer driver
 │       ├── elf.rs         # ELF loader
 │       ├── irq.rs         # IRQ-to-task routing
-│       └── pipe.rs        # Kernel-level pipes
+│       ├── pipe.rs        # Kernel-level pipes
+│       └── mmap.rs        # Anonymous mmap with demand paging
 ├── user/               # User-space programs (all Rust)
 │   ├── libkenix/          # Shared runtime library
 │   │   ├── Cargo.toml
@@ -129,6 +141,9 @@ kenix/
 │   │   ├── Cargo.toml
 │   │   └── src/main.rs
 │   ├── hello/             # Test program for spawn
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs
+│   ├── forktest/          # Phase 1 BusyBox support tests
 │   │   ├── Cargo.toml
 │   │   └── src/main.rs
 │   ├── user.ld            # Shared linker script
@@ -193,9 +208,23 @@ kenix/
 - [x] wait/waitpid syscalls
 
 ### Memory Management
-- [ ] Demand paging
+- [x] Anonymous mmap/munmap with demand paging
+- [x] mprotect (stub)
+- [ ] File-backed mmap
 - [ ] Copy-on-write (COW)
 - [ ] Swapping
+
+### Signals
+- [x] Signal state tracking (mask, pending, handlers)
+- [x] sigaction/sigprocmask/kill syscalls (stubs)
+- [x] SIGCHLD on child exit
+- [ ] Signal delivery to user handlers
+- [ ] sigreturn syscall
+
+### Time
+- [x] clock_gettime (CLOCK_MONOTONIC, CLOCK_REALTIME)
+- [ ] nanosleep
+- [ ] timer_create/timer_settime
 
 ### Hardware Support
 - [x] VirtIO-blk driver (block device)

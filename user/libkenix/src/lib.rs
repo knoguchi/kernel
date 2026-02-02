@@ -100,8 +100,15 @@ pub mod syscall {
     pub const SYS_WRITE: u64 = 64;
     pub const SYS_FSTAT: u64 = 80;
     pub const SYS_EXIT: u64 = 93;
+    pub const SYS_CLOCK_GETTIME: u64 = 113;
+    pub const SYS_KILL: u64 = 129;
+    pub const SYS_RT_SIGACTION: u64 = 134;
+    pub const SYS_RT_SIGPROCMASK: u64 = 135;
     pub const SYS_BRK: u64 = 214;
+    pub const SYS_MUNMAP: u64 = 215;
     pub const SYS_EXECVE: u64 = 221;
+    pub const SYS_MMAP: u64 = 222;
+    pub const SYS_MPROTECT: u64 = 226;
     pub const SYS_WAIT4: u64 = 260;
 
     /// Exit the process
@@ -648,6 +655,188 @@ pub mod syscall {
                 in("x1") argv,
                 in("x2") envp,
                 in("x8") SYS_EXECVE,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    // ========================================================================
+    // New BusyBox support syscalls
+    // ========================================================================
+
+    /// Timespec structure for clock_gettime
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Timespec {
+        pub tv_sec: i64,
+        pub tv_nsec: i64,
+    }
+
+    /// Clock IDs
+    pub const CLOCK_REALTIME: i32 = 0;
+    pub const CLOCK_MONOTONIC: i32 = 1;
+
+    /// Get current time
+    pub fn clock_gettime(clock_id: i32, tp: &mut Timespec) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") clock_id as i64 => ret,
+                in("x1") tp as *mut Timespec,
+                in("x8") SYS_CLOCK_GETTIME,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// mmap protection flags
+    pub const PROT_NONE: u32 = 0x0;
+    pub const PROT_READ: u32 = 0x1;
+    pub const PROT_WRITE: u32 = 0x2;
+    pub const PROT_EXEC: u32 = 0x4;
+
+    /// mmap flags
+    pub const MAP_SHARED: u32 = 0x01;
+    pub const MAP_PRIVATE: u32 = 0x02;
+    pub const MAP_FIXED: u32 = 0x10;
+    pub const MAP_ANONYMOUS: u32 = 0x20;
+
+    /// mmap failure value
+    pub const MAP_FAILED: usize = usize::MAX;
+
+    /// Map memory region (anonymous only)
+    pub fn mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") addr => ret,
+                in("x1") len,
+                in("x2") prot as u64,
+                in("x3") flags as u64,
+                in("x4") fd as i64,
+                in("x5") offset,
+                in("x8") SYS_MMAP,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Unmap memory region
+    pub fn munmap(addr: usize, len: usize) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") addr => ret,
+                in("x1") len,
+                in("x8") SYS_MUNMAP,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Change memory protection
+    pub fn mprotect(addr: usize, len: usize, prot: u32) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") addr => ret,
+                in("x1") len,
+                in("x2") prot as u64,
+                in("x8") SYS_MPROTECT,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Signal numbers
+    pub const SIGCHLD: i32 = 17;
+
+    /// Signal handler values
+    pub const SIG_DFL: u64 = 0;
+    pub const SIG_IGN: u64 = 1;
+
+    /// Sigaction structure (simplified)
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Sigaction {
+        pub sa_handler: u64,
+        pub sa_flags: u64,
+        pub sa_restorer: u64,
+        pub sa_mask: u64,
+    }
+
+    impl Default for Sigaction {
+        fn default() -> Self {
+            Self {
+                sa_handler: SIG_DFL,
+                sa_flags: 0,
+                sa_restorer: 0,
+                sa_mask: 0,
+            }
+        }
+    }
+
+    /// Set signal handler
+    pub fn sigaction(sig: i32, act: Option<&Sigaction>, oldact: Option<&mut Sigaction>) -> isize {
+        let ret: isize;
+        let act_ptr = act.map(|a| a as *const Sigaction).unwrap_or(core::ptr::null());
+        let oldact_ptr = oldact.map(|a| a as *mut Sigaction).unwrap_or(core::ptr::null_mut());
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") sig as i64 => ret,
+                in("x1") act_ptr,
+                in("x2") oldact_ptr,
+                in("x3") 8u64,  // sigsetsize
+                in("x8") SYS_RT_SIGACTION,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// sigprocmask "how" values
+    pub const SIG_BLOCK: i32 = 0;
+    pub const SIG_UNBLOCK: i32 = 1;
+    pub const SIG_SETMASK: i32 = 2;
+
+    /// Set signal mask
+    pub fn sigprocmask(how: i32, set: Option<&u64>, oldset: Option<&mut u64>) -> isize {
+        let ret: isize;
+        let set_ptr = set.map(|s| s as *const u64).unwrap_or(core::ptr::null());
+        let oldset_ptr = oldset.map(|s| s as *mut u64).unwrap_or(core::ptr::null_mut());
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") how as i64 => ret,
+                in("x1") set_ptr,
+                in("x2") oldset_ptr,
+                in("x3") 8u64,  // sigsetsize
+                in("x8") SYS_RT_SIGPROCMASK,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Send signal to process
+    pub fn kill(pid: i32, sig: i32) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") pid as i64 => ret,
+                in("x1") sig as i64,
+                in("x8") SYS_KILL,
                 options(nostack)
             );
         }

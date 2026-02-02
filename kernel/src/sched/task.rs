@@ -9,6 +9,7 @@
 use crate::mm::PhysAddr;
 use crate::mm::frame::{alloc_frame, free_frame};
 use crate::mm::address_space::AddressSpace;
+use crate::mmap::MmapState;
 use alloc::vec::Vec;
 
 /// Maximum number of tasks in the system
@@ -390,6 +391,14 @@ pub struct Task {
     pub exit_code: i32,
     /// Tasks waiting for this task to exit (for waitpid)
     pub wait_queue: Option<TaskId>,
+    /// Memory-mapped regions state
+    pub mmap_state: MmapState,
+    /// Signal mask (blocked signals, bitmask)
+    pub signal_mask: u64,
+    /// Pending signals (bitmask)
+    pub signal_pending: u64,
+    /// Signal handlers (SIG_DFL=0, SIG_IGN=1, or handler address)
+    pub signal_handlers: [u64; 32],
 }
 
 impl Task {
@@ -423,6 +432,10 @@ impl Task {
             heap_brk: DEFAULT_HEAP_START,
             exit_code: 0,
             wait_queue: None,
+            mmap_state: MmapState::new(),
+            signal_mask: 0,
+            signal_pending: 0,
+            signal_handlers: [0; 32],
         }
     }
 

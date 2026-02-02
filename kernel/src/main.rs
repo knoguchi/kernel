@@ -20,6 +20,7 @@ mod ipc;
 mod shm;
 mod irq;
 mod allocator;
+mod mmap;
 
 // Memory intrinsics required by compiler
 #[no_mangle]

@@ -252,9 +252,13 @@ impl Scheduler {
                 task.exit_code = exit_code;
                 task.state = TaskState::Terminated;
 
-                // Wake up parent if it's waiting for us (WaitBlocked)
+                // Signal parent and wake if waiting (WaitBlocked)
                 if let Some(parent_id) = task.parent {
                     let parent = &mut TASKS[parent_id.0];
+                    // Set SIGCHLD pending on parent (signal 17, bit 16)
+                    const SIGCHLD_BIT: u64 = 1 << 16; // SIGCHLD = 17, bit = 17-1 = 16
+                    parent.signal_pending |= SIGCHLD_BIT;
+
                     if parent.state == TaskState::WaitBlocked {
                         parent.state = TaskState::Ready;
                         enqueue_task(parent_id);
