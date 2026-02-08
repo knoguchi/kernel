@@ -15,18 +15,15 @@
 
 use crate::exception::ExceptionContext;
 use crate::sched::{self, TaskId, Message, TaskState, FileDescriptor, PendingSyscall, KERNEL_STACK_SIZE};
-use crate::sched::task::{FdFlags, find_free_slot};
+use crate::sched::task::find_free_slot;
 use crate::ipc;
 use crate::shm;
 use crate::irq;
 use crate::timer;
 use crate::mmap;
-use crate::mm::{PhysAddr, KERNEL_VIRT_OFFSET, BLOCK_SIZE_2MB};
 use crate::mm::frame::{alloc_frame, free_frame, PAGE_SIZE};
-use crate::mm::paging::{PageTable, l1_index};
-use crate::mm::address_space::AddressSpace; // Add AddressSpace
+use crate::mm::AddressSpace;
 use core::ptr;
-use alloc::vec::Vec; // Add Vec for alloc_kernel_stack_frames
 use crate::println;
 
 /// Pipe server task ID
@@ -130,6 +127,10 @@ pub const SYS_SCHED_GETAFFINITY: u16 = 123; // Get CPU affinity mask
 pub const SYS_SETPGID: u16 = 154;           // Set process group ID
 pub const SYS_GETPGID: u16 = 155;           // Get process group ID
 
+// File transfer syscalls
+pub const SYS_SENDFILE: u16 = 71;           // Transfer data between file descriptors (stub)
+pub const SYS_FADVISE64: u16 = 223;         // File access pattern hint (stub)
+
 /// Error codes (Linux-compatible)
 pub const ESUCCESS: i64 = 0;   // Success
 pub const ENOENT: i64 = -2;    // No such file or directory
@@ -156,9 +157,6 @@ pub const ENAMETOOLONG: i64 = -36;  // File name too long
 pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
     // AArch64 Linux syscall convention: syscall number in x8
     let syscall_num = ctx.gpr[8] as u16;
-
-    let task_id = sched::current().map(|t| t.0).unwrap_or(999);
-    let _ = task_id; // Used for debugging
 
     match syscall_num {
         SYS_YIELD => {
@@ -632,6 +630,14 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         }
         SYS_SCHED_SETAFFINITY => {
             // sched_setaffinity(pid, cpusetsize, mask) - set CPU affinity (stub - return success)
+            ctx.gpr[0] = 0;
+        }
+        SYS_SENDFILE => {
+            // sendfile(out_fd, in_fd, offset, count) - return ENOSYS so cat falls back to read/write
+            ctx.gpr[0] = ENOSYS as u64;
+        }
+        SYS_FADVISE64 => {
+            // fadvise64(fd, offset, len, advice) - hint about file access patterns (stub - return success)
             ctx.gpr[0] = 0;
         }
 
@@ -2483,7 +2489,7 @@ fn sys_brk(addr: usize) -> i64 {
 
         // Don't allow shrinking below current heap start
         // (heap_brk is initialized to end of ELF segments)
-        let heap_start = task.heap_brk.min(addr);
+        let _heap_start = task.heap_brk.min(addr);
 
         // Allow brk up to 16MB (well below mmap region at 0x10000000)
         const BRK_LIMIT: usize = 0x0100_0000;
@@ -2613,6 +2619,56 @@ fn sys_execve(ctx: &mut ExceptionContext, pathname: usize, argv: usize, _envp: u
     if path_bytes.is_empty() {
         return ENOENT;
     }
+
+    // Resolve relative paths using cwd
+    let mut resolved_path = [0u8; 256];
+    let resolved_len: usize;
+
+    // Strip "./" prefix if present
+    let (effective_path, effective_len) = if path_bytes.len() >= 2 && path_bytes[0] == b'.' && path_bytes[1] == b'/' {
+        (&path_bytes[2..], path_bytes.len() - 2)
+    } else {
+        (path_bytes, path_bytes.len())
+    };
+
+    if effective_len > 0 && effective_path[0] == b'/' {
+        // Absolute path - use as-is
+        let copy_len = effective_len.min(255);
+        resolved_path[..copy_len].copy_from_slice(&effective_path[..copy_len]);
+        resolved_len = copy_len;
+    } else {
+        // Relative path - prepend cwd
+        let cwd_len = unsafe {
+            let task = &TASKS[current_id.0];
+            let mut len = 0;
+            while len < sched::MAX_PATH_LEN && len < 200 && task.cwd[len] != 0 {
+                resolved_path[len] = task.cwd[len];
+                len += 1;
+            }
+            len
+        };
+
+        if cwd_len == 0 || resolved_path[0] != b'/' {
+            // No cwd set, use root
+            resolved_path[0] = b'/';
+            let copy_len = effective_len.min(254);
+            resolved_path[1..1 + copy_len].copy_from_slice(&effective_path[..copy_len]);
+            resolved_len = 1 + copy_len;
+        } else {
+            // Append "/" if needed, then path
+            let mut pos = cwd_len;
+            if pos > 0 && resolved_path[pos - 1] != b'/' && pos < 255 {
+                resolved_path[pos] = b'/';
+                pos += 1;
+            }
+            let copy_len = effective_len.min(255 - pos);
+            resolved_path[pos..pos + copy_len].copy_from_slice(&effective_path[..copy_len]);
+            resolved_len = pos + copy_len;
+        }
+    }
+
+    // Use resolved path for the rest of the function
+    let path_bytes = &resolved_path[..resolved_len];
 
     // Read argv from user memory
     // argv is a pointer to an array of char* pointers, terminated by NULL

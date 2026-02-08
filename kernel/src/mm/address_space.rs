@@ -6,7 +6,6 @@
 
 use super::frame::{alloc_frame, free_frame, PhysAddr, PAGE_SIZE};
 use super::paging::{PageTableEntry, MATTR_NORMAL, MATTR_DEVICE, ENTRIES_PER_TABLE, l1_index, l2_index, l3_index, BLOCK_SIZE_2MB};
-use super::KERNEL_VIRT_OFFSET; // Import KERNEL_VIRT_OFFSET
 use core::ptr;
 use alloc::vec::Vec; // For AddressSpaceBuilder
 
@@ -673,12 +672,18 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        // Free data blocks (2MB blocks of user data)
+        // Free data blocks
+        // Check alignment to determine if it's a 2MB block or single 4KB page
         for block in self.data_blocks.iter() {
             if let Some(block_addr) = block {
-                // Each 2MB block = 512 pages of 4KB each
-                for i in 0..512 {
-                    free_frame(PhysAddr(block_addr.0 + i * 4096));
+                if (block_addr.0 & (BLOCK_SIZE_2MB - 1)) == 0 {
+                    // 2MB-aligned: it's a 2MB block, free all 512 pages
+                    for i in 0..512 {
+                        free_frame(PhysAddr(block_addr.0 + i * 4096));
+                    }
+                } else {
+                    // Not 2MB-aligned: it's a single 4KB page
+                    free_frame(*block_addr);
                 }
             }
         }

@@ -12,7 +12,7 @@
 
 pub mod task;
 
-pub use task::{TaskId, TaskState, Message, IpcState, KERNEL_STACK_SIZE, FileDescriptor, FdKind, MAX_FDS, PendingSyscall, MAX_PATH_LEN, DEFAULT_HEAP_START};
+pub use task::{TaskId, TaskState, Message, KERNEL_STACK_SIZE, FileDescriptor, MAX_FDS, PendingSyscall, MAX_PATH_LEN, DEFAULT_HEAP_START};
 
 use crate::mm::{self, PhysAddr, AddressSpace, PageFlags};
 use crate::exception::ExceptionContext;
@@ -139,13 +139,15 @@ impl Scheduler {
 
         // Save current task's context and put it back in ready queue
         // (but only if it was Running - blocked tasks stay blocked)
+        // Note: idle task (0) is never put in the ready queue - it runs when queue is empty
         if let Some(id) = current_id {
             let task = &mut TASKS[id.0];
             // Store the SP that points to the exception context
             task.kernel_stack_top = ctx as *const _ as usize;
 
             // Only re-enqueue if the task was running (not IPC blocked)
-            if task.state == TaskState::Running {
+            // Never enqueue idle task - it's the fallback when queue is empty
+            if task.state == TaskState::Running && id != self.idle_task {
                 task.state = TaskState::Ready;
                 task.time_slice = DEFAULT_TIME_SLICE;
                 self.enqueue(id);
@@ -245,6 +247,8 @@ impl Scheduler {
     pub fn exit_current(&mut self, exit_code: i32) {
         if let Some(current_id) = self.current {
             unsafe {
+                let parent_id_opt = TASKS[current_id.0].parent;
+
                 // Wake up any tasks waiting to send to or waiting for reply from this task
                 task::wake_blocked_senders(current_id);
 
@@ -263,7 +267,7 @@ impl Scheduler {
                 task.state = TaskState::Terminated;
 
                 // Signal parent and wake if waiting (WaitBlocked)
-                if let Some(parent_id) = task.parent {
+                if let Some(parent_id) = parent_id_opt {
                     let parent = &mut TASKS[parent_id.0];
                     // Set SIGCHLD pending on parent (signal 17, bit 16)
                     const SIGCHLD_BIT: u64 = 1 << 16; // SIGCHLD = 17, bit = 17-1 = 16
@@ -561,8 +565,6 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     // Find the range of all segments
     let mut min_vaddr = usize::MAX;
     let mut max_vaddr = 0usize;
-    let mut has_executable = false;
-    let mut has_writable = false;
 
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
@@ -572,12 +574,6 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         }
         min_vaddr = min_vaddr.min(vaddr);
         max_vaddr = max_vaddr.max(vaddr + memsz);
-        if phdr.p_flags & PF_X != 0 {
-            has_executable = true;
-        }
-        if phdr.p_flags & PF_W != 0 {
-            has_writable = true;
-        }
     }
 
     if min_vaddr == usize::MAX {
@@ -602,7 +598,7 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     // the code must be at the start of the physical block.
     let first_frame = mm::frame::alloc_frames_at_2mb_boundary(num_frames)?;
     let phys_base_2mb = first_frame; // first_frame IS the 2MB block base
-    let first_frame_offset = 0; // Always 0 now
+    let _first_frame_offset = 0; // Always 0 now
 
     // Zero the entire 2MB block (ensures .bss is zeroed)
     unsafe {
@@ -676,7 +672,7 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     // SP points to argc
 
     let stack_virt_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB;
-    let stack_phys_top = stack_phys_base_2mb.0 + BLOCK_SIZE_2MB;
+    let _stack_phys_top = stack_phys_base_2mb.0 + BLOCK_SIZE_2MB;
 
     // Calculate physical address from virtual offset
     let virt_to_phys = |vaddr: usize| -> usize {
@@ -1228,11 +1224,19 @@ pub fn create_blkdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         }
     }
 
+    // Track segment flags for page permissions
+    let mut has_executable = false;
+    let mut has_writable = false;
+
     // Copy all segments to the appropriate frames
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
         let filesz = phdr.p_filesz as usize;
         let memsz = phdr.p_memsz as usize;
+
+        // Track segment permissions
+        if phdr.p_flags & 0x1 != 0 { has_executable = true; }
+        if phdr.p_flags & 0x2 != 0 { has_writable = true; }
 
         if memsz == 0 || filesz == 0 {
             continue;
@@ -1384,8 +1388,6 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
     // Find the range of all segments
     let mut min_vaddr = usize::MAX;
     let mut max_vaddr = 0usize;
-    let mut has_executable = false;
-    let mut has_writable = false;
 
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
@@ -1395,12 +1397,6 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         }
         min_vaddr = min_vaddr.min(vaddr);
         max_vaddr = max_vaddr.max(vaddr + memsz);
-        if phdr.p_flags & PF_X != 0 {
-            has_executable = true;
-        }
-        if phdr.p_flags & PF_W != 0 {
-            has_writable = true;
-        }
     }
 
     if min_vaddr == usize::MAX {
@@ -1445,11 +1441,19 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         }
     }
 
+    // Track segment flags for page permissions
+    let mut has_executable = false;
+    let mut has_writable = false;
+
     // Copy all segments to the appropriate frames
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
         let filesz = phdr.p_filesz as usize;
         let memsz = phdr.p_memsz as usize;
+
+        // Track segment permissions
+        if phdr.p_flags & 0x1 != 0 { has_executable = true; }
+        if phdr.p_flags & 0x2 != 0 { has_writable = true; }
 
         if memsz == 0 || filesz == 0 {
             continue;

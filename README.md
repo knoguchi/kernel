@@ -16,9 +16,14 @@ The kernel boots on QEMU virt and runs multiple user-space servers:
 alignment fault emulation for SIMD instructions, allowing unmodified musl-based
 binaries to run. Type commands at the `/ #` prompt.
 
-**Recent Fix (2026-02-08):** Fixed an IPC race condition where the second `ls` command
-would freeze. The bug was in `sys_recv` incorrectly waking senders using the `sys_call`
-(RPC) pattern, causing replies to be lost when VFS was busy.
+**Recent Fixes (2026-02-08):**
+- Fixed address space memory corruption where forked-then-execve'd processes would
+  corrupt the parent's page tables on exit. The `Drop` impl was treating 4KB pages
+  as 2MB blocks, freeing memory belonging to other tasks.
+- Fixed scheduler bug where the idle task was being added to the ready queue,
+  preventing proper parent wake-up after child exit.
+- Fixed IPC race condition where `sys_recv` incorrectly woke RPC senders.
+- Added relative path resolution to `execve` (`./ls` now works from any directory).
 
 Tested features: IPC, shared memory, pipes, file operations, process spawn/execve,
 fork/wait, mmap/munmap (anonymous and file-backed), clock_gettime, signal delivery,
