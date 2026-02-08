@@ -2,6 +2,8 @@
 //!
 //! Handles reading file data by following the cluster chain.
 
+#![allow(dead_code)]
+
 use super::dir::DirEntry;
 
 /// A FAT32 file handle

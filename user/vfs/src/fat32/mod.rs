@@ -1,5 +1,7 @@
 //! FAT32 filesystem implementation
 
+#![allow(dead_code)]
+
 pub mod bpb;
 pub mod fat;
 pub mod dir;

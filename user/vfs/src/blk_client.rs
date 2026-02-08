@@ -2,6 +2,8 @@
 //!
 //! Communicates with the blkdev server via IPC to read/write disk sectors.
 
+#![allow(dead_code)]
+
 use libkenix::ipc::{self, Message};
 use libkenix::shm;
 use libkenix::msg::{BLK_READ, BLK_WRITE, BLK_INFO};

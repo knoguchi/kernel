@@ -3,6 +3,8 @@
 //! The BPB is located at the beginning of the boot sector and contains
 //! filesystem metadata needed to navigate the FAT structure.
 
+#![allow(dead_code)]
+
 use super::SECTOR_SIZE;
 
 /// BIOS Parameter Block for FAT32

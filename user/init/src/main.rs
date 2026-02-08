@@ -133,6 +133,7 @@ fn main() -> ! {
     syscall::exit(0);
 }
 
+#[allow(dead_code)]
 fn test_ls_twice() {
     // Run test binary the first time (smaller than busybox)
     print("--- First test run ---\n");
@@ -192,6 +193,7 @@ fn test_ls_twice() {
     }
 }
 
+#[allow(dead_code)]
 fn test_disk_execve() {
     print("Forking for disk execve test...\n");
 

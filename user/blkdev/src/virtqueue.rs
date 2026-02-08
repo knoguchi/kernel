@@ -5,6 +5,8 @@
 //! - Available ring: driver writes available descriptor indices
 //! - Used ring: device writes completed descriptor indices
 
+#![allow(dead_code)]
+
 use core::sync::atomic::{fence, Ordering};
 
 /// Maximum queue size we support

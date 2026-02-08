@@ -15,7 +15,6 @@
 //! [0]     Valid bit
 
 use super::frame::PAGE_SIZE;
-use super::address_space::PageFlags;
 
 /// Memory attribute index for Device-nGnRnE (MAIR Attr0)
 pub const MATTR_DEVICE: u64 = 0;

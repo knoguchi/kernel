@@ -59,6 +59,7 @@ fn uart_print(s: &str) {
 }
 
 /// Check if there's data available to read
+#[allow(dead_code)]
 fn uart_has_data() -> bool {
     unsafe { (*UART_FR & UART_FR_RXFE) == 0 }
 }

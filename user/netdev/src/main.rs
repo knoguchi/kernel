@@ -67,7 +67,7 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
     loop {
         // Wait for message
         let recv = ipc::recv(TASK_ANY);
-        let sender = recv.sender;
+        let _sender = recv.sender;
         let msg = recv.msg;
 
         match msg.tag {

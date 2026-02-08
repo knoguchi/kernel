@@ -3,6 +3,8 @@
 //! Provides access to VirtIO device registers via memory-mapped I/O.
 //! Based on VirtIO 1.1 specification, MMIO transport.
 
+#![allow(dead_code)]
+
 use core::ptr::{read_volatile, write_volatile};
 
 /// VirtIO MMIO base address (QEMU virt machine first virtio slot)

@@ -40,6 +40,7 @@ pub const SYS_SEND: u16 = 1;     // Send message, block until received
 pub const SYS_RECV: u16 = 2;     // Receive message, block until available
 pub const SYS_CALL: u16 = 3;     // Send + wait for reply (RPC)
 pub const SYS_REPLY: u16 = 4;    // Reply to caller
+pub const SYS_REPLY_TO: u16 = 5; // Reply to a specific task (for deferred replies)
 
 /// Syscall numbers - Shared Memory
 pub const SYS_SHMCREATE: u16 = 10;  // Create shared memory region
@@ -223,6 +224,14 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         SYS_REPLY => {
             let msg = Message::new(ctx.gpr[0], [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]]);
             let result = ipc::sys_reply(msg);
+            ctx.gpr[0] = result as u64;
+        }
+
+        // SYS_REPLY_TO: x0=target_task, x1=tag, x2-x5=data → returns result in x0
+        SYS_REPLY_TO => {
+            let target = TaskId(ctx.gpr[0] as usize);
+            let msg = Message::new(ctx.gpr[1], [ctx.gpr[2], ctx.gpr[3], ctx.gpr[4], ctx.gpr[5]]);
+            let result = ipc::sys_reply_to(target, msg);
             ctx.gpr[0] = result as u64;
         }
 

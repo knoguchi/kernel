@@ -3,6 +3,8 @@
 //! The FAT is a linked list where each entry points to the next cluster
 //! in a file's chain, or contains a special marker.
 
+#![allow(dead_code)]
+
 use super::SECTOR_SIZE;
 
 /// End of chain marker

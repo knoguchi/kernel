@@ -8,8 +8,8 @@
 //! - Page fault handler allocates pages on demand
 
 use crate::mm::frame::{alloc_frame, free_frame, PhysAddr, PAGE_SIZE};
-use crate::mm::address_space::{AddressSpace, PageFlags};
-use crate::sched::task::{TaskId, TASKS};
+use crate::mm::address_space::PageFlags;
+use crate::sched::task::TASKS;
 use crate::sched;
 use alloc::vec::Vec;
 
@@ -188,7 +188,7 @@ impl MmapState {
     /// Remove region(s) overlapping with the given range
     /// Returns the physical pages that need to be freed
     pub fn remove_region(&mut self, addr: usize, len: usize) -> Vec<PhysAddr> {
-        let mut pages_to_free = Vec::new();
+        let pages_to_free = Vec::new();
         let end = addr + len;
 
         // Find and remove overlapping regions

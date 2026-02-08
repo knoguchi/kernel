@@ -830,6 +830,7 @@ fn handle_read(client: usize, handle: u64, len: u64, reply_data: &mut [u64; 4]) 
 }
 
 /// File type and mode constants
+#[allow(dead_code)]
 const S_IFMT: u32 = 0o170000;   // File type mask
 const S_IFDIR: u32 = 0o040000;  // Directory
 const S_IFREG: u32 = 0o100000;  // Regular file
@@ -959,6 +960,7 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
     const DT_DIR: u8 = 4;
 
     let mut bytes_written: usize = 0;
+    #[allow(unused_assignments)]
     let mut entry_offset: i64 = file.offset as i64; // Start from current position
     let start_entry = file.offset; // Track starting entry index
 
@@ -1014,7 +1016,8 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
                     break; // No more space
                 }
 
-                entry_offset += reclen as i64;
+                #[allow(unused_assignments)]
+                { entry_offset += reclen as i64; }
 
                 // Write dirent64 structure to SHM
                 let dest = shm_base + bytes_written;
@@ -1138,7 +1141,8 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
                             break 'outer;
                         }
 
-                        entry_offset += reclen as i64;
+                        #[allow(unused_assignments)]
+                { entry_offset += reclen as i64; }
                         current_entry_idx += 1;
 
                         // Get attributes

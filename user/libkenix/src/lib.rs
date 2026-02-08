@@ -76,6 +76,7 @@ pub mod syscall {
     pub const SYS_RECV: u64 = 2;
     pub const SYS_CALL: u64 = 3;
     pub const SYS_REPLY: u64 = 4;
+    pub const SYS_REPLY_TO: u64 = 5;
     pub const SYS_NOTIFY: u64 = 7;
     pub const SYS_WAIT_NOTIFY: u64 = 8;
     pub const SYS_SHMCREATE: u64 = 10;
@@ -1217,6 +1218,28 @@ pub mod ipc {
                 in("x3") msg.data[2],
                 in("x4") msg.data[3],
                 in("x8") SYS_REPLY,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
+    /// Reply to a specific task (for deferred replies)
+    ///
+    /// Unlike reply() which replies to the last caller, this allows replying
+    /// to any task that is waiting for a reply from us. Used for blocking pipes.
+    pub fn reply_to(task_id: usize, msg: &Message) -> isize {
+        let ret: isize;
+        unsafe {
+            asm!(
+                "svc #0",
+                inout("x0") task_id => ret,
+                in("x1") msg.tag,
+                in("x2") msg.data[0],
+                in("x3") msg.data[1],
+                in("x4") msg.data[2],
+                in("x5") msg.data[3],
+                in("x8") SYS_REPLY_TO,
                 options(nostack)
             );
         }

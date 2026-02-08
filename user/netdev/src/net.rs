@@ -2,6 +2,8 @@
 //!
 //! Implements the VirtIO network device specification.
 
+#![allow(dead_code)]
+
 use crate::virtio_mmio::{VirtioMmio, status, device_id};
 use crate::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
 use core::sync::atomic::{fence, Ordering};

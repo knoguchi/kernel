@@ -1,6 +1,7 @@
 //! Pipe server for Kenix
 //!
 //! Provides userspace pipes for inter-process data streams via IPC.
+//! Supports blocking reads/writes using deferred IPC replies.
 
 #![no_std]
 #![no_main]
@@ -8,13 +9,31 @@
 use libkenix::ipc::{self, Message, TASK_ANY};
 use libkenix::msg::{PIPE_CREATE, PIPE_READ, PIPE_WRITE, PIPE_CLOSE, ERR_OK, ERR_NOMEM, ERR_INVAL, ERR_BADF};
 use libkenix::shm;
-use libkenix::console;
 
 /// Maximum number of pipes
 const MAX_PIPES: usize = 64;
 
 /// Pipe buffer size (4KB)
 const PIPE_BUF_SIZE: usize = 4096;
+
+/// Maximum pending readers/writers per pipe
+const MAX_PENDING: usize = 8;
+
+/// A pending reader waiting for data
+#[derive(Clone, Copy)]
+struct PendingReader {
+    task_id: usize,
+    shm_id: u64,
+    max_len: usize,
+}
+
+/// A pending writer waiting for space
+#[derive(Clone, Copy)]
+struct PendingWriter {
+    task_id: usize,
+    shm_id: u64,
+    len: usize,
+}
 
 /// A single pipe instance
 struct Pipe {
@@ -32,6 +51,10 @@ struct Pipe {
     writers: usize,
     /// Whether this pipe slot is in use
     in_use: bool,
+    /// Pending readers waiting for data
+    pending_readers: [Option<PendingReader>; MAX_PENDING],
+    /// Pending writers waiting for space
+    pending_writers: [Option<PendingWriter>; MAX_PENDING],
 }
 
 impl Pipe {
@@ -44,6 +67,8 @@ impl Pipe {
             readers: 0,
             writers: 0,
             in_use: false,
+            pending_readers: [None; MAX_PENDING],
+            pending_writers: [None; MAX_PENDING],
         }
     }
 
@@ -56,6 +81,8 @@ impl Pipe {
         self.readers = 1;
         self.writers = 1;
         self.in_use = true;
+        self.pending_readers = [None; MAX_PENDING];
+        self.pending_writers = [None; MAX_PENDING];
     }
 
     /// Check if pipe has data to read
@@ -69,7 +96,6 @@ impl Pipe {
     }
 
     /// Read data from pipe
-    /// Returns number of bytes read
     fn read(&mut self, dst: &mut [u8]) -> usize {
         let to_read = dst.len().min(self.len);
         if to_read == 0 {
@@ -85,7 +111,6 @@ impl Pipe {
     }
 
     /// Write data to pipe
-    /// Returns number of bytes written
     fn write(&mut self, src: &[u8]) -> usize {
         let space = PIPE_BUF_SIZE - self.len;
         let to_write = src.len().min(space);
@@ -99,6 +124,48 @@ impl Pipe {
         }
         self.len += to_write;
         to_write
+    }
+
+    /// Add a pending reader
+    fn add_pending_reader(&mut self, reader: PendingReader) -> bool {
+        for slot in &mut self.pending_readers {
+            if slot.is_none() {
+                *slot = Some(reader);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Take the first pending reader
+    fn take_pending_reader(&mut self) -> Option<PendingReader> {
+        for slot in &mut self.pending_readers {
+            if slot.is_some() {
+                return slot.take();
+            }
+        }
+        None
+    }
+
+    /// Add a pending writer
+    fn add_pending_writer(&mut self, writer: PendingWriter) -> bool {
+        for slot in &mut self.pending_writers {
+            if slot.is_none() {
+                *slot = Some(writer);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Take the first pending writer
+    fn take_pending_writer(&mut self) -> Option<PendingWriter> {
+        for slot in &mut self.pending_writers {
+            if slot.is_some() {
+                return slot.take();
+            }
+        }
+        None
     }
 
     /// Check if pipe should be deallocated
@@ -132,6 +199,70 @@ fn free_pipe(id: usize) {
     }
 }
 
+/// Complete a read operation: copy data from pipe to SHM and reply
+fn complete_read(task_id: usize, pipe: &mut Pipe, shm_id: u64, max_len: usize) {
+    // Map the shared memory
+    let shm_addr = shm::map(shm_id, 0);
+    if shm_addr < 0 {
+        let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+        ipc::reply_to(task_id, &reply);
+        return;
+    }
+
+    // Read from pipe into SHM buffer
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(shm_addr as *mut u8, max_len)
+    };
+    let bytes_read = pipe.read(buf);
+
+    // Unmap SHM
+    shm::unmap(shm_id);
+
+    let reply = Message::new(bytes_read as u64, [0; 4]);
+    ipc::reply_to(task_id, &reply);
+}
+
+/// Complete a write operation: copy data from SHM to pipe and reply
+fn complete_write(task_id: usize, pipe: &mut Pipe, shm_id: u64, len: usize) {
+    // Map the shared memory
+    let shm_addr = shm::map(shm_id, 0);
+    if shm_addr < 0 {
+        let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+        ipc::reply_to(task_id, &reply);
+        return;
+    }
+
+    // Read from SHM buffer and write to pipe
+    let buf = unsafe {
+        core::slice::from_raw_parts(shm_addr as *const u8, len)
+    };
+    let bytes_written = pipe.write(buf);
+
+    // Unmap SHM
+    shm::unmap(shm_id);
+
+    let reply = Message::new(bytes_written as u64, [0; 4]);
+    ipc::reply_to(task_id, &reply);
+}
+
+/// Wake all pending readers with EOF (0 bytes)
+fn wake_readers_eof(pipe: &mut Pipe) {
+    while let Some(reader) = pipe.take_pending_reader() {
+        // Reply with 0 bytes (EOF)
+        let reply = Message::new(0, [0; 4]);
+        ipc::reply_to(reader.task_id, &reply);
+    }
+}
+
+/// Wake all pending writers with error (broken pipe)
+fn wake_writers_error(pipe: &mut Pipe) {
+    while let Some(writer) = pipe.take_pending_writer() {
+        // Reply with error (EPIPE-like)
+        let reply = Message::new(ERR_BADF as u64, [0; 4]);
+        ipc::reply_to(writer.task_id, &reply);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // Use stack buffer to avoid potential rodata mapping issues
@@ -142,12 +273,11 @@ pub extern "C" fn _start() -> ! {
     loop {
         // Wait for message
         let recv = ipc::recv(TASK_ANY);
-        let _sender = recv.sender;
+        let sender = recv.sender;
         let msg = recv.msg;
 
         match msg.tag {
             PIPE_CREATE => {
-                console::println("[pipeserv] PIPE_CREATE");
                 // Create a new pipe
                 let reply = match alloc_pipe() {
                     Some(id) => Message::new(id as u64, [0; 4]),
@@ -176,34 +306,50 @@ pub extern "C" fn _start() -> ! {
                     continue;
                 }
 
-                // Map the shared memory
-                let shm_addr = shm::map(shm_id, 0);
-                if shm_addr < 0 {
-                    let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+                if pipe.has_data() {
+                    // Data available - read immediately
+                    let shm_addr = shm::map(shm_id, 0);
+                    if shm_addr < 0 {
+                        let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+                        ipc::reply(&reply);
+                        continue;
+                    }
+
+                    let buf = unsafe {
+                        core::slice::from_raw_parts_mut(shm_addr as *mut u8, max_len)
+                    };
+                    let bytes_read = pipe.read(buf);
+                    shm::unmap(shm_id);
+
+                    let reply = Message::new(bytes_read as u64, [0; 4]);
                     ipc::reply(&reply);
-                    continue;
-                }
 
-                // Read from pipe into SHM buffer
-                let buf = unsafe {
-                    core::slice::from_raw_parts_mut(shm_addr as *mut u8, max_len)
-                };
-
-                // If pipe is empty and no writers, return EOF (0)
-                // If pipe is empty but has writers, block (for now return 0 - TODO: proper blocking)
-                let bytes_read = if pipe.has_data() {
-                    pipe.read(buf)
+                    // Wake any pending writers now that there's space
+                    while pipe.has_space() {
+                        if let Some(writer) = pipe.take_pending_writer() {
+                            complete_write(writer.task_id, pipe, writer.shm_id, writer.len);
+                        } else {
+                            break;
+                        }
+                    }
                 } else if pipe.writers == 0 {
-                    0 // EOF
+                    // No writers left - return EOF
+                    let reply = Message::new(0, [0; 4]);
+                    ipc::reply(&reply);
                 } else {
-                    0 // Would block - for now return 0
-                };
-
-                // Unmap SHM
-                shm::unmap(shm_id);
-
-                let reply = Message::new(bytes_read as u64, [0; 4]);
-                ipc::reply(&reply);
+                    // No data but writers exist - block (defer reply)
+                    let reader = PendingReader {
+                        task_id: sender,
+                        shm_id,
+                        max_len,
+                    };
+                    if !pipe.add_pending_reader(reader) {
+                        // Too many pending readers - return 0 (caller should retry)
+                        let reply = Message::new(0, [0; 4]);
+                        ipc::reply(&reply);
+                    }
+                    // Don't reply - caller stays blocked
+                }
             }
 
             PIPE_WRITE => {
@@ -228,33 +374,51 @@ pub extern "C" fn _start() -> ! {
 
                 // If no readers, return error (EPIPE-like)
                 if pipe.readers == 0 {
-                    // Unmap and return error
                     let reply = Message::new(ERR_BADF as u64, [0; 4]);
                     ipc::reply(&reply);
                     continue;
                 }
 
-                // Map the shared memory
-                let shm_addr = shm::map(shm_id, 0);
-                if shm_addr < 0 {
-                    let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+                if pipe.has_space() {
+                    // Space available - write immediately
+                    let shm_addr = shm::map(shm_id, 0);
+                    if shm_addr < 0 {
+                        let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+                        ipc::reply(&reply);
+                        continue;
+                    }
+
+                    let buf = unsafe {
+                        core::slice::from_raw_parts(shm_addr as *const u8, len)
+                    };
+                    let bytes_written = pipe.write(buf);
+                    shm::unmap(shm_id);
+
+                    let reply = Message::new(bytes_written as u64, [0; 4]);
                     ipc::reply(&reply);
-                    continue;
+
+                    // Wake any pending readers now that there's data
+                    while pipe.has_data() {
+                        if let Some(reader) = pipe.take_pending_reader() {
+                            complete_read(reader.task_id, pipe, reader.shm_id, reader.max_len);
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    // No space - block (defer reply)
+                    let writer = PendingWriter {
+                        task_id: sender,
+                        shm_id,
+                        len,
+                    };
+                    if !pipe.add_pending_writer(writer) {
+                        // Too many pending writers - return 0 (caller should retry)
+                        let reply = Message::new(0, [0; 4]);
+                        ipc::reply(&reply);
+                    }
+                    // Don't reply - caller stays blocked
                 }
-
-                // Read from SHM buffer and write to pipe
-                let buf = unsafe {
-                    core::slice::from_raw_parts(shm_addr as *const u8, len)
-                };
-
-                // Write as much as possible (non-blocking for now)
-                let bytes_written = pipe.write(buf);
-
-                // Unmap SHM
-                shm::unmap(shm_id);
-
-                let reply = Message::new(bytes_written as u64, [0; 4]);
-                ipc::reply(&reply);
             }
 
             PIPE_CLOSE => {
@@ -281,9 +445,17 @@ pub extern "C" fn _start() -> ! {
                     if pipe.readers > 0 {
                         pipe.readers -= 1;
                     }
+                    // If no more readers, wake pending writers with error
+                    if pipe.readers == 0 {
+                        wake_writers_error(pipe);
+                    }
                 } else {
                     if pipe.writers > 0 {
                         pipe.writers -= 1;
+                    }
+                    // If no more writers, wake pending readers with EOF
+                    if pipe.writers == 0 {
+                        wake_readers_eof(pipe);
                     }
                 }
 

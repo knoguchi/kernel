@@ -2,6 +2,8 @@
 //!
 //! Implements the VirtIO block device specification.
 
+#![allow(dead_code)]
+
 use crate::virtio_mmio::{VirtioMmio, status, device_id};
 use crate::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
 use core::sync::atomic::{fence, Ordering};
@@ -166,7 +168,7 @@ impl VirtioBlk {
         self.mmio.set_status(status::ACKNOWLEDGE | status::DRIVER);
 
         // Read device features
-        let features_lo = self.mmio.device_features(0);
+        let _features_lo = self.mmio.device_features(0);
         let features_hi = self.mmio.device_features(1);
 
 
@@ -331,7 +333,7 @@ impl VirtioBlk {
         }
 
         // Process completion
-        let (head, _len) = unsafe { self.queue.pop_used().unwrap() };
+        let (_head, _len) = unsafe { self.queue.pop_used().unwrap() };
 
         // Free descriptors
         self.queue.free_desc(desc0);

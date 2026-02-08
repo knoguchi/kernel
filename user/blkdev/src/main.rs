@@ -173,6 +173,7 @@ fn cache_invalidate_range(start_sector: u64, count: usize) {
 
 /// Convert a virtual address to physical address for DMA
 #[inline]
+#[allow(dead_code)]
 fn va_to_pa(va: u64) -> u64 {
     // Our address space: VA 0 maps to PA PHYS_BASE
     // So PA = VA + PHYS_BASE
@@ -208,16 +209,18 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
     }
 
     // Main server loop
+    #[allow(unused_variables, unused_assignments)]
     let mut read_count = 0u32;
     loop {
         // Wait for message
         let recv = ipc::recv(TASK_ANY);
-        let sender = recv.sender;
+        let _sender = recv.sender;
         let msg = recv.msg;
 
         match msg.tag {
             BLK_READ => {
-                read_count += 1;
+                #[allow(unused_assignments)]
+                { read_count += 1; }
                 // BLK_READ: data[0] = sector, data[1] = count, data[2] = shm_id
                 let sector = msg.data[0];
                 let count = msg.data[1] as usize;

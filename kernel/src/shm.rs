@@ -12,7 +12,7 @@
 use crate::mm::frame::{alloc_frame, free_frame, PhysAddr, PAGE_SIZE};
 use crate::sched::{TaskId, current};
 use crate::sched::task::{TASKS, MAX_TASKS, TaskState};
-use crate::mm::{AddressSpace, PageFlags};
+use crate::mm::PageFlags;
 use core::ptr;
 
 /// Maximum number of shared memory regions
@@ -614,7 +614,7 @@ unsafe fn destroy_shm_internal(shm_id: usize) {
 ///
 /// This directly manipulates page tables given the L1 table address.
 unsafe fn map_4kb_direct(l1_addr: usize, vaddr: usize, paddr: PhysAddr) -> bool {
-    use crate::mm::paging::{l1_index, l2_index, l3_index, PageTableEntry, ENTRIES_PER_TABLE};
+    use crate::mm::paging::{l1_index, l2_index, l3_index, PageTableEntry};
 
     let l1_idx = l1_index(vaddr);
     let l2_idx = l2_index(vaddr);

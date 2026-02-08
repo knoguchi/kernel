@@ -3,6 +3,8 @@
 //! Directory entries are 32 bytes each and contain file metadata.
 //! Long filenames (LFN) use multiple entries before the short name entry.
 
+#![allow(dead_code)]
+
 /// Directory entry size in bytes
 pub const DIR_ENTRY_SIZE: usize = 32;
 

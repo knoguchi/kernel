@@ -441,7 +441,7 @@ fn test_signal_delivery() {
     const SIGUSR1: i32 = 10;
 
     let act = Sigaction {
-        sa_handler: signal_handler as u64,
+        sa_handler: signal_handler as *const () as u64,
         sa_flags: 0,
         sa_restorer: 0,
         sa_mask: 0,

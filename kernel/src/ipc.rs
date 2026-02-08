@@ -421,6 +421,93 @@ pub fn sys_reply(msg: Message) -> i64 {
     IPC_OK
 }
 
+/// Reply to a specific task (for deferred replies)
+///
+/// Unlike sys_reply which replies to the last caller, this allows a server
+/// to reply to any task that is waiting for a reply from it. This is used
+/// for deferred/asynchronous reply patterns (e.g., pipe blocking).
+///
+/// # Arguments
+/// * `target` - Task ID to reply to
+/// * `msg` - Reply message
+///
+/// # Returns
+/// IPC_OK on success, error code on failure
+pub fn sys_reply_to(target: TaskId, msg: Message) -> i64 {
+    let server_id = match current() {
+        Some(id) => id,
+        None => return IPC_ERR_INVALID_TASK,
+    };
+
+    if !is_valid_task(target) {
+        return IPC_ERR_TASK_DEAD;
+    }
+
+    unsafe {
+        let target_task = &mut TASKS[target.0];
+
+        // Target must be waiting for our reply
+        if target_task.state != TaskState::ReplyBlocked || target_task.ipc.reply_to != Some(server_id) {
+            return IPC_ERR_NOT_WAITING;
+        }
+
+        // Transfer reply message
+        target_task.ipc.pending_msg = msg;
+        target_task.ipc.reply_to = None;
+
+        // Check if this reply completes a pending syscall
+        let pending = target_task.pending_syscall;
+        let result = complete_pending_syscall(target, pending, &msg);
+
+        match result {
+            PendingSyscallResult::Complete(x0_val, x1_opt) => {
+                // Set up return values in target's saved context
+                if !pending.is_none() {
+                    let task = &TASKS[target.0];
+                    let ctx = task.kernel_stack_top as *mut ExceptionContext;
+                    if !ctx.is_null() {
+                        (*ctx).gpr[0] = x0_val as u64;
+                        if let Some(x1_val) = x1_opt {
+                            (*ctx).gpr[1] = x1_val as u64;
+                        }
+                    }
+                } else {
+                    set_call_return(target, &msg);
+                }
+
+                // Clear pending syscall
+                let target_task = &mut TASKS[target.0];
+                target_task.pending_syscall = PendingSyscall::None;
+
+                // Wake up target
+                target_task.state = TaskState::Ready;
+                sched::enqueue_task(target);
+            }
+            PendingSyscallResult::Continue { new_pending, target: next_target, msg: next_msg } => {
+                // Multi-stage syscall - target stays blocked, chain to next IPC
+                let target_task = &mut TASKS[target.0];
+                target_task.pending_syscall = new_pending;
+                target_task.ipc.pending_msg = next_msg;
+                target_task.ipc.reply_to = Some(next_target);
+
+                let next_task = &mut TASKS[next_target.0];
+                if next_task.state == TaskState::RecvBlocked {
+                    next_task.ipc.pending_msg = next_msg;
+                    next_task.ipc.caller = Some(target);
+                    target_task.state = TaskState::ReplyBlocked;
+                    next_task.state = TaskState::Ready;
+                    sched::enqueue_task(next_target);
+                } else {
+                    target_task.state = TaskState::ReplyBlocked;
+                    enqueue_sender(next_target, target);
+                }
+            }
+        }
+    }
+
+    IPC_OK
+}
+
 /// Complete a pending syscall using the IPC reply from a server
 ///
 /// Returns PendingSyscallResult indicating whether to wake the caller or continue with another IPC

@@ -17,15 +17,18 @@ alignment fault emulation for SIMD instructions, allowing unmodified musl-based
 binaries to run. Type commands at the `/ #` prompt.
 
 **Recent Fixes (2026-02-08):**
+- Added blocking pipe support via deferred IPC replies. Pipe reads now block when
+  empty (instead of returning 0), enabling shell pipelines like `echo hello | cat`.
+- Added `sys_reply_to` syscall for replying to specific tasks (not just last caller),
+  enabling async/deferred reply patterns in user-space servers.
 - Fixed address space memory corruption where forked-then-execve'd processes would
   corrupt the parent's page tables on exit. The `Drop` impl was treating 4KB pages
   as 2MB blocks, freeing memory belonging to other tasks.
 - Fixed scheduler bug where the idle task was being added to the ready queue,
   preventing proper parent wake-up after child exit.
-- Fixed IPC race condition where `sys_recv` incorrectly woke RPC senders.
 - Added relative path resolution to `execve` (`./ls` now works from any directory).
 
-Tested features: IPC, shared memory, pipes, file operations, process spawn/execve,
+Tested features: IPC, shared memory, blocking pipes, file operations, process spawn/execve,
 fork/wait, mmap/munmap (anonymous and file-backed), clock_gettime, signal delivery,
 writev/readv, FAT32 disk I/O, interactive shell (ppoll blocking on stdin).
 
@@ -109,7 +112,7 @@ kenix/
 │       ├── timer.rs       # ARM timer driver
 │       ├── elf.rs         # ELF loader
 │       ├── irq.rs         # IRQ-to-task routing
-│       ├── pipe.rs        # Kernel-level pipes
+│       ├── signal.rs      # Signal delivery and handling
 │       └── mmap.rs        # Anonymous mmap with demand paging
 ├── user/               # User-space programs (all Rust)
 │   ├── libkenix/          # Shared runtime library
@@ -141,7 +144,7 @@ kenix/
 │   │       ├── virtio_mmio.rs # VirtIO MMIO registers
 │   │       ├── virtqueue.rs  # Virtqueue management
 │   │       └── net.rs        # VirtIO-net protocol
-│   ├── pipeserv/          # Pipe server (unused, kernel pipes preferred)
+│   ├── pipeserv/          # Pipe server (blocking pipes via deferred IPC)
 │   │   ├── Cargo.toml
 │   │   └── src/main.rs
 │   ├── hello/             # Test program for spawn
@@ -160,6 +163,51 @@ kenix/
 ├── scripts/            # Build scripts
 │   └── create_disk.sh     # FAT32 disk image creation
 └── Makefile
+```
+
+## Signal Handling
+
+Kenix implements POSIX-style signals with user-space signal handlers:
+
+### Signal Delivery Flow
+
+1. **Signal sent** - `kill(pid, sig)` or automatic (e.g., SIGCHLD on child exit)
+2. **Signal queued** - Added to target task's `pending_signals` bitmask
+3. **Delivery check** - Before returning to user-space, kernel checks for deliverable signals
+4. **Handler setup** - If handler installed:
+   - Save current user context to signal stack
+   - Set up `siginfo_t` and `ucontext_t` on user stack
+   - Redirect execution to user's signal handler
+   - Return address set to `sigreturn` trampoline
+5. **Handler runs** - User-space handler executes
+6. **sigreturn** - Handler returns via `rt_sigreturn` syscall
+7. **Context restore** - Kernel restores original context, resumes interrupted code
+
+### Supported Signals
+
+| Signal | Number | Default Action | Notes |
+|--------|--------|----------------|-------|
+| SIGHUP | 1 | Terminate | |
+| SIGINT | 2 | Terminate | Ctrl+C |
+| SIGQUIT | 3 | Terminate | |
+| SIGKILL | 9 | Terminate | Cannot be caught |
+| SIGPIPE | 13 | Terminate | Broken pipe |
+| SIGCHLD | 17 | Ignore | Child exited |
+| SIGCONT | 18 | Continue | |
+| SIGSTOP | 19 | Stop | Cannot be caught |
+
+### Example: Installing a Signal Handler
+
+```c
+void handler(int sig) {
+    write(1, "Got signal!\n", 12);
+}
+
+struct sigaction sa = {
+    .sa_handler = handler,
+    .sa_flags = 0,
+};
+sigaction(SIGINT, &sa, NULL);
 ```
 
 ## Roadmap
@@ -181,6 +229,7 @@ kenix/
 
 ### IPC
 - [x] Synchronous IPC (call/recv/reply)
+- [x] Deferred replies (reply_to for async patterns)
 - [x] Inline message passing (24 bytes)
 - [x] Shared memory IPC
 - [x] Asynchronous notifications (notify/wait_notify)
@@ -190,6 +239,7 @@ kenix/
 - [x] VFS server (ramfs + FAT32)
 - [x] Block device server (VirtIO-blk)
 - [x] Network device server (VirtIO-net)
+- [x] Pipe server (blocking pipes with deferred replies)
 - [x] FAT32 filesystem
 
 ### File Descriptors
@@ -198,7 +248,7 @@ kenix/
 - [x] read() syscall
 - [x] write() syscall
 - [x] close() syscall
-- [x] pipe() syscall (kernel-level pipes)
+- [x] pipe() syscall (blocking pipes via pipeserv)
 - [x] dup/dup2/dup3 syscalls
 
 ### Process Management
@@ -220,10 +270,14 @@ kenix/
 
 ### Signals
 - [x] Signal state tracking (mask, pending, handlers)
-- [x] sigaction/sigprocmask/kill syscalls
-- [x] SIGCHLD on child exit
-- [x] Signal delivery to user handlers
-- [x] sigreturn syscall
+- [x] sigaction syscall (install signal handlers)
+- [x] sigprocmask syscall (block/unblock signals)
+- [x] kill syscall (send signal to process)
+- [x] SIGCHLD delivery on child exit
+- [x] Signal delivery to user-space handlers
+- [x] sigreturn syscall (return from signal handler)
+- [x] Default signal actions (terminate, ignore)
+- [x] SA_RESTART, SA_SIGINFO flags (partial)
 
 ### Phase 2 musl/BusyBox Support
 - [x] set_tid_address syscall
