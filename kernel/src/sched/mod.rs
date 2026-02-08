@@ -1889,3 +1889,247 @@ pub fn replace_task_with_elf(
 
     Ok(entry_point)
 }
+
+/// fw_cfg MMIO base address (within UART 2MB block at 0x08000000)
+const FWCFG_MMIO_BASE: usize = 0x0902_0000;
+
+/// Fixed virtual address for framebuffer in fbdev's address space
+const FRAMEBUFFER_VADDR: usize = 0x2000_0000;
+
+/// Create the fbdev server from ELF with fw_cfg MMIO and framebuffer access
+///
+/// This is a specialized function for the framebuffer device server that:
+/// 1. Maps the fw_cfg MMIO region (same 2MB block as UART)
+/// 2. Allocates a 2MB block for framebuffer memory
+/// 3. Maps framebuffer into fbdev's address space
+/// 4. Passes phys_base in x0 and fb_phys in x1
+///
+/// # Arguments
+/// * `name` - Task name for debugging
+/// * `elf_data` - Raw ELF file data
+///
+/// # Returns
+/// The TaskId if successful, None if parsing or allocation failed
+pub fn create_fbdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> {
+    // Parse ELF header
+    let elf = match ElfFile::parse(elf_data) {
+        Ok(e) => e,
+        Err(_e) => {
+            return None;
+        }
+    };
+
+    let task_id = task::find_free_slot()?;
+
+    // Create user address space
+    let mut addr_space = unsafe { AddressSpace::new_for_user()? };
+
+    // Find the range of all segments
+    let mut min_vaddr = usize::MAX;
+    let mut max_vaddr = 0usize;
+
+    for phdr in elf.load_segments() {
+        let vaddr = phdr.p_vaddr as usize;
+        let memsz = phdr.p_memsz as usize;
+        if memsz == 0 {
+            continue;
+        }
+        min_vaddr = min_vaddr.min(vaddr);
+        max_vaddr = max_vaddr.max(vaddr + memsz);
+    }
+
+    if min_vaddr == usize::MAX {
+        return None;
+    }
+
+    let block_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
+
+    // Calculate how many 4KB frames we need for the code
+    let code_size = max_vaddr - min_vaddr;
+    let num_frames = (code_size + mm::frame::PAGE_SIZE - 1) / mm::frame::PAGE_SIZE;
+
+    if num_frames > MAX_CODE_FRAMES {
+        return None;
+    }
+
+    // Allocate the first code frame
+    let first_frame = mm::alloc_frame()?;
+    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let first_frame_offset = first_frame.0 - phys_base_2mb.0;
+
+    // Zero and track all frames
+    let mut code_frames: [PhysAddr; MAX_CODE_FRAMES] = [PhysAddr(0); MAX_CODE_FRAMES];
+    code_frames[0] = first_frame;
+
+    unsafe {
+        core::ptr::write_bytes(first_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+    }
+
+    // Allocate remaining frames, checking they're in the same 2MB block
+    for i in 1..num_frames {
+        let frame = mm::alloc_frame()?;
+        let frame_2mb_base = PhysAddr(frame.0 & !(BLOCK_SIZE_2MB - 1));
+
+        if frame_2mb_base.0 != phys_base_2mb.0 {
+            return None;
+        }
+
+        code_frames[i] = frame;
+        unsafe {
+            core::ptr::write_bytes(frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        }
+    }
+
+    // Track segment flags for page permissions
+    let mut has_executable = false;
+    let mut has_writable = false;
+
+    // Copy all segments to the appropriate frames
+    for phdr in elf.load_segments() {
+        let vaddr = phdr.p_vaddr as usize;
+        let filesz = phdr.p_filesz as usize;
+        let memsz = phdr.p_memsz as usize;
+
+        // Track segment permissions
+        if phdr.p_flags & 0x1 != 0 { has_executable = true; }
+        if phdr.p_flags & 0x2 != 0 { has_writable = true; }
+
+        if memsz == 0 || filesz == 0 {
+            continue;
+        }
+
+        let segment_data = elf.segment_data(phdr).ok()?;
+        let offset_in_frames = vaddr - block_base;
+
+        let mut bytes_copied = 0usize;
+        while bytes_copied < filesz {
+            let current_offset = offset_in_frames + bytes_copied;
+            let frame_idx = current_offset / mm::frame::PAGE_SIZE;
+            let offset_in_frame = current_offset % mm::frame::PAGE_SIZE;
+
+            if frame_idx >= num_frames {
+                break;
+            }
+
+            let bytes_left_in_frame = mm::frame::PAGE_SIZE - offset_in_frame;
+            let bytes_left_to_copy = filesz - bytes_copied;
+            let copy_size = bytes_left_in_frame.min(bytes_left_to_copy);
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    segment_data.as_ptr().add(bytes_copied),
+                    (code_frames[frame_idx].0 + offset_in_frame) as *mut u8,
+                    copy_size,
+                );
+            }
+
+            bytes_copied += copy_size;
+        }
+    }
+
+    // Determine page flags based on combined segment flags
+    let flags = if has_executable && has_writable {
+        PageFlags::user_code_data()
+    } else if has_executable {
+        PageFlags::user_code()
+    } else if has_writable {
+        PageFlags::user_data()
+    } else {
+        PageFlags::user_code()
+    };
+
+    // Map the code block
+    unsafe {
+        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+            return None;
+        }
+    }
+
+    // Map fw_cfg MMIO region (same 2MB block as UART)
+    // fw_cfg is at 0x09020000, UART is at 0x09000000 - both in 2MB block 0x09000000
+    unsafe {
+        let fwcfg_block_base = FWCFG_MMIO_BASE & !(BLOCK_SIZE_2MB - 1); // 0x09000000
+        if !addr_space.map_2mb(fwcfg_block_base, PhysAddr(fwcfg_block_base), PageFlags::user_device()) {
+            return None;
+        }
+    }
+
+    // Allocate 2MB block for framebuffer (800*600*4 = 1.92MB fits in one block)
+    // Use alloc_frames_at_2mb_boundary to get a clean 2MB block
+    let fb_frame = mm::frame::alloc_frames_at_2mb_boundary(512)?; // 512 frames = 2MB
+    let fb_phys = fb_frame.0 as u64;
+
+    // Zero the framebuffer
+    unsafe {
+        core::ptr::write_bytes(fb_frame.0 as *mut u8, 0, BLOCK_SIZE_2MB);
+    }
+
+    // Map framebuffer at FRAMEBUFFER_VADDR
+    unsafe {
+        if !addr_space.map_2mb(FRAMEBUFFER_VADDR, fb_frame, PageFlags::user_data()) {
+            return None;
+        }
+    }
+
+    // Allocate and map user stack
+    let stack_frame = mm::alloc_frame()?;
+    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+
+    unsafe {
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
+            return None;
+        }
+    }
+
+    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    let user_entry_point = first_frame_offset + elf.entry_point() as usize;
+
+    // Allocate kernel stack
+    let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
+    let mut kernel_stack_base = PhysAddr(0);
+
+    for i in 0..stack_pages {
+        if let Some(frame) = mm::alloc_frame() {
+            if i == 0 {
+                kernel_stack_base = frame;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    unsafe {
+        let task = &mut TASKS[task_id.0];
+        task.id = task_id;
+        task.state = TaskState::Ready;
+        task.set_name(name);
+        task.kernel_stack_base = kernel_stack_base;
+        task.addr_space = Some(addr_space);
+        task.entry_point = user_entry_point;
+        task.time_slice = DEFAULT_TIME_SLICE;
+        task.next = None;
+        task.ipc = task::IpcState::empty();
+        task.init_stdio();
+
+        let kernel_stack_top = kernel_stack_base.0 + KERNEL_STACK_SIZE;
+        let ctx_addr = kernel_stack_top - EXCEPTION_CONTEXT_SIZE;
+        let ctx = ctx_addr as *mut ExceptionContext;
+
+        core::ptr::write_bytes(ctx, 0, 1);
+        (*ctx).elr = user_entry_point as u64;
+        (*ctx).spsr = 0x000;
+        (*ctx).sp = user_stack_top as u64;
+        // Pass physical base in x0 for VA->PA conversion
+        (*ctx).gpr[0] = phys_base_2mb.0 as u64;
+        // Pass framebuffer physical address in x1
+        (*ctx).gpr[1] = fb_phys;
+
+        task.kernel_stack_top = ctx_addr;
+
+        SCHEDULER.enqueue(task_id);
+    }
+
+    Some(task_id)
+}

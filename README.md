@@ -10,6 +10,7 @@ The kernel boots on QEMU virt and runs multiple user-space servers:
 - **VFS server** - Virtual filesystem with ramfs and FAT32
 - **Block device server** - VirtIO-blk driver
 - **Network device server** - VirtIO-net driver
+- **Framebuffer server** - ramfb driver with text console (800x600)
 - **Init process** - System tests and process spawning
 
 **Phase 3 Complete:** BusyBox shell runs interactively! The kernel now includes
@@ -60,8 +61,11 @@ apt install mtools   # Linux
 # Build the kernel and user-space programs
 make
 
-# Run on QEMU (direct kernel boot)
+# Run on QEMU (serial console only)
 make run-kernel
+
+# Run with graphical display (shows framebuffer)
+make run-kernel-fb
 
 # BusyBox shell will display "/ #" prompt
 # Type commands like: echo hello, ls, cat /etc/passwd
@@ -144,6 +148,13 @@ kenix/
 │   │       ├── virtio_mmio.rs # VirtIO MMIO registers
 │   │       ├── virtqueue.rs  # Virtqueue management
 │   │       └── net.rs        # VirtIO-net protocol
+│   ├── fbdev/             # Framebuffer device server
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs       # IPC server loop
+│   │       ├── fwcfg.rs      # QEMU fw_cfg interface
+│   │       ├── ramfb.rs      # ramfb driver
+│   │       └── font.rs       # 8x16 VGA bitmap font
 │   ├── pipeserv/          # Pipe server (blocking pipes via deferred IPC)
 │   │   ├── Cargo.toml
 │   │   └── src/main.rs
@@ -239,6 +250,7 @@ sigaction(SIGINT, &sa, NULL);
 - [x] VFS server (ramfs + FAT32)
 - [x] Block device server (VirtIO-blk)
 - [x] Network device server (VirtIO-net)
+- [x] Framebuffer server (ramfb with text console)
 - [x] Pipe server (blocking pipes with deferred replies)
 - [x] FAT32 filesystem
 
@@ -298,6 +310,7 @@ sigaction(SIGINT, &sa, NULL);
 ### Hardware Support
 - [x] VirtIO-blk driver (block device)
 - [x] VirtIO-net driver (network)
+- [x] ramfb driver (framebuffer via fw_cfg)
 - [x] ARM GIC (Generic Interrupt Controller)
 - [x] ARM timer interrupts (preemption)
 - [ ] VirtIO interrupt-driven I/O

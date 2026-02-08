@@ -21,6 +21,7 @@ fn main() {
         "../user/blkdev.elf",
         "../user/netdev.elf",
         "../user/pipeserv.elf",
+        "../user/fbdev.elf",
         "../user/forktest.elf",
     ];
     for elf in &user_elfs {

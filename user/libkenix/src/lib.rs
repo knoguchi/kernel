@@ -1321,6 +1321,17 @@ pub mod msg {
     pub const PIPE_WRITE: u64 = 502;    // Write to pipe (pipe_id, shm_id, len)
     pub const PIPE_CLOSE: u64 = 503;    // Close pipe end (pipe_id, is_read_end)
 
+    // Framebuffer device server messages
+    pub const FB_INIT: u64 = 400;       // Get FB info -> [width, height, bpp, stride]
+    pub const FB_CLEAR: u64 = 401;      // Clear screen: data[0]=color
+    pub const FB_PIXEL: u64 = 402;      // Set pixel: data[0]=x, data[1]=y, data[2]=color
+    pub const FB_RECT: u64 = 403;       // Fill rect: data[0]=x|(y<<16), data[1]=w|(h<<16), data[2]=color
+    pub const FB_PUTCHAR: u64 = 404;    // Put char: data[0]=col, data[1]=row, data[2]=char, data[3]=fg|(bg<<32)
+    pub const FB_PRINT: u64 = 405;      // Print string: data[0]=shm_id, data[1]=len
+    pub const FB_SCROLL: u64 = 406;     // Scroll up one line
+    pub const FB_CURSOR_SET: u64 = 407; // Set cursor: data[0]=col, data[1]=row
+    pub const FB_CURSOR_GET: u64 = 408; // Get cursor: returns [col, row]
+
     // Error codes
     pub const ERR_OK: i64 = 0;
     pub const ERR_NOENT: i64 = -2;
@@ -1354,4 +1365,5 @@ pub mod tasks {
     pub const BLKDEV: usize = 4;
     pub const NETDEV: usize = 5;
     pub const PIPESERV: usize = 6;
+    pub const FBDEV: usize = 7;
 }

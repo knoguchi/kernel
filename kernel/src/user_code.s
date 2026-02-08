@@ -45,6 +45,13 @@ __pipeserv_elf_start:
 .incbin "../user/pipeserv.elf"
 __pipeserv_elf_end:
 
+// Framebuffer device server ELF (task ID 7)
+.global __fbdev_elf_start
+.global __fbdev_elf_end
+__fbdev_elf_start:
+.incbin "../user/fbdev.elf"
+__fbdev_elf_end:
+
 // Forktest ELF
 .global __forktest_elf_start
 .global __forktest_elf_end

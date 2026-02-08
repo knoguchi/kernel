@@ -110,6 +110,9 @@ extern "C" {
     // Pipe server ELF (created sixth, gets task ID 6)
     static __pipeserv_elf_start: u8;
     static __pipeserv_elf_end: u8;
+    // Framebuffer device server ELF (created seventh, gets task ID 7)
+    static __fbdev_elf_start: u8;
+    static __fbdev_elf_end: u8;
     // Forktest ELF
     static __forktest_elf_start: u8;
     static __forktest_elf_end: u8;
@@ -378,6 +381,22 @@ pub extern "C" fn kernel_main() -> ! {
         println!("  Created pipeserv server (id={}) - runs in EL0", id.0);
     } else {
         println!("  ERROR: Failed to create pipeserv server!");
+    }
+    println!();
+
+    // Create fbdev server (task ID 7)
+    println!("Creating fbdev server...");
+    let fbdev_start = unsafe { &__fbdev_elf_start as *const u8 };
+    let fbdev_end = unsafe { &__fbdev_elf_end as *const u8 };
+    let fbdev_size = fbdev_end as usize - fbdev_start as usize;
+    let fbdev_data = unsafe { core::slice::from_raw_parts(fbdev_start, fbdev_size) };
+
+    println!("  Fbdev ELF at {:#010x}, size {} bytes", fbdev_start as usize, fbdev_size);
+
+    if let Some(id) = sched::create_fbdev_server_from_elf("fbdev", fbdev_data) {
+        println!("  Created fbdev server (id={}) - runs in EL0 with ramfb access", id.0);
+    } else {
+        println!("  ERROR: Failed to create fbdev server!");
     }
     println!();
 
