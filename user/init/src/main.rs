@@ -17,6 +17,8 @@ static HELLO_ELF: &[u8] = include_bytes!("../data/hello.elf");
 // Embed the forktest program for Phase 1 BusyBox support tests
 static FORKTEST_ELF: &[u8] = include_bytes!("../data/forktest.elf");
 
+// BusyBox is now loaded from FAT32 disk at /disk/bin/busybox
+
 // ============================================================================
 // Console Client (IPC-based printing)
 // ============================================================================
@@ -121,7 +123,146 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn main() -> ! {
-    print("=== Init Process ===\n");
+    print("=== Kenix Init ===\n");
+    print("Running BusyBox from disk...\n\n");
+
+    // Run busybox echo command
+    run_busybox_shell();
+
+    print("\n=== Init complete ===\n");
+    syscall::exit(0);
+}
+
+fn test_disk_execve() {
+    print("Forking for disk execve test...\n");
+
+    let child_pid = syscall::fork();
+    if child_pid < 0 {
+        print("Fork failed!\n");
+        return;
+    } else if child_pid == 0 {
+        // Child: execve the test_align binary from disk (use 8.3 short name)
+        let path = b"/disk/bin/TEST_A~1\0";
+        let argv: [*const u8; 2] = [
+            b"test_align\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+
+        print("Child: execve test_align...\n");
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        // If we get here, execve failed
+        print("execve failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else {
+        // Parent: wait for child
+        print("Parent waiting for child pid=");
+        print_num(child_pid as usize);
+        print("\n");
+        let (wait_result, status) = syscall::waitpid(child_pid as i32, 0);
+        if wait_result >= 0 {
+            print("Child exited with status=");
+            print_num(status as usize);
+            print("\n");
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn test_hello_execve() {
+    print("Forking for hello test...\n");
+
+    let child_pid = syscall::fork();
+    if child_pid < 0 {
+        print("Fork failed!\n");
+        return;
+    } else if child_pid == 0 {
+        // Child: spawn hello.elf via the embedded binary
+        // Since we can't easily execve an embedded binary, use spawn instead
+        print("Child: spawning hello.elf...\n");
+        let hello_pid = syscall::spawn(HELLO_ELF);
+        if hello_pid < 0 {
+            print("Spawn failed!\n");
+        } else {
+            print("Spawned hello as pid=");
+            print_num(hello_pid as usize);
+            print("\n");
+        }
+        syscall::exit(0);
+    } else {
+        // Parent: wait for child
+        print("Parent waiting for child pid=");
+        print_num(child_pid as usize);
+        print("\n");
+        let (wait_result, status) = syscall::waitpid(child_pid as i32, 0);
+        if wait_result >= 0 {
+            print("Child exited with status=");
+            print_num(status as usize);
+            print("\n");
+        }
+    }
+}
+
+fn run_busybox_shell() {
+    // First test with small binary to verify VFS works
+    print("Testing /disk/bin/test...\n");
+    let test_pid = syscall::fork();
+    if test_pid == 0 {
+        let path = b"/disk/bin/test\0";
+        let argv: [*const u8; 2] = [b"test\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve test failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else if test_pid > 0 {
+        let (_, status) = syscall::waitpid(test_pid as i32, 0);
+        print("test exited status=");
+        print_num(status as usize);
+        print("\n");
+    }
+
+    // Now try busybox
+    print("Forking for busybox...\n");
+    let shell_pid = syscall::fork();
+    if shell_pid < 0 {
+        print("Failed to fork: ");
+        print_num((-shell_pid) as usize);
+        print("\n");
+        return;
+    } else if shell_pid == 0 {
+        let busybox_path = b"/disk/bin/busybox\0";
+        let argv: [*const u8; 4] = [
+            b"busybox\0".as_ptr(),
+            b"echo\0".as_ptr(),
+            b"Hello\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        print("execve busybox...\n");
+        let result = syscall::execve(busybox_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else {
+        print("busybox pid=");
+        print_num(shell_pid as usize);
+        print("\n");
+        let (wait_result, status) = syscall::waitpid(shell_pid as i32, 0);
+        if wait_result >= 0 {
+            print("busybox exited status=");
+            print_num(status as usize);
+            print("\n");
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn run_all_tests() {
     print("Testing IPC, VFS, Spawn\n\n");
 
     // ========================================
@@ -277,10 +418,12 @@ fn main() -> ! {
             let len = cwd_buf.iter().position(|&c| c == 0).unwrap_or(cwd_buf.len());
             syscall::write(1, &cwd_buf[..len]);
             print("\n");
+            print("[debug] after getcwd print\n");
         }
     } else {
         print("chdir failed\n");
     }
+    print("[debug] before brk test\n");
 
     // ========================================
     // Test brk
@@ -433,6 +576,44 @@ fn main() -> ! {
         } else {
             print("Failed to spawn forktest: ");
             print_num((-test_pid) as usize);
+            print("\n");
+        }
+    }
+
+    // ========================================
+    // Run Interactive BusyBox Shell from FAT32 disk
+    // ========================================
+    print("\n--- Starting BusyBox Shell ---\n");
+    print("Type 'exit' to quit.\n\n");
+
+    // Fork a child to run BusyBox
+    let shell_pid = syscall::fork();
+    if shell_pid < 0 {
+        print("Failed to fork for shell: ");
+        print_num((-shell_pid) as usize);
+        print("\n");
+    } else if shell_pid == 0 {
+        // Child: execve busybox from disk
+        let busybox_path = b"/disk/bin/busybox\0";
+        let argv: [*const u8; 3] = [
+            b"sh\0".as_ptr(),        // argv[0] = "sh"
+            core::ptr::null(),       // argv[1] = NULL (no additional args for now)
+            core::ptr::null(),       // terminator
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+
+        let result = syscall::execve(busybox_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        // If we get here, execve failed
+        print("execve failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else {
+        // Parent: wait for shell to exit
+        let (wait_result, status) = syscall::waitpid(shell_pid as i32, 0);
+        if wait_result >= 0 {
+            print("\n[init] Shell exited with status=");
+            print_num(status as usize);
             print("\n");
         }
     }

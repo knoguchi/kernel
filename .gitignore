@@ -28,5 +28,27 @@ QEMU_EFI.fd
 # ignore artifacts
 *.elf
 *.o
-
 *~
+
+# Disk images
+disk.img
+
+# Downloaded binaries and extracted packages
+busybox
+busybox-*.tar.bz2
+busybox-*/
+busybox-static*.apk
+busybox-static*.deb
+busybox_*
+*.tar.zst
+*.tar.gz
+*.tar.gz.*
+debian-binary
+bin/
+usr/
+musl-*/
+.PKGINFO
+.SIGN.RSA.*
+
+# Build-generated data files
+user/init/data/

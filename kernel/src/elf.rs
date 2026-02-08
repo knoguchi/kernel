@@ -169,6 +169,11 @@ impl<'a> ElfFile<'a> {
         self.header.e_entry
     }
 
+    /// Get the ELF header
+    pub fn header(&self) -> &Elf64Header {
+        self.header
+    }
+
     /// Get an iterator over PT_LOAD program headers
     pub fn load_segments(&self) -> LoadSegmentIter<'a> {
         LoadSegmentIter {

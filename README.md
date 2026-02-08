@@ -12,8 +12,13 @@ The kernel boots on QEMU virt and runs multiple user-space servers:
 - **Network device server** - VirtIO-net driver
 - **Init process** - System tests and process spawning
 
+**Phase 3 Complete:** BusyBox shell runs interactively! The kernel now includes
+alignment fault emulation for SIMD instructions, allowing unmodified musl-based
+binaries to run. Type commands at the `/ #` prompt.
+
 Tested features: IPC, shared memory, pipes, file operations, process spawn/execve,
-mmap/munmap (anonymous and file-backed), clock_gettime, signal delivery, writev/readv.
+fork/wait, mmap/munmap (anonymous and file-backed), clock_gettime, signal delivery,
+writev/readv, FAT32 disk I/O, interactive shell (ppoll blocking on stdin).
 
 ## Target
 
@@ -43,12 +48,12 @@ apt install mtools   # Linux
 # Build the kernel and user-space programs
 make
 
-# Run on QEMU (recommended - direct kernel boot)
+# Run on QEMU (direct kernel boot)
 make run-kernel
 
-# Run with UEFI bootloader (WIP - currently a stub)
-make fetch-ovmf
-make run
+# BusyBox shell will display "/ #" prompt
+# Type commands like: echo hello, ls, cat /etc/passwd
+# Press Ctrl+A X to exit QEMU
 ```
 
 ### Sample Output
@@ -60,39 +65,17 @@ make run
 [netdev] MAC: 52:54:00:12:34:56
 [pipeserv] ok, ready!
 
-=== Init Process ===
-Testing IPC, VFS, Spawn
---- Basic VFS Test ---
-Read /hello.txt: Hello from ramfs!
---- Pipe Test ---
-Created pipe: read_fd=3, write_fd=4
-Read from pipe: Hello, pipe!
---- Fork Test ---
-[parent] fork() returned child PID=8
-[child] I'm the child! PID=8
-[parent] Child exited with status=0
---- Spawn Test ---
-[hello] I was spawned!
-[hello] My PID is: 9
-
---- Phase 1 BusyBox Tests ---
-=== Phase 1 BusyBox Support Tests ===
-[TEST] clock_gettime: OK (1.619s)
-[TEST] fstat: OK mode=0o666 nlink=1 blksize=4096
-[TEST] mmap: allocated at 0x0000000010000000 write/read OK munmap OK
-[TEST] signals: sigaction OK sigprocmask OK kill OK
-[TEST] fork/wait: forked pid=10 exit=42 OK
-
-=== Phase 2 musl Startup Tests ===
-[TEST] set_tid_address: OK tid=9
-[TEST] getrandom: OK got 16 bytes: f7d84b2b...
-[TEST] prlimit64: OK stack_cur=2048KB max=2048KB
-[TEST] writev: Hello, writev world!
-[TEST] writev: OK wrote 21 bytes
-[TEST] ioctl TIOCGWINSZ: OK 80x24
-[TEST] signal delivery: OK handler called
-[TEST] file mmap: got fd=3 mapped at 0x10001000 content OK (Hello) munmap OK
-=== Tests Complete ===
+=== Kenix Init ===
+[vfs] Block device connected
+[vfs] FAT32 filesystem mounted at /disk/
+Running BusyBox from disk...
+Forking for busybox...
+execve busybox...
+busybox pid=8
+/ # echo hello
+hello
+/ # exit
+busybox exited status=0
 
 === Init complete ===
 ```
@@ -237,6 +220,10 @@ kenix/
 - [x] prlimit64 syscall
 - [x] writev/readv syscalls
 - [x] ioctl TIOCGWINSZ (terminal size)
+- [x] ppoll syscall (blocking stdin)
+- [x] getpgid/setpgid syscalls
+- [x] fstatat syscall
+- [x] SIMD alignment fault emulation (unmodified musl binaries work)
 
 ### Time
 - [x] clock_gettime (CLOCK_MONOTONIC, CLOCK_REALTIME)

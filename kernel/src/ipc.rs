@@ -375,19 +375,29 @@ pub fn sys_reply(msg: Message) -> i64 {
                 let caller_task = &mut TASKS[caller_id.0];
                 caller_task.pending_syscall = new_pending;
 
-                // Set up IPC to target server
+                // Store the message in caller's pending_msg (for receiver to pick up)
+                caller_task.ipc.pending_msg = next_msg;
                 caller_task.ipc.reply_to = Some(target);
-                caller_task.state = TaskState::ReplyBlocked;
 
-                // Transfer message to target server
                 let target_task = &mut TASKS[target.0];
-                target_task.ipc.pending_msg = next_msg;
-                target_task.ipc.caller = Some(caller_id);
+                let target_state = target_task.state;
 
                 // Wake target if it's waiting for messages
-                if target_task.state == TaskState::RecvBlocked {
+                if target_state == TaskState::RecvBlocked {
+                    // Target is blocked waiting - deliver message directly
+                    target_task.ipc.pending_msg = next_msg;
+                    target_task.ipc.caller = Some(caller_id);
+                    caller_task.state = TaskState::ReplyBlocked;
+
                     target_task.state = TaskState::Ready;
                     sched::enqueue_task(target);
+                } else {
+                    // Target is busy - add caller to sender queue
+                    // When target calls recv(), it will find us
+                    // Use ReplyBlocked (not SendBlocked) so recv won't wake us -
+                    // we want to stay blocked until the reply comes
+                    caller_task.state = TaskState::ReplyBlocked;
+                    enqueue_sender(target, caller_id);
                 }
             }
         }
@@ -689,8 +699,15 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 }
             }
 
-            // Clean up SHM
-            shm::sys_shmunmap_for_task(caller_id, shm_id);
+            // Don't clean up SHM if it's the task's cached I/O SHM (for performance)
+            // The SHM is reused across multiple reads to avoid allocation overhead
+            let is_cached_shm = {
+                let caller_task = &TASKS[caller_id.0];
+                caller_task.io_shm_id == Some(shm_id)
+            };
+            if !is_cached_shm {
+                shm::sys_shmunmap_for_task(caller_id, shm_id);
+            }
 
             PendingSyscallResult::Complete(bytes_read, None)
         }
@@ -714,8 +731,8 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 return PendingSyscallResult::Complete(vnode, None); // Return the error (ENOENT, etc.)
             }
 
-            // Create SHM for reading the ELF file (256KB should be enough for small ELFs)
-            const EXECVE_SHM_SIZE: usize = 256 * 1024;
+            // Create SHM for reading the ELF file (2MB for larger binaries like BusyBox)
+            const EXECVE_SHM_SIZE: usize = 2 * 1024 * 1024;
             let data_shm_id = shm::sys_shmcreate(EXECVE_SHM_SIZE);
             if data_shm_id < 0 {
                 // Close the vnode via VFS_CLOSE
@@ -728,11 +745,12 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             shm::sys_shmgrant(data_shm_id, VFS_TID.0);
 
             // Chain to stage 2: read the ELF file via VFS_READ_SHM
+            // VFS expects: [handle, shm_id, shm_offset, max_len]
             let msg = Message::new(VFS_READ_SHM, [
-                vnode as u64,         // vnode handle
-                data_shm_id as u64,   // SHM ID for data
-                EXECVE_SHM_SIZE as u64, // max bytes to read
-                0,                    // offset = 0
+                vnode as u64,             // vnode handle
+                data_shm_id as u64,       // SHM ID for data
+                0,                        // shm_offset = 0 (write at start of SHM)
+                EXECVE_SHM_SIZE as u64,   // max bytes to read
             ]);
 
             PendingSyscallResult::Continue {

@@ -1263,6 +1263,7 @@ pub mod console {
 
 pub mod msg {
     // Console server messages
+    pub const MSG_READ: u64 = 0;
     pub const MSG_WRITE: u64 = 1;
     pub const MSG_EXIT: u64 = 2;
     pub const MSG_SHM_WRITE: u64 = 10;

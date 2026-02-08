@@ -25,8 +25,151 @@ static mut BLOCK_DEV: VirtioBlk = VirtioBlk::new(VIRTIO_MMIO_BASE);
 static mut PHYS_BASE: u64 = 0;
 
 /// Bounce buffer for DMA - internal to blkdev so has known physical address
-/// Size: 8 sectors = 4KB (matches SHM allocation)
-static mut BOUNCE_BUF: [u8; 4096] = [0; 4096];
+/// Size: 256 sectors = 128KB (increased for better performance)
+static mut BOUNCE_BUF: [u8; 131072] = [0; 131072];
+
+// ============================================================================
+// SHM Cache - avoid repeated map/unmap overhead
+// ============================================================================
+
+const MAX_CACHED_SHM: usize = 8;
+
+#[derive(Clone, Copy)]
+struct CachedShm {
+    shm_id: u64,
+    addr: usize,
+}
+
+static mut SHM_CACHE: [Option<CachedShm>; MAX_CACHED_SHM] = [None; MAX_CACHED_SHM];
+static mut SHM_CACHE_LRU: [u8; MAX_CACHED_SHM] = [0; MAX_CACHED_SHM];
+
+/// Get a cached SHM mapping or map it and cache it
+fn get_or_map_shm(shm_id: u64) -> Option<usize> {
+    unsafe {
+        // First, check if already cached
+        for i in 0..MAX_CACHED_SHM {
+            if let Some(ref entry) = SHM_CACHE[i] {
+                if entry.shm_id == shm_id {
+                    // Update LRU - this entry is now most recently used
+                    let old_lru = SHM_CACHE_LRU[i];
+                    for j in 0..MAX_CACHED_SHM {
+                        if SHM_CACHE_LRU[j] > old_lru {
+                            SHM_CACHE_LRU[j] -= 1;
+                        }
+                    }
+                    SHM_CACHE_LRU[i] = (MAX_CACHED_SHM - 1) as u8;
+                    return Some(entry.addr);
+                }
+            }
+        }
+
+        // Not cached - need to map it
+        let addr = shm::map(shm_id, 0);
+        if addr < 0 {
+            return None;
+        }
+
+        // Find a slot to cache it (prefer empty slot, then LRU)
+        let mut slot = None;
+        let mut min_lru = u8::MAX;
+
+        for i in 0..MAX_CACHED_SHM {
+            if SHM_CACHE[i].is_none() {
+                slot = Some(i);
+                break;
+            }
+            if SHM_CACHE_LRU[i] < min_lru {
+                min_lru = SHM_CACHE_LRU[i];
+                slot = Some(i);
+            }
+        }
+
+        if let Some(i) = slot {
+            // Evict old entry if present
+            if let Some(ref old) = SHM_CACHE[i] {
+                shm::unmap(old.shm_id);
+            }
+
+            // Update LRU counters
+            for j in 0..MAX_CACHED_SHM {
+                if SHM_CACHE[j].is_some() {
+                    SHM_CACHE_LRU[j] = SHM_CACHE_LRU[j].saturating_sub(1);
+                }
+            }
+
+            SHM_CACHE[i] = Some(CachedShm {
+                shm_id,
+                addr: addr as usize,
+            });
+            SHM_CACHE_LRU[i] = (MAX_CACHED_SHM - 1) as u8;
+        }
+
+        Some(addr as usize)
+    }
+}
+
+// ============================================================================
+// Block Cache - reduces disk I/O for repeated reads
+// ============================================================================
+
+/// Number of sectors to cache (256 sectors = 128KB)
+const CACHE_SECTORS: usize = 256;
+
+/// Block cache data
+static mut BLOCK_CACHE: [u8; CACHE_SECTORS * SECTOR_SIZE] = [0; CACHE_SECTORS * SECTOR_SIZE];
+
+/// Cache tags: sector number for each cache slot (u64::MAX = invalid)
+static mut CACHE_TAGS: [u64; CACHE_SECTORS] = [u64::MAX; CACHE_SECTORS];
+
+/// Direct-mapped cache lookup
+fn cache_lookup(sector: u64) -> Option<&'static [u8]> {
+    let slot = (sector as usize) % CACHE_SECTORS;
+    unsafe {
+        if CACHE_TAGS[slot] == sector {
+            let start = slot * SECTOR_SIZE;
+            Some(&BLOCK_CACHE[start..start + SECTOR_SIZE])
+        } else {
+            None
+        }
+    }
+}
+
+/// Insert sector data into cache
+fn cache_insert(sector: u64, data: &[u8]) {
+    if data.len() != SECTOR_SIZE {
+        return;
+    }
+    let slot = (sector as usize) % CACHE_SECTORS;
+    unsafe {
+        let start = slot * SECTOR_SIZE;
+        BLOCK_CACHE[start..start + SECTOR_SIZE].copy_from_slice(data);
+        CACHE_TAGS[slot] = sector;
+    }
+}
+
+/// Insert multiple consecutive sectors into cache
+fn cache_insert_range(start_sector: u64, data: &[u8], count: usize) {
+    for i in 0..count {
+        let sector = start_sector + i as u64;
+        let offset = i * SECTOR_SIZE;
+        if offset + SECTOR_SIZE <= data.len() {
+            cache_insert(sector, &data[offset..offset + SECTOR_SIZE]);
+        }
+    }
+}
+
+/// Invalidate cache entries for a range of sectors (for write consistency)
+fn cache_invalidate_range(start_sector: u64, count: usize) {
+    for i in 0..count {
+        let sector = start_sector + i as u64;
+        let slot = (sector as usize) % CACHE_SECTORS;
+        unsafe {
+            if CACHE_TAGS[slot] == sector {
+                CACHE_TAGS[slot] = u64::MAX;
+            }
+        }
+    }
+}
 
 /// Convert a virtual address to physical address for DMA
 #[inline]
@@ -65,6 +208,7 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
     }
 
     // Main server loop
+    let mut read_count = 0u32;
     loop {
         // Wait for message
         let recv = ipc::recv(TASK_ANY);
@@ -73,41 +217,67 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
 
         match msg.tag {
             BLK_READ => {
+                read_count += 1;
                 // BLK_READ: data[0] = sector, data[1] = count, data[2] = shm_id
                 let sector = msg.data[0];
                 let count = msg.data[1] as usize;
                 let shm_id = msg.data[2];
                 let total_bytes = count * SECTOR_SIZE;
 
-                // Check if request fits in bounce buffer
-                if total_bytes > 4096 {
+                // Check if request fits in bounce buffer (now 128KB)
+                if total_bytes > 131072 {
                     let reply = Message::new(ERR_INVAL as u64, [0; 4]);
                     ipc::reply(&reply);
                     continue;
                 }
 
-                // Map the shared memory buffer for copying
-                let buf_addr = shm::map(shm_id, 0);
-                if buf_addr < 0 {
-                    let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+                // Get cached SHM mapping (avoids map/unmap overhead)
+                let buf_addr = match get_or_map_shm(shm_id) {
+                    Some(addr) => addr,
+                    None => {
+                        let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+                        ipc::reply(&reply);
+                        continue;
+                    }
+                };
+
+                let shm_buf = unsafe {
+                    core::slice::from_raw_parts_mut(buf_addr as *mut u8, total_bytes)
+                };
+
+                // Try to satisfy request from block cache first
+                let mut all_cached = true;
+                for i in 0..count {
+                    let sec = sector + i as u64;
+                    if let Some(cached_data) = cache_lookup(sec) {
+                        let offset = i * SECTOR_SIZE;
+                        shm_buf[offset..offset + SECTOR_SIZE].copy_from_slice(cached_data);
+                    } else {
+                        all_cached = false;
+                        break;
+                    }
+                }
+
+                if all_cached {
+                    // All sectors were in cache - no disk I/O needed
+                    let reply = Message::new(total_bytes as u64, [0; 4]);
                     ipc::reply(&reply);
                     continue;
                 }
 
-                // Read into bounce buffer (which has known physical address)
+                // Cache miss - read from disk into bounce buffer
                 let bounce = unsafe { &mut BOUNCE_BUF[..total_bytes] };
                 let result = unsafe { BLOCK_DEV.read(sector, bounce) };
 
-                // If successful, copy from bounce buffer to SHM
+                // If successful, copy from bounce buffer to SHM and update cache
                 if result >= 0 {
-                    let shm_buf = unsafe {
-                        core::slice::from_raw_parts_mut(buf_addr as *mut u8, total_bytes)
-                    };
                     shm_buf.copy_from_slice(bounce);
+
+                    // Update block cache with the data we just read
+                    cache_insert_range(sector, bounce, count);
                 }
 
-                // Unmap shared memory
-                shm::unmap(shm_id);
+                // Note: SHM stays mapped in cache for reuse
 
                 // Send reply
                 let reply = if result >= 0 {
@@ -125,20 +295,22 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
                 let shm_id = msg.data[2];
                 let total_bytes = count * SECTOR_SIZE;
 
-                // Check if request fits in bounce buffer
-                if total_bytes > 4096 {
+                // Check if request fits in bounce buffer (now 128KB)
+                if total_bytes > 131072 {
                     let reply = Message::new(ERR_INVAL as u64, [0; 4]);
                     ipc::reply(&reply);
                     continue;
                 }
 
-                // Map the shared memory buffer
-                let buf_addr = shm::map(shm_id, 0);
-                if buf_addr < 0 {
-                    let reply = Message::new(ERR_INVAL as u64, [0; 4]);
-                    ipc::reply(&reply);
-                    continue;
-                }
+                // Get cached SHM mapping (avoids map/unmap overhead)
+                let buf_addr = match get_or_map_shm(shm_id) {
+                    Some(addr) => addr,
+                    None => {
+                        let reply = Message::new(ERR_INVAL as u64, [0; 4]);
+                        ipc::reply(&reply);
+                        continue;
+                    }
+                };
 
                 // Copy from SHM to bounce buffer
                 let shm_buf = unsafe {
@@ -150,8 +322,12 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
                 // Write from bounce buffer
                 let result = unsafe { BLOCK_DEV.write(sector, bounce) };
 
-                // Unmap shared memory
-                shm::unmap(shm_id);
+                // Invalidate cache for written sectors to maintain consistency
+                if result >= 0 {
+                    cache_invalidate_range(sector, count);
+                }
+
+                // Note: SHM stays mapped in cache for reuse
 
                 // Send reply
                 let reply = if result >= 0 {

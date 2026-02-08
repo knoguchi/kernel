@@ -142,6 +142,10 @@ pub unsafe fn init_and_enable(print_fn: impl Fn(&str, u64)) {
     sctlr |= SCTLR_M;  // Enable MMU
     sctlr |= SCTLR_C;  // Enable data cache
     sctlr |= SCTLR_I;  // Enable instruction cache
+    // Disable alignment checking (helps with some unaligned accesses)
+    sctlr &= !SCTLR_A;   // Disable alignment check for EL1
+    sctlr &= !SCTLR_SA;  // Disable stack alignment check for EL1
+    sctlr &= !SCTLR_SA0; // Disable stack alignment check for EL0
     write_sctlr_el1(sctlr);
 
     // Final instruction barrier
@@ -150,7 +154,10 @@ pub unsafe fn init_and_enable(print_fn: impl Fn(&str, u64)) {
 
 // SCTLR_EL1 bits
 const SCTLR_M: u64 = 1 << 0;  // MMU enable
+const SCTLR_A: u64 = 1 << 1;  // Alignment check enable for EL1
 const SCTLR_C: u64 = 1 << 2;  // Data cache enable
+const SCTLR_SA: u64 = 1 << 3; // Stack alignment check enable for EL1
+const SCTLR_SA0: u64 = 1 << 4; // Stack alignment check enable for EL0
 const SCTLR_I: u64 = 1 << 12; // Instruction cache enable
 
 // System register access functions

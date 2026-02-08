@@ -78,4 +78,25 @@ impl ExceptionContext {
     pub fn is_write_fault(&self) -> bool {
         (self.esr & (1 << 6)) != 0
     }
+
+    /// Check if this is a translation fault (page not mapped)
+    /// These are the faults that can be handled by demand paging
+    /// DFSC 0x04-0x07: Translation faults at levels 0-3
+    pub fn is_translation_fault(&self) -> bool {
+        let dfsc = self.fault_status_code();
+        dfsc >= 0x04 && dfsc <= 0x07
+    }
+
+    /// Check if this is an alignment fault
+    /// DFSC 0x21: Alignment fault
+    pub fn is_alignment_fault(&self) -> bool {
+        self.fault_status_code() == 0x21
+    }
+
+    /// Check if this is a permission fault
+    /// DFSC 0x0C-0x0F: Permission faults at levels 0-3
+    pub fn is_permission_fault(&self) -> bool {
+        let dfsc = self.fault_status_code();
+        dfsc >= 0x0C && dfsc <= 0x0F
+    }
 }

@@ -29,6 +29,9 @@ const UART_FR: *const u32 = (UART_BASE + 0x018) as *const u32;
 /// TX FIFO full flag
 const UART_FR_TXFF: u32 = 1 << 5;
 
+/// RX FIFO empty flag
+const UART_FR_RXFE: u32 = 1 << 4;
+
 /// Write a single character to UART
 fn uart_putc(c: u8) {
     unsafe {
@@ -53,6 +56,77 @@ fn uart_print(s: &str) {
     for c in s.bytes() {
         uart_putc(c);
     }
+}
+
+/// Check if there's data available to read
+fn uart_has_data() -> bool {
+    unsafe { (*UART_FR & UART_FR_RXFE) == 0 }
+}
+
+/// Read a single character from UART (non-blocking, returns None if no data)
+fn uart_getc() -> Option<u8> {
+    unsafe {
+        if (*UART_FR & UART_FR_RXFE) != 0 {
+            return None; // RX FIFO empty
+        }
+        Some(*UART_DR)
+    }
+}
+
+/// Read from UART into buffer (blocking until at least 1 byte or newline)
+fn uart_read(buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0;
+
+    // Block until we get at least one character
+    loop {
+        if let Some(c) = uart_getc() {
+            // Echo the character back
+            uart_putc(c);
+
+            // Handle backspace
+            if c == 0x7f || c == 0x08 {
+                if count > 0 {
+                    count -= 1;
+                    // Erase character on terminal
+                    uart_putc(0x08); // backspace
+                    uart_putc(b' '); // space
+                    uart_putc(0x08); // backspace
+                }
+                continue;
+            }
+
+            // Handle enter (CR or LF)
+            if c == b'\r' || c == b'\n' {
+                uart_putc(b'\n');
+                if count < buf.len() {
+                    buf[count] = b'\n';
+                    count += 1;
+                }
+                break;
+            }
+
+            // Store character
+            if count < buf.len() {
+                buf[count] = c;
+                count += 1;
+            }
+
+            // Buffer full
+            if count >= buf.len() {
+                break;
+            }
+        } else {
+            // No data - yield CPU briefly then retry
+            // (In a real system we'd use interrupts)
+            libkenix::syscall::yield_cpu();
+        }
+    }
+
+    count
 }
 
 // ============================================================================
@@ -131,7 +205,22 @@ fn main() -> ! {
         // Wait for a message from any task
         let recv = ipc::recv(TASK_ANY);
 
-        if recv.msg.tag == MSG_WRITE {
+        if recv.msg.tag == MSG_READ {
+            // MSG_READ: data[0] = max length to read
+            let max_len = recv.msg.data[0] as usize;
+            let max_len = if max_len > 24 { 24 } else { max_len };
+
+            // Read from UART into reply buffer
+            let mut reply = Message::new(0, [0, 0, 0, 0]);
+            let data_ptr = reply.data[1..].as_mut_ptr() as *mut u8;
+            let buf = unsafe { core::slice::from_raw_parts_mut(data_ptr, max_len) };
+
+            let bytes_read = uart_read(buf);
+            reply.tag = bytes_read as u64;
+            reply.data[0] = bytes_read as u64;
+
+            ipc::reply(&reply);
+        } else if recv.msg.tag == MSG_WRITE {
             // MSG_WRITE: data[0] = length, data[1-3] = inline string data (up to 24 bytes)
             let len = recv.msg.data[0] as usize;
             let len = if len > 24 { 24 } else { len };

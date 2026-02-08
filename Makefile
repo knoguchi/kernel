@@ -38,16 +38,6 @@ kernel: user
 	cd kernel && cargo +nightly build --release --target aarch64-kenix.json -Zbuild-std=core,alloc
 	cp target/aarch64-kenix/release/kenix-kernel kernel.elf
 
-run: all
-	$(QEMU) \
-		-M virt \
-		-cpu cortex-a72 \
-		-m 1G \
-		-bios $(OVMF) \
-		-drive format=raw,file=fat:rw:esp \
-		-nographic \
-		-serial mon:stdio
-
 disk: $(DISK_IMG)
 
 $(DISK_IMG):

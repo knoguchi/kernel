@@ -382,27 +382,8 @@ pub extern "C" fn kernel_main() -> ! {
     }
     println!();
 
-    // Create forktest task from ELF
-    println!("Creating forktest task...");
-    let forktest_start = unsafe { &__forktest_elf_start as *const u8 };
-    let forktest_end = unsafe { &__forktest_elf_end as *const u8 };
-    let forktest_size = forktest_end as usize - forktest_start as usize;
-    let forktest_data = unsafe { core::slice::from_raw_parts(forktest_start, forktest_size) };
-
-    println!("  Forktest ELF at {:#010x}, size {} bytes", forktest_start as usize, forktest_size);
-
-    if let Ok(elf_file) = elf::ElfFile::parse(forktest_data) {
-        println!("  Entry point: {:#010x}", elf_file.entry_point());
-    } else {
-        println!("  ERROR: Failed to parse forktest ELF for entry point!");
-    }
-
-    if let Some(id) = sched::create_user_task_from_elf("forktest", forktest_data) {
-        println!("  Created forktest task (id={}) - runs in EL0", id.0);
-    } else {
-        println!("  ERROR: Failed to create forktest task!");
-    }
-    println!();
+    // Forktest is now spawned by init, not created at kernel init time
+    // This avoids race conditions between init and forktest both using VFS
 
     // Start timer (10ms tick)
     timer::start(10);

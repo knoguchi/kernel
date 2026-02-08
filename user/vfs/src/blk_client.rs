@@ -45,8 +45,8 @@ impl BlkClient {
 
         self.capacity = msg.data[0];
 
-        // Allocate shared memory for transfers (4KB = 8 sectors)
-        let size = 4096;
+        // Allocate shared memory for transfers (128KB = 256 sectors)
+        let size = 131072;
         let shm_id = shm::create(size);
         if shm_id < 0 {
             return false;

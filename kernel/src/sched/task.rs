@@ -232,6 +232,10 @@ impl PendingSyscall {
     pub const fn is_none(&self) -> bool {
         matches!(self, PendingSyscall::None)
     }
+
+    pub const fn is_execve(&self) -> bool {
+        matches!(self, PendingSyscall::ExecveOpen { .. } | PendingSyscall::ExecveRead { .. })
+    }
 }
 
 /// Task state
@@ -412,6 +416,10 @@ pub struct Task {
     pub signal_handlers: [u64; 32],
     /// Pointer to write 0 on thread exit (for futex wakeup)
     pub clear_child_tid: usize,
+    /// Cached SHM ID for file I/O (avoids per-read allocation)
+    pub io_shm_id: Option<usize>,
+    /// Size of the cached I/O SHM region
+    pub io_shm_size: usize,
 }
 
 impl Task {
@@ -450,6 +458,8 @@ impl Task {
             signal_pending: 0,
             signal_handlers: [0; 32],
             clear_child_tid: 0,
+            io_shm_id: None,
+            io_shm_size: 0,
         }
     }
 

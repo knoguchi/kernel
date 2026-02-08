@@ -480,6 +480,7 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
         task.ipc = task::IpcState::empty(); // Reset IPC state for reused slots
+        task.mmap_state = crate::mmap::MmapState::new(); // Reset mmap state
         task.init_stdio(); // Initialize stdin/stdout/stderr
 
         // Calculate kernel stack top (16-byte aligned)
@@ -514,8 +515,8 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
     Some(task_id)
 }
 
-/// Maximum number of code frames per user task (512KB max code size)
-const MAX_CODE_FRAMES: usize = 128;
+/// Maximum number of code frames per user task (2MB max code size for BusyBox)
+const MAX_CODE_FRAMES: usize = 512;
 
 /// Create a user-mode task from an ELF binary
 ///
@@ -593,13 +594,14 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     let phys_base_2mb = first_frame; // first_frame IS the 2MB block base
     let first_frame_offset = 0; // Always 0 now
 
-    // Zero only the range we'll use for code (up to max_vaddr to ensure .bss is zeroed)
+    // Zero the entire 2MB block (ensures .bss is zeroed)
     unsafe {
-        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, max_vaddr);
+        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, BLOCK_SIZE_2MB);
     }
 
     // Copy all segments directly into the 2MB physical block
-    // The ELF is linked at virtual address `vaddr`, which maps to `phys_base_2mb.0 + vaddr`
+    // The segment at virtual address `vaddr` is placed at physical offset `vaddr - block_base`
+    // since we'll map virtual block_base -> physical phys_base_2mb
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
         let filesz = phdr.p_filesz as usize;
@@ -611,8 +613,9 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         // Get segment data from ELF
         let segment_data = elf.segment_data(phdr).ok()?;
 
-        // Calculate destination physical address
-        let dest_paddr = phys_base_2mb.0 + vaddr;
+        // Calculate destination physical address relative to the 2MB block base
+        let offset_in_block = vaddr - block_base;
+        let dest_paddr = phys_base_2mb.0 + offset_in_block;
 
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -633,10 +636,10 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     // need to write to global variables. Using RWX is less secure but necessary.
     let flags = PageFlags::user_code_data();
 
-    // Map the 2MB block at virtual address 0
-    // The code will be at virtual address first_frame_offset within this block
+    // Map the 2MB block at the correct virtual address (block_base)
+    // Linux binaries are typically linked at 0x400000 (4MB), not 0
     unsafe {
-        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+        if !addr_space.map_2mb(block_base, phys_base_2mb, flags) {
             return None;
         }
     }
@@ -647,20 +650,119 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     let stack_phys_base_2mb = stack_frame; // first_frame IS the 2MB block base
 
     unsafe {
-        // Zero the first page of the stack
-        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        // Zero the entire 2MB stack block
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, BLOCK_SIZE_2MB);
         if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return None;
         }
     }
 
-    // User stack pointer: top of the allocated 2MB region (minus alignment)
-    let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
-
-    // The ELF is linked at 0, and we copied it starting at first_frame_offset.
-    // The user entry point should be just the ELF's specified entry point, as the
-    // virtual address 0 is mapped to the physical 2MB block base.
+    // Get the ELF entry point
     let user_entry_point = elf.entry_point() as usize;
+
+    // Set up the user stack with Linux ABI (argc, argv, envp, auxv)
+    // Stack layout (growing downward):
+    // [top of 2MB] random_bytes(16) | "busybox\0" | padding | auxv[] | envp[] | argv[] | argc
+    // SP points to argc
+
+    let stack_virt_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB;
+    let stack_phys_top = stack_phys_base_2mb.0 + BLOCK_SIZE_2MB;
+
+    // Calculate physical address from virtual offset
+    let virt_to_phys = |vaddr: usize| -> usize {
+        stack_phys_base_2mb.0 + (vaddr - USER_STACK_VADDR_BASE)
+    };
+
+    // Start from top of stack and work down
+    let mut sp = stack_virt_top;
+
+    unsafe {
+        // 1. Random bytes at top (for AT_RANDOM) - 16 bytes
+        sp -= 16;
+        let random_vaddr = sp;
+        let random_paddr = virt_to_phys(sp);
+        // Use simple pseudo-random values (task_id based)
+        let random_ptr = random_paddr as *mut u64;
+        *random_ptr = 0xDEADBEEF12345678u64;
+        *random_ptr.add(1) = 0xCAFEBABE87654321u64;
+
+        // 2. Program name string "busybox"
+        sp -= 16; // "busybox\0" padded to 16 bytes
+        let prog_name_vaddr = sp;
+        let prog_name_paddr = virt_to_phys(sp);
+        // Use "sh" as argv[0] so BusyBox runs the shell applet
+        let prog_name = b"sh\0";
+        core::ptr::copy_nonoverlapping(prog_name.as_ptr(), prog_name_paddr as *mut u8, prog_name.len());
+
+        // 3. Align to 16 bytes
+        sp = sp & !15;
+
+        // 4. Set up auxiliary vector (auxv)
+        // Each entry is two u64s: type and value
+        // Linux auxv types
+        const AT_NULL: u64 = 0;
+        const AT_PHDR: u64 = 3;    // Program header address
+        const AT_PHENT: u64 = 4;   // Program header entry size
+        const AT_PHNUM: u64 = 5;   // Number of program headers
+        const AT_PAGESZ: u64 = 6;  // Page size
+        const AT_ENTRY: u64 = 9;   // Entry point
+        const AT_UID: u64 = 11;
+        const AT_EUID: u64 = 12;
+        const AT_GID: u64 = 13;
+        const AT_EGID: u64 = 14;
+        const AT_RANDOM: u64 = 25; // Random bytes pointer
+
+        // Get ELF header info for auxv
+        let phdr_addr = block_base + elf.header().e_phoff as usize;
+        let phent = elf.header().e_phentsize as u64;
+        let phnum = elf.header().e_phnum as u64;
+
+        // Build auxv array - AT_NULL must be LAST (highest address after writing)
+        // We write in reverse order, so AT_NULL at the end of array goes to highest address
+        let auxv: [(u64, u64); 11] = [
+            (AT_PHDR, phdr_addr as u64),
+            (AT_PHENT, phent),
+            (AT_PHNUM, phnum),
+            (AT_PAGESZ, 4096),
+            (AT_ENTRY, user_entry_point as u64),
+            (AT_UID, 0),
+            (AT_EUID, 0),
+            (AT_GID, 0),
+            (AT_EGID, 0),
+            (AT_RANDOM, random_vaddr as u64),
+            (AT_NULL, 0),  // Must be last - terminates the auxv array
+        ];
+
+        // Write auxv (each entry is 16 bytes)
+        for (at_type, at_val) in auxv.iter().rev() {
+            sp -= 16;
+            let ptr = virt_to_phys(sp) as *mut u64;
+            *ptr = *at_type;
+            *ptr.add(1) = *at_val;
+        }
+
+        // 5. envp[] = { NULL }
+        sp -= 8;
+        *(virt_to_phys(sp) as *mut u64) = 0;
+
+        // 6. argv[] = { prog_name, NULL }
+        sp -= 8;
+        *(virt_to_phys(sp) as *mut u64) = 0; // NULL terminator
+        sp -= 8;
+        *(virt_to_phys(sp) as *mut u64) = prog_name_vaddr as u64;
+
+        // 7. argc = 1
+        sp -= 8;
+        *(virt_to_phys(sp) as *mut u64) = 1;
+    }
+
+    // Final stack pointer points to argc
+    let user_stack_top = sp;
+
+    // Note: For Linux binaries (block_base >= 2MB), we don't pre-map heap.
+    // musl will use mmap and brk to manage memory dynamically.
+    // The mmap region starts at 0x100000 (MMAP_BASE) and mmap page fault
+    // handler will allocate pages on demand.
 
     // Allocate kernel stack for syscalls/interrupts
     let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
@@ -687,6 +789,10 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         task.time_slice = DEFAULT_TIME_SLICE;
         task.next = None;
         task.ipc = task::IpcState::empty(); // Reset IPC state for reused slots
+        task.mmap_state = crate::mmap::MmapState::new(); // Reset mmap state
+        // Set heap_brk to end of ELF segments (page-aligned) for musl/Linux compatibility
+        // Linux brk starts at the end of the data segment, not at a fixed address
+        task.heap_brk = (max_vaddr + 0xfff) & !0xfff;
         task.init_stdio(); // Initialize stdin/stdout/stderr
 
         // Calculate kernel stack top (16-byte aligned)
@@ -1564,20 +1670,22 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
         None => return Err(-12), // ENOMEM - couldn't create address space
     };
 
-    // Map code at 0 (ELF is typically linked at address 0 for simplicity)
+    // Map code at the 2MB-aligned virtual address where the ELF expects to be loaded
+    // Linux binaries are typically linked at 0x400000 (4MB), not 0
+    // Use user_code_data (RWX) since the 2MB block contains both code and writable data
+    let virt_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
     unsafe {
-        if !new_addr_space.map_2mb(0, phys_base_2mb, PageFlags::user_code()) {
+        if !new_addr_space.map_2mb(virt_base, phys_base_2mb, PageFlags::user_code_data()) {
             return Err(-12); // ENOMEM
         }
     }
 
-    // Allocate a separate stack frame
-    let stack_frame = match mm::frame::alloc_frames_in_2mb_block(16) {
+    // Allocate a separate 2MB stack block
+    let stack_frame = match mm::frame::alloc_frames_in_2mb_block(512) {
         Some(frame) => frame,
         None => return Err(-12), // ENOMEM
     };
     let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let user_stack_top = USER_STACK_VADDR_BASE + (16 * 4096);
 
     // Map stack at USER_STACK_VADDR_BASE
     unsafe {
@@ -1586,11 +1694,97 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
         }
     }
 
-    // Update the task, preserving what POSIX requires
+    // Set up the user stack with Linux ABI (argc, argv, envp, auxv)
+    let stack_virt_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB;
+
+    // Calculate physical address from virtual offset
+    let virt_to_phys = |vaddr: usize| -> usize {
+        stack_phys_base_2mb.0 + (vaddr - USER_STACK_VADDR_BASE)
+    };
+
+    // Start from top of stack and work down
+    let mut sp = stack_virt_top;
+
+    unsafe {
+        // 1. Random bytes at top (for AT_RANDOM) - 16 bytes
+        sp -= 16;
+        let random_vaddr = sp;
+        let random_paddr = virt_to_phys(sp);
+        let random_ptr = random_paddr as *mut u64;
+        *random_ptr = 0xDEADBEEF12345678u64;
+        *random_ptr.add(1) = 0xCAFEBABE87654321u64;
+
+        // 2. Program name string "sh"
+        sp -= 16;
+        let prog_name_vaddr = sp;
+        let prog_name_paddr = virt_to_phys(sp);
+        let prog_name = b"sh\0";
+        core::ptr::copy_nonoverlapping(prog_name.as_ptr(), prog_name_paddr as *mut u8, prog_name.len());
+
+        // 3. Align to 16 bytes
+        sp = sp & !15;
+
+        // 4. Set up auxiliary vector (auxv)
+        const AT_NULL: u64 = 0;
+        const AT_PHDR: u64 = 3;
+        const AT_PHENT: u64 = 4;
+        const AT_PHNUM: u64 = 5;
+        const AT_PAGESZ: u64 = 6;
+        const AT_ENTRY: u64 = 9;
+        const AT_UID: u64 = 11;
+        const AT_EUID: u64 = 12;
+        const AT_GID: u64 = 13;
+        const AT_EGID: u64 = 14;
+        const AT_RANDOM: u64 = 25;
+
+        // Get ELF header info for auxv
+        let elf_header = &*(elf_data.as_ptr() as *const crate::elf::Elf64Header);
+        let phdr_addr = virt_base + elf_header.e_phoff as usize;
+        let phent = elf_header.e_phentsize as u64;
+        let phnum = elf_header.e_phnum as u64;
+
+        let auxv: [(u64, u64); 11] = [
+            (AT_PHDR, phdr_addr as u64),
+            (AT_PHENT, phent),
+            (AT_PHNUM, phnum),
+            (AT_PAGESZ, 4096),
+            (AT_ENTRY, entry_point as u64),
+            (AT_UID, 0),
+            (AT_EUID, 0),
+            (AT_GID, 0),
+            (AT_EGID, 0),
+            (AT_RANDOM, random_vaddr as u64),
+            (AT_NULL, 0),
+        ];
+
+        // Write auxv (each entry is 16 bytes)
+        for (at_type, at_val) in auxv.iter().rev() {
+            sp -= 16;
+            let ptr = virt_to_phys(sp) as *mut u64;
+            *ptr = *at_type;
+            *ptr.add(1) = *at_val;
+        }
+
+        // 5. envp[] = { NULL }
+        sp -= 8;
+        *(virt_to_phys(sp) as *mut u64) = 0;
+
+        // 6. argv[] = { prog_name, NULL }
+        sp -= 8;
+        *(virt_to_phys(sp) as *mut u64) = 0;
+        sp -= 8;
+        *(virt_to_phys(sp) as *mut u64) = prog_name_vaddr as u64;
+
+        // 7. argc = 1
+        sp -= 8;
+        *(virt_to_phys(sp) as *mut u64) = 1;
+    }
+
+    // Update the task
     unsafe {
         let task = &mut TASKS[task_id.0];
 
-        // Replace old address space with new one. The old one will be dropped automatically.
+        // Replace old address space with new one
         task.addr_space = Some(new_addr_space);
         task.entry_point = entry_point;
 
@@ -1616,10 +1810,9 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
         core::ptr::write_bytes(ctx, 0, 1);
         (*ctx).elr = entry_point as u64;
         (*ctx).spsr = 0x000; // EL0, interrupts enabled
-        (*ctx).sp = user_stack_top as u64;
+        (*ctx).sp = sp as u64; // SP points to argc on the stack
 
         task.kernel_stack_top = ctx_addr;
-
     }
 
     Ok(entry_point)

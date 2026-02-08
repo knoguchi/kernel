@@ -110,6 +110,100 @@ fn test_mmap() {
     }
 }
 
+/// Test musl/BusyBox mmap pattern: mmap(PROT_NONE) + mprotect
+fn test_mmap_mprotect() {
+    console::print("[TEST] mmap+mprotect: ");
+
+    // Mimic musl's malloc pattern: mmap with PROT_NONE, then mprotect
+    let addr = syscall::mmap(
+        0,      // addr hint (NULL = let kernel choose)
+        8192,   // size (same as BusyBox)
+        0,      // PROT_NONE (no permissions initially)
+        syscall::MAP_PRIVATE | syscall::MAP_ANONYMOUS,
+        -1,     // fd
+        0,      // offset
+    );
+
+    console::print("mmap returned 0x");
+    for i in (0..8).rev() {
+        print_hex_byte(((addr as u64 >> (i * 8)) & 0xff) as u8);
+    }
+    console::print(" ");
+
+    if addr < 0 || addr as usize == syscall::MAP_FAILED {
+        console::print("FAILED\n");
+        return;
+    }
+
+    // Now call mprotect to add read/write permissions (like musl does)
+    let ret = syscall::mprotect(
+        addr as usize,
+        8192,
+        syscall::PROT_READ | syscall::PROT_WRITE,
+    );
+
+    if ret == 0 {
+        console::print("mprotect OK ");
+
+        // Now try to access the memory
+        let ptr = addr as *mut u8;
+        unsafe {
+            *ptr = 0x42;
+            if *ptr == 0x42 {
+                console::print("access OK\n");
+            } else {
+                console::print("access FAILED\n");
+            }
+        }
+    } else {
+        console::print("mprotect FAILED (ret=");
+        print_num(ret as i64);
+        console::print(")\n");
+    }
+
+    // Cleanup
+    syscall::munmap(addr as usize, 8192);
+}
+
+/// Test using musl-style inline assembly to make syscall
+/// This mimics EXACTLY how musl makes the mmap syscall
+fn test_musl_style_mmap() {
+    console::print("[TEST] musl-style mmap: ");
+
+    // Use the exact inline assembly pattern that musl uses
+    let result: isize;
+    unsafe {
+        // musl-style syscall: same constraints as musl's syscall_arch.h
+        // Note: musl uses "svc 0" without immediate, we use "svc #0" with
+        core::arch::asm!(
+            "svc #0",
+            inlateout("x0") 0usize => result,  // addr = 0, returns result
+            in("x1") 8192usize,                 // len = 8192
+            in("x2") 0u64,                      // prot = PROT_NONE
+            in("x3") 0x22u64,                   // flags = MAP_PRIVATE | MAP_ANONYMOUS
+            in("x4") -1i64 as u64,              // fd = -1
+            in("x5") 0u64,                      // offset = 0
+            in("x8") 222u64,                    // syscall number = mmap
+            options(nostack),
+            // Mark condition codes as clobbered (like musl's "cc")
+            // Note: Rust doesn't have a direct equivalent, but nostack should suffice
+        );
+    }
+
+    console::print("returned 0x");
+    for i in (0..8).rev() {
+        print_hex_byte(((result as u64 >> (i * 8)) & 0xff) as u8);
+    }
+
+    if result > 0 {
+        console::print(" OK\n");
+        // Clean up
+        syscall::munmap(result as usize, 8192);
+    } else {
+        console::print(" FAILED\n");
+    }
+}
+
 fn test_stat() {
     console::print("[TEST] fstat: ");
 
@@ -453,6 +547,8 @@ pub extern "C" fn _start() -> ! {
     test_clock_gettime();
     test_stat();
     test_mmap();
+    test_mmap_mprotect();  // Test musl/BusyBox pattern
+    test_musl_style_mmap();  // Test musl-style inline assembly
     test_signal();
     test_fork_wait();
 

@@ -14,6 +14,7 @@ use crate::sched;
 use alloc::vec::Vec;
 
 /// MMAP memory region: 0x10000000 - 0x30000000 (256MB to 768MB)
+/// Starts high to avoid conflicting with brk heap (which is below 16MB)
 pub const MMAP_BASE: usize = 0x1000_0000;
 pub const MMAP_END: usize = 0x3000_0000;
 
@@ -223,19 +224,28 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
         None => return -1,
     };
 
+    crate::println!("[mmap_fault] task={} addr={:#x}", current_id.0, fault_addr);
+
     unsafe {
         let task = &mut TASKS[current_id.0];
 
         // Find the mmap region containing this address
         let region = match task.mmap_state.find_region_mut(fault_addr) {
             Some(r) => r,
-            None => return -1, // No region for this address
+            None => {
+                crate::println!("[mmap_fault] no region found");
+                return -1; // No region for this address
+            }
         };
+
+        crate::println!("[mmap_fault] region vaddr={:#x} len={} prot={:#x}",
+            region.vaddr, region.len, region.prot);
 
         let page_idx = region.page_index(fault_addr);
 
         // Check if page is already allocated (shouldn't happen, but safety check)
         if region.is_page_allocated(page_idx) {
+            crate::println!("[mmap_fault] page {} already allocated!", page_idx);
             return -1; // Page already allocated, shouldn't fault
         }
 
@@ -268,6 +278,9 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
         // Mark the page as allocated
         region.mark_allocated(page_idx);
 
+        crate::println!("[mmap_fault] mapped page vaddr={:#x} paddr={:#x} flags={{w={},x={},u={}}}",
+            page_vaddr, phys_frame.0, page_flags.writable, page_flags.executable, page_flags.user);
+
         // Invalidate TLB for this address
         core::arch::asm!(
             "dsb ishst",
@@ -293,6 +306,10 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
 ///
 /// Returns: Virtual address of mapping, or MAP_FAILED on error
 pub fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> i64 {
+    let task_id = sched::current().map(|id| id.0).unwrap_or(999);
+    crate::println!("[mmap] task={} addr={:#x} len={} prot={:#x} flags={:#x}",
+        task_id, addr, len, prot, flags);
+
     // Validate arguments
     if len == 0 {
         return -22; // EINVAL
@@ -349,6 +366,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset:
         let region = MmapRegion::new(vaddr, aligned_len, prot, flags);
         task.mmap_state.add_region(region);
 
+        crate::println!("[mmap] OK: vaddr={:#x}", vaddr);
         vaddr as i64
     }
 }
@@ -423,11 +441,90 @@ pub fn sys_munmap(addr: usize, len: usize) -> i64 {
     }
 }
 
-/// System call: mprotect (stub)
+/// System call: mprotect
 ///
-/// For now, just return success without actually changing permissions.
-pub fn sys_mprotect(_addr: usize, _len: usize, _prot: u32) -> i64 {
-    // Stub implementation - just return success
-    // A real implementation would update page table permissions
-    0
+/// Change protection on a region of memory.
+/// addr must be page-aligned.
+pub fn sys_mprotect(addr: usize, len: usize, prot: u32) -> i64 {
+    // Validate arguments
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return -22; // EINVAL - addr must be page-aligned
+    }
+    if len == 0 {
+        return 0; // Success for zero length
+    }
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return -22,
+    };
+
+    let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let end_addr = addr + aligned_len;
+
+    crate::println!("[mprotect] task={} addr={:#x} len={} prot={:#x}",
+        current_id.0, addr, len, prot);
+
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+
+        // Find regions that overlap with this range and update their prot
+        let mut found = false;
+        for region in task.mmap_state.regions.iter_mut() {
+            let region_end = region.vaddr + region.len;
+
+            // Check if region overlaps with the mprotect range
+            if region.vaddr < end_addr && region_end > addr {
+                found = true;
+                let old_prot = region.prot;
+
+                // Update the region's protection
+                // NOTE: For already-allocated pages, this won't update the page table entries.
+                // Those pages would need to be unmapped and re-faulted to get new permissions.
+                // For demand-paging (musl's typical pattern), pages are allocated AFTER mprotect,
+                // so this works correctly.
+                region.prot = prot;
+
+                crate::println!("[mprotect] region {:#x} prot {:#x} -> {:#x}",
+                    region.vaddr, old_prot, prot);
+
+                // For already-allocated pages that need permission changes,
+                // unmap them so they'll be re-faulted with correct permissions
+                if old_prot != prot {
+                    let addr_space = match &mut task.addr_space {
+                        Some(aspace) => aspace,
+                        None => return -22,
+                    };
+
+                    let num_pages = region.len / PAGE_SIZE;
+                    for i in 0..num_pages {
+                        if region.allocated_pages[i] {
+                            let page_vaddr = region.vaddr + i * PAGE_SIZE;
+                            // Unmap the page - it will be re-allocated on next access
+                            addr_space.unmap_4kb(page_vaddr);
+                            region.allocated_pages[i] = false;
+                            crate::println!("[mprotect] unmapped page {:#x} for re-fault", page_vaddr);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found {
+            // No region found for this address - could be brk/stack region
+            // Return success anyway for compatibility (Linux behavior)
+            crate::println!("[mprotect] no mmap region found, returning success");
+        }
+
+        // Invalidate TLB
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+
+        0
+    }
 }

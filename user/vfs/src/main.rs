@@ -356,8 +356,78 @@ static mut FAT32_FILES: [Fat32OpenFile; MAX_OPEN_FILES] = [const { Fat32OpenFile
 
 /// Sector buffer for disk reads
 static mut SECTOR_BUF: [u8; SECTOR_SIZE] = [0; SECTOR_SIZE];
-/// Cluster buffer for FAT32 reads (up to 8 sectors)
-static mut CLUSTER_BUF: [u8; 4096] = [0; 4096];
+/// Cluster buffer for FAT32 reads (128KB for bulk transfers)
+static mut CLUSTER_BUF: [u8; 131072] = [0; 131072];
+
+// ============================================================================
+// FAT Sector Cache - LRU cache for FAT table lookups
+// ============================================================================
+
+/// Number of FAT sectors to cache (16 sectors = 8KB, covers 2048 cluster entries)
+const FAT_CACHE_SIZE: usize = 16;
+
+/// Cached FAT sector data
+static mut FAT_CACHE: [[u8; SECTOR_SIZE]; FAT_CACHE_SIZE] = [[0; SECTOR_SIZE]; FAT_CACHE_SIZE];
+/// FAT sector numbers cached (-1 = slot empty)
+static mut FAT_CACHE_TAGS: [i64; FAT_CACHE_SIZE] = [-1; FAT_CACHE_SIZE];
+/// LRU counters for cache replacement
+static mut FAT_CACHE_LRU: [u8; FAT_CACHE_SIZE] = [0; FAT_CACHE_SIZE];
+
+/// Get cached FAT sector or load it
+fn fat_cache_get(sector: u32) -> Option<&'static [u8; SECTOR_SIZE]> {
+    unsafe {
+        let sector_i64 = sector as i64;
+
+        // Check if already cached
+        for i in 0..FAT_CACHE_SIZE {
+            if FAT_CACHE_TAGS[i] == sector_i64 {
+                // Cache hit - update LRU
+                let old_lru = FAT_CACHE_LRU[i];
+                for j in 0..FAT_CACHE_SIZE {
+                    if FAT_CACHE_LRU[j] > old_lru {
+                        FAT_CACHE_LRU[j] -= 1;
+                    }
+                }
+                FAT_CACHE_LRU[i] = (FAT_CACHE_SIZE - 1) as u8;
+                return Some(&FAT_CACHE[i]);
+            }
+        }
+
+        // Cache miss - find LRU slot
+        let mut min_lru = u8::MAX;
+        let mut slot = 0;
+        for i in 0..FAT_CACHE_SIZE {
+            if FAT_CACHE_TAGS[i] < 0 {
+                // Empty slot
+                slot = i;
+                break;
+            }
+            if FAT_CACHE_LRU[i] < min_lru {
+                min_lru = FAT_CACHE_LRU[i];
+                slot = i;
+            }
+        }
+
+        // Read sector into cache slot
+        let bytes_read = BLK_CLIENT.read(sector as u64, &mut FAT_CACHE[slot]);
+        if bytes_read < SECTOR_SIZE as isize {
+            return None;
+        }
+
+        // Update cache metadata
+        FAT_CACHE_TAGS[slot] = sector_i64;
+
+        // Update LRU counters
+        for j in 0..FAT_CACHE_SIZE {
+            if FAT_CACHE_TAGS[j] >= 0 && j != slot {
+                FAT_CACHE_LRU[j] = FAT_CACHE_LRU[j].saturating_sub(1);
+            }
+        }
+        FAT_CACHE_LRU[slot] = (FAT_CACHE_SIZE - 1) as u8;
+
+        Some(&FAT_CACHE[slot])
+    }
+}
 
 /// Check if a path starts with /disk/
 fn is_disk_path(path: &[u8], path_len: usize) -> bool {
@@ -466,7 +536,41 @@ fn fat32_lookup(path: &[u8], path_len: usize) -> Result<DirEntry, i64> {
     }
 }
 
-/// Read data from a FAT32 file
+/// Read FAT entry with LRU caching (reduces IPC calls significantly)
+fn fat32_get_next_cluster(fs: &Fat32, cluster: u32) -> Option<u32> {
+    let fat_sector = fs.fat_sector_for_cluster(cluster);
+    let fat_offset = fs.fat_offset_for_cluster(cluster);
+
+    // Get FAT sector from LRU cache
+    let cache_data = fat_cache_get(fat_sector)?;
+
+    let next_cluster = FatTable::read_entry(cache_data, fat_offset);
+    if FatTable::is_end_of_chain(next_cluster) {
+        None
+    } else {
+        Some(next_cluster)
+    }
+}
+
+/// Count consecutive clusters starting from given cluster (for bulk reads)
+fn fat32_count_consecutive_clusters(fs: &Fat32, start_cluster: u32, max_clusters: usize) -> usize {
+    let mut count = 1;
+    let mut current = start_cluster;
+
+    while count < max_clusters {
+        match fat32_get_next_cluster(fs, current) {
+            Some(next) if next == current + 1 => {
+                // Consecutive cluster
+                current = next;
+                count += 1;
+            }
+            _ => break,
+        }
+    }
+    count
+}
+
+/// Read data from a FAT32 file (optimized with bulk reads and FAT caching)
 fn fat32_read(file_idx: usize, buf: &mut [u8]) -> Result<usize, i64> {
     let fs = unsafe {
         match &FAT32_FS {
@@ -481,50 +585,54 @@ fn fat32_read(file_idx: usize, buf: &mut [u8]) -> Result<usize, i64> {
     }
 
     let cluster_size = (fs.sectors_per_cluster as usize) * SECTOR_SIZE;
+    let max_clusters_per_read = 131072 / cluster_size; // Max clusters that fit in 128KB buffer
     let mut total_read = 0usize;
 
     while total_read < buf.len() && !file.is_eof() {
-        // Read current cluster
+        // Count how many consecutive clusters we can read at once
+        let clusters_needed = ((buf.len() - total_read) + cluster_size - 1) / cluster_size;
+        let clusters_to_read = fat32_count_consecutive_clusters(
+            fs,
+            file.current_cluster,
+            clusters_needed.min(max_clusters_per_read),
+        );
+
+        // Read multiple clusters in one IPC call
+        let read_size = clusters_to_read * cluster_size;
         let sector = fs.cluster_to_sector(file.current_cluster);
         let bytes_read = unsafe {
-            BLK_CLIENT.read(sector as u64, &mut CLUSTER_BUF[..cluster_size])
+            BLK_CLIENT.read(sector as u64, &mut CLUSTER_BUF[..read_size])
         };
-        if bytes_read < cluster_size as isize {
+        if bytes_read < read_size as isize {
             return Err(ERR_IO);
         }
 
-        // Calculate how much we can read from this cluster
-        let offset_in_cluster = file.cluster_offset as usize;
-        let remaining_in_cluster = cluster_size - offset_in_cluster;
-        let remaining_in_file = file.remaining() as usize;
-        let remaining_in_buf = buf.len() - total_read;
-        let to_read = remaining_in_cluster.min(remaining_in_file).min(remaining_in_buf);
+        // Process all clusters we read
+        let mut cluster_idx = 0;
+        while cluster_idx < clusters_to_read && total_read < buf.len() && !file.is_eof() {
+            let offset_in_cluster = file.cluster_offset as usize;
+            let cluster_start = cluster_idx * cluster_size;
+            let remaining_in_cluster = cluster_size - offset_in_cluster;
+            let remaining_in_file = file.remaining() as usize;
+            let remaining_in_buf = buf.len() - total_read;
+            let to_read = remaining_in_cluster.min(remaining_in_file).min(remaining_in_buf);
 
-        // Copy data
-        buf[total_read..total_read + to_read]
-            .copy_from_slice(unsafe { &CLUSTER_BUF[offset_in_cluster..offset_in_cluster + to_read] });
+            // Copy data from buffer
+            buf[total_read..total_read + to_read].copy_from_slice(unsafe {
+                &CLUSTER_BUF[cluster_start + offset_in_cluster..cluster_start + offset_in_cluster + to_read]
+            });
 
-        total_read += to_read;
-        file.advance(to_read as u32, cluster_size as u32);
+            total_read += to_read;
+            file.advance(to_read as u32, cluster_size as u32);
 
-        // If we need more data and haven't reached EOF, get next cluster
-        if file.cluster_offset == 0 && !file.is_eof() {
-            // Read FAT to get next cluster
-            let fat_sector = fs.fat_sector_for_cluster(file.current_cluster);
-            let fat_offset = fs.fat_offset_for_cluster(file.current_cluster);
-
-            let bytes_read = unsafe {
-                BLK_CLIENT.read(fat_sector as u64, &mut SECTOR_BUF)
-            };
-            if bytes_read < SECTOR_SIZE as isize {
-                return Err(ERR_IO);
+            // Move to next cluster if needed
+            if file.cluster_offset == 0 && !file.is_eof() {
+                match fat32_get_next_cluster(fs, file.current_cluster) {
+                    Some(next) => file.set_current_cluster(next),
+                    None => break,
+                }
             }
-
-            let next_cluster = FatTable::read_entry(unsafe { &SECTOR_BUF }, fat_offset);
-            if FatTable::is_end_of_chain(next_cluster) {
-                break;
-            }
-            file.set_current_cluster(next_cluster);
+            cluster_idx += 1;
         }
     }
 

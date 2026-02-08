@@ -54,7 +54,7 @@ pub const SYS_SHMGRANT: u16 = 13;   // Grant another task access to shared memor
 pub const SYS_YIELD: u16 = 0;    // Voluntarily yield CPU
 pub const SYS_NOTIFY: u16 = 7;   // Send async notification
 pub const SYS_WAIT_NOTIFY: u16 = 8;  // Wait for notification
-pub const SYS_GETPID: u16 = 20;  // Get current task ID
+pub const SYS_GETPID: u16 = 172;  // Get current task ID (Linux number)
 pub const SYS_SPAWN: u16 = 21;   // Create new task from ELF
 pub const SYS_FORK: u16 = 22;    // Create child process (fork)
 
@@ -76,8 +76,11 @@ pub const SYS_READ: u16 = 63;    // Read from file descriptor
 pub const SYS_WRITE: u16 = 64;   // Write to file descriptor
 pub const SYS_READV: u16 = 65;   // Read into multiple buffers (scatter)
 pub const SYS_WRITEV: u16 = 66;  // Write from multiple buffers (gather)
+pub const SYS_PPOLL: u16 = 73;   // Poll with timeout
+pub const SYS_FSTATAT: u16 = 79; // Get file status at directory
 pub const SYS_FSTAT: u16 = 80;   // Get file status
 pub const SYS_EXIT: u16 = 93;    // Terminate process
+pub const SYS_EXIT_GROUP: u16 = 94;  // Terminate all threads (same as exit for single-threaded)
 pub const SYS_WAIT4: u16 = 260;  // Wait for child process
 pub const SYS_BRK: u16 = 214;    // Change data segment size
 pub const SYS_EXECVE: u16 = 221; // Execute program
@@ -100,14 +103,31 @@ pub const SYS_MPROTECT: u16 = 226;  // Change memory protection
 
 // musl startup syscalls
 pub const SYS_SET_TID_ADDRESS: u16 = 96;  // Set pointer for thread ID on exit
+pub const SYS_FUTEX: u16 = 98;            // Fast userspace mutex
+pub const SYS_SET_ROBUST_LIST: u16 = 99;  // Set robust futex list
 pub const SYS_PRLIMIT64: u16 = 261;       // Get/set resource limits
 pub const SYS_GETRANDOM: u16 = 278;       // Get random bytes
+
+// Additional syscalls
+pub const SYS_READLINKAT: u16 = 78;       // Read symbolic link
+pub const SYS_PRCTL: u16 = 167;           // Process control
+pub const SYS_GETPPID: u16 = 173;         // Get parent process ID
+pub const SYS_GETTID: u16 = 178;          // Get thread ID
+pub const SYS_RSEQ: u16 = 293;            // Restartable sequence (stub)
 
 // Signal syscalls
 pub const SYS_KILL: u16 = 129;              // Send signal to process
 pub const SYS_RT_SIGACTION: u16 = 134;      // Set signal handler
 pub const SYS_RT_SIGPROCMASK: u16 = 135;    // Set signal mask
 pub const SYS_RT_SIGRETURN: u16 = 139;      // Return from signal handler
+
+// Scheduler syscalls
+pub const SYS_SCHED_SETAFFINITY: u16 = 122; // Set CPU affinity mask
+pub const SYS_SCHED_GETAFFINITY: u16 = 123; // Get CPU affinity mask
+
+// Process group syscalls
+pub const SYS_SETPGID: u16 = 154;           // Set process group ID
+pub const SYS_GETPGID: u16 = 155;           // Get process group ID
 
 /// Error codes (Linux-compatible)
 pub const ESUCCESS: i64 = 0;   // Success
@@ -135,6 +155,8 @@ pub const ENAMETOOLONG: i64 = -36;  // File name too long
 pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
     // AArch64 Linux syscall convention: syscall number in x8
     let syscall_num = ctx.gpr[8] as u16;
+
+    let task_id = sched::current().map(|t| t.0).unwrap_or(999);
 
     match syscall_num {
         SYS_YIELD => {
@@ -311,6 +333,21 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             let statbuf = ctx.gpr[1] as usize;
             ctx.gpr[0] = sys_fstat(ctx, fd, statbuf) as u64;
         }
+        // SYS_FSTATAT: x0=dirfd, x1=pathname, x2=statbuf, x3=flags → returns 0 or error
+        SYS_FSTATAT => {
+            let dirfd = ctx.gpr[0] as i32;
+            let pathname = ctx.gpr[1] as usize;
+            let statbuf = ctx.gpr[2] as usize;
+            let _flags = ctx.gpr[3] as u32;
+            ctx.gpr[0] = sys_fstatat(ctx, dirfd, pathname, statbuf) as u64;
+        }
+        // SYS_PPOLL: x0=fds, x1=nfds, x2=tmo_p, x3=sigmask → returns count or 0
+        SYS_PPOLL => {
+            // ppoll(fds, nfds, tmo_p, sigmask) - poll with timeout
+            let fds = ctx.gpr[0] as usize;
+            let nfds = ctx.gpr[1] as usize;
+            ctx.gpr[0] = sys_ppoll(fds, nfds) as u64;
+        }
 
         // SYS_GETDENTS64: x0=fd, x1=dirent_buf, x2=count → returns bytes read
         SYS_GETDENTS64 => {
@@ -342,6 +379,13 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         }
 
         SYS_EXIT => {
+            let exit_code = ctx.gpr[0] as i32;
+            sys_exit_with_switch(ctx, exit_code);
+            // Never returns
+        }
+
+        SYS_EXIT_GROUP => {
+            // For single-threaded processes, exit_group is the same as exit
             let exit_code = ctx.gpr[0] as i32;
             sys_exit_with_switch(ctx, exit_code);
             // Never returns
@@ -430,7 +474,8 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             // Check if this is anonymous or file-backed mmap
             if (flags & mmap::MAP_ANONYMOUS) != 0 || fd == -1 {
                 // Anonymous mmap - handle synchronously
-                ctx.gpr[0] = mmap::sys_mmap(addr, len, prot, flags, fd, offset) as u64;
+                let result = mmap::sys_mmap(addr, len, prot, flags, fd, offset);
+                ctx.gpr[0] = result as u64;
             } else {
                 // File-backed mmap - requires IPC to VFS
                 sys_mmap_file(ctx, addr, len, prot, flags, fd, offset);
@@ -481,6 +526,52 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             let _tidptr = ctx.gpr[0] as usize;
             ctx.gpr[0] = sys_set_tid_address(_tidptr) as u64;
         }
+        SYS_FUTEX => {
+            // futex(uaddr, op, val, ...) - fast userspace mutex
+            // For single-threaded programs, we can stub this
+            let _uaddr = ctx.gpr[0] as usize;
+            let op = ctx.gpr[1] as i32;
+            let _val = ctx.gpr[2] as u32;
+            // FUTEX_WAIT = 0, FUTEX_WAKE = 1
+            // For single-threaded: WAIT returns immediately, WAKE returns 0
+            if op & 0x7f == 0 {
+                // FUTEX_WAIT - return EAGAIN (no wait needed in single-threaded)
+                ctx.gpr[0] = EAGAIN as u64;
+            } else {
+                // FUTEX_WAKE and others - return 0 (no threads to wake)
+                ctx.gpr[0] = 0;
+            }
+        }
+        SYS_SET_ROBUST_LIST => {
+            // set_robust_list(head, len) - register robust futex list
+            // For single-threaded programs, just return success
+            ctx.gpr[0] = 0;
+        }
+        SYS_RSEQ => {
+            // rseq(rseq, rseq_len, flags, sig) - restartable sequence
+            // Return ENOSYS - not implemented (programs can work without it)
+            ctx.gpr[0] = ENOSYS as u64;
+        }
+        SYS_READLINKAT => {
+            // readlinkat(dirfd, pathname, buf, bufsiz) - read symbolic link
+            // For now, return EINVAL (no symlink support)
+            ctx.gpr[0] = EINVAL as u64;
+        }
+        SYS_PRCTL => {
+            // prctl(option, arg2, arg3, arg4, arg5) - process control
+            // Return 0 for most options (stub)
+            ctx.gpr[0] = 0;
+        }
+        SYS_GETPPID => {
+            // getppid() - get parent process ID
+            // For now, return 1 (init is parent)
+            ctx.gpr[0] = 1;
+        }
+        SYS_GETTID => {
+            // gettid() - get thread ID (same as PID for single-threaded)
+            let tid = sched::current().map(|t| t.0).unwrap_or(0);
+            ctx.gpr[0] = tid as u64;
+        }
         SYS_PRLIMIT64 => {
             // prlimit64(pid, resource, new_limit, old_limit) - get/set resource limits
             let pid = ctx.gpr[0] as i32;
@@ -496,12 +587,56 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             let flags = ctx.gpr[2] as u32;
             ctx.gpr[0] = sys_getrandom(buf, buflen, flags) as u64;
         }
+        SYS_GETPGID => {
+            // getpgid(pid) - get process group ID
+            // pid=0 means current process
+            let pid = ctx.gpr[0] as i32;
+            if pid == 0 {
+                // Return current task's process group (same as task ID for now)
+                let tid = sched::current().map(|t| t.0).unwrap_or(1);
+                ctx.gpr[0] = tid as u64;
+            } else {
+                // For other pids, just return the pid as its pgid (each process is its own group)
+                ctx.gpr[0] = pid as u64;
+            }
+        }
+        SYS_SETPGID => {
+            // setpgid(pid, pgid) - set process group ID (stub - just return success)
+            ctx.gpr[0] = 0;
+        }
+        SYS_SCHED_GETAFFINITY => {
+            // sched_getaffinity(pid, cpusetsize, mask) - get CPU affinity mask
+            // Return a mask with CPU 0 set (single-CPU system)
+            let cpusetsize = ctx.gpr[1] as usize;
+            let mask = ctx.gpr[2] as *mut u8;
+            if cpusetsize > 0 && !mask.is_null() {
+                unsafe {
+                    // Set bit 0 (CPU 0) in the mask
+                    core::ptr::write_volatile(mask, 0x01);
+                    // Zero out the rest
+                    for i in 1..cpusetsize.min(128) {
+                        core::ptr::write_volatile(mask.add(i), 0);
+                    }
+                }
+                ctx.gpr[0] = cpusetsize.min(128) as u64;
+            } else {
+                ctx.gpr[0] = EINVAL as u64;
+            }
+        }
+        SYS_SCHED_SETAFFINITY => {
+            // sched_setaffinity(pid, cpusetsize, mask) - set CPU affinity (stub - return success)
+            ctx.gpr[0] = 0;
+        }
 
         _ => {
-            // Unknown syscall
+            // Log unknown syscall for debugging
+            let task_id = sched::current().map(|t| t.0).unwrap_or(0);
+            println!("[syscall] task {} unknown syscall {} (x0={:#x}, x1={:#x}, x2={:#x})",
+                task_id, syscall_num, ctx.gpr[0], ctx.gpr[1], ctx.gpr[2]);
             ctx.gpr[0] = ENOSYS as u64;
         }
     }
+
 }
 
 /// SYS_YIELD - Voluntarily yield the CPU to another task
@@ -550,32 +685,81 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
     // Handle based on fd kind
     match fd_entry.kind {
         FdKind::Console => {
-            // Read from UART (blocking single character for now)
+            // Read from UART with line buffering and echo (for interactive shell)
             const UART_BASE: usize = 0x0900_0000;
             const UART_DR: usize = 0x000;
             const UART_FR: usize = 0x018;
             const UART_FR_RXFE: u32 = 1 << 4; // RX FIFO empty
+            const UART_FR_TXFF: u32 = 1 << 5; // TX FIFO full
 
             if len == 0 {
                 return 0;
             }
 
-            // Wait for a character to be available
-            unsafe {
+            let mut count = 0usize;
+
+            // Helper to write a char to UART (echo)
+            let uart_putc = |c: u8| unsafe {
                 let fr = (UART_BASE + UART_FR) as *const u32;
-                while (core::ptr::read_volatile(fr) & UART_FR_RXFE) != 0 {
+                while (core::ptr::read_volatile(fr) & UART_FR_TXFF) != 0 {
                     core::hint::spin_loop();
                 }
+                let dr = (UART_BASE + UART_DR) as *mut u8;
+                core::ptr::write_volatile(dr, c);
+            };
 
-                // Read the character
+            // Read until newline or buffer full
+            unsafe {
+                let fr = (UART_BASE + UART_FR) as *const u32;
                 let dr = (UART_BASE + UART_DR) as *const u8;
-                let c = core::ptr::read_volatile(dr);
 
-                // Write to user buffer
-                core::ptr::write_volatile(buf as *mut u8, c);
+                loop {
+                    // Wait for a character
+                    while (core::ptr::read_volatile(fr) & UART_FR_RXFE) != 0 {
+                        // Yield to other tasks while waiting
+                        sched::yield_cpu();
+                    }
+
+                    let c = core::ptr::read_volatile(dr);
+
+                    // Handle backspace/delete
+                    if c == 0x7f || c == 0x08 {
+                        if count > 0 {
+                            count -= 1;
+                            uart_putc(0x08); // backspace
+                            uart_putc(b' '); // space
+                            uart_putc(0x08); // backspace
+                        }
+                        continue;
+                    }
+
+                    // Echo the character
+                    uart_putc(c);
+
+                    // Handle enter (CR or LF)
+                    if c == b'\r' || c == b'\n' {
+                        uart_putc(b'\n');
+                        if count < len {
+                            core::ptr::write_volatile((buf + count) as *mut u8, b'\n');
+                            count += 1;
+                        }
+                        break;
+                    }
+
+                    // Store character in buffer
+                    if count < len {
+                        core::ptr::write_volatile((buf + count) as *mut u8, c);
+                        count += 1;
+                    }
+
+                    // Buffer full
+                    if count >= len {
+                        break;
+                    }
+                }
             }
 
-            1 // Read one character
+            count as i64
         }
         FdKind::PipeRead => {
             let pipe_id = fd_entry.handle;
@@ -619,29 +803,60 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
                 return 0;
             }
 
-            // Create SHM for data transfer
-            let shm_id_i64 = shm::sys_shmcreate(len);
-            if shm_id_i64 < 0 {
-                return ENOMEM;
-            }
-            let shm_id = shm_id_i64 as usize;
+            // Reuse cached SHM for file I/O to avoid per-read allocation overhead
+            // We use a larger SHM (128KB) to support bulk transfers
+            const IO_SHM_SIZE: usize = 131072;
+            let actual_len = len.min(IO_SHM_SIZE);
 
-            // Grant VFS access to SHM
-            shm::sys_shmgrant(shm_id, VFS_TID.0);
+            let shm_id = unsafe {
+                let task = &mut TASKS[current_id.0];
 
-            // Set up pending syscall
+                // Check if we have a cached SHM that's large enough
+                if let Some(cached_id) = task.io_shm_id {
+                    if task.io_shm_size >= actual_len {
+                        cached_id
+                    } else {
+                        // Existing SHM too small, destroy and create larger one
+                        shm::sys_shmdestroy(cached_id);
+                        task.io_shm_id = None;
+                        task.io_shm_size = 0;
+
+                        // Create new larger SHM
+                        let new_id = shm::sys_shmcreate(IO_SHM_SIZE);
+                        if new_id < 0 {
+                            return ENOMEM;
+                        }
+                        shm::sys_shmgrant(new_id as usize, VFS_TID.0);
+                        task.io_shm_id = Some(new_id as usize);
+                        task.io_shm_size = IO_SHM_SIZE;
+                        new_id as usize
+                    }
+                } else {
+                    // No cached SHM, create one
+                    let new_id = shm::sys_shmcreate(IO_SHM_SIZE);
+                    if new_id < 0 {
+                        return ENOMEM;
+                    }
+                    shm::sys_shmgrant(new_id as usize, VFS_TID.0);
+                    task.io_shm_id = Some(new_id as usize);
+                    task.io_shm_size = IO_SHM_SIZE;
+                    new_id as usize
+                }
+            };
+
+            // Set up pending syscall (don't destroy SHM on completion - keep it cached)
             unsafe {
                 let task = &mut TASKS[current_id.0];
                 task.pending_syscall = PendingSyscall::VfsRead {
                     user_buf: buf,
-                    max_len: len,
+                    max_len: actual_len,
                     shm_id,
                 };
             }
 
             // Send VFS_READ_SHM request
             // data[0] = vnode, data[1] = shm_id, data[2] = shm_offset, data[3] = max_len
-            let msg = Message::new(VFS_READ_SHM, [vnode, shm_id as u64, 0, len as u64]);
+            let msg = Message::new(VFS_READ_SHM, [vnode, shm_id as u64, 0, actual_len as u64]);
             ipc::sys_call(ctx, VFS_TID, msg);
 
             0 // Placeholder
@@ -965,8 +1180,8 @@ fn sys_fork(ctx: &mut ExceptionContext) -> i64 {
     child_id.0 as i64
 }
 
-/// Maximum ELF size we'll accept for spawn (1MB should be plenty for user programs)
-const MAX_ELF_SIZE: usize = 1024 * 1024;
+/// Maximum ELF size we'll accept for spawn (2MB to support BusyBox)
+const MAX_ELF_SIZE: usize = 2 * 1024 * 1024;
 
 /// SYS_SPAWN - Create a new task from an ELF image
 ///
@@ -1748,6 +1963,188 @@ fn sys_fstat(ctx: &mut ExceptionContext, fd: usize, statbuf: usize) -> i64 {
     0 // Placeholder
 }
 
+/// SYS_FSTATAT - Get file status at directory
+///
+/// For now this is a simplified implementation that returns ENOENT.
+/// A full implementation would use VFS to stat the path.
+fn sys_fstatat(_ctx: &mut ExceptionContext, dirfd: i32, pathname: usize, _statbuf: usize) -> i64 {
+    // Read the pathname for debugging
+    let path_bytes: [u8; 256] = unsafe {
+        let mut buf = [0u8; 256];
+        for i in 0..255 {
+            let c = core::ptr::read_volatile((pathname + i) as *const u8);
+            if c == 0 {
+                break;
+            }
+            buf[i] = c;
+        }
+        buf
+    };
+
+    // Find null terminator
+    let path_len = path_bytes.iter().position(|&c| c == 0).unwrap_or(256);
+    let _path = core::str::from_utf8(&path_bytes[..path_len]).unwrap_or("<invalid>");
+
+    // AT_FDCWD = -100, meaning use current working directory
+    let _at_fdcwd = dirfd == -100;
+
+    // For now, return ENOENT for most paths
+    // This allows BusyBox to continue without blocking
+    ENOENT
+}
+
+/// Poll event flags
+const POLLIN: u16 = 0x0001;   // Data ready to read
+const POLLOUT: u16 = 0x0004;  // Writing won't block
+const POLLERR: u16 = 0x0008;  // Error condition
+const POLLHUP: u16 = 0x0010;  // Hang up
+
+/// struct pollfd layout:
+/// fd: i32 (offset 0)
+/// events: i16 (offset 4)
+/// revents: i16 (offset 6)
+const POLLFD_SIZE: usize = 8;
+
+/// SYS_PPOLL - Poll file descriptors with timeout
+///
+/// Waits for events on file descriptors. For console (stdin), blocks until
+/// UART has data available.
+fn sys_ppoll(fds: usize, nfds: usize) -> i64 {
+    use sched::task::{TASKS, FdKind};
+
+    const UART_BASE: usize = 0x0900_0000;
+    const UART_FR: usize = 0x018;
+    const UART_FR_RXFE: u32 = 1 << 4; // RX FIFO empty
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    let mut ready_count = 0i64;
+    let mut polling_stdin = false;
+
+    // First pass: check which fds are ready and if we're polling stdin
+    for i in 0..nfds {
+        let pollfd_addr = fds + i * POLLFD_SIZE;
+        let fd = unsafe { core::ptr::read_volatile(pollfd_addr as *const i32) };
+        let events = unsafe { core::ptr::read_volatile((pollfd_addr + 4) as *const i16) } as u16;
+        let revents_ptr = (pollfd_addr + 6) as *mut u16;
+
+        if fd < 0 {
+            unsafe { core::ptr::write_volatile(revents_ptr, 0); }
+            continue;
+        }
+
+        // Check fd type
+        let fd_kind = unsafe {
+            let task = &TASKS[current_id.0];
+            if (fd as usize) < sched::MAX_FDS {
+                task.fds[fd as usize].kind
+            } else {
+                FdKind::None
+            }
+        };
+
+        let mut revents: u16 = 0;
+
+        match fd_kind {
+            FdKind::Console => {
+                // Check if UART has data
+                let has_data = unsafe {
+                    let fr = (UART_BASE + UART_FR) as *const u32;
+                    (core::ptr::read_volatile(fr) & UART_FR_RXFE) == 0
+                };
+
+                if has_data && (events & POLLIN) != 0 {
+                    revents |= POLLIN;
+                    ready_count += 1;
+                } else if (events & POLLIN) != 0 {
+                    polling_stdin = true;
+                }
+
+                // Console is always writable
+                if (events & POLLOUT) != 0 {
+                    revents |= POLLOUT;
+                    if revents == POLLOUT {
+                        ready_count += 1;
+                    }
+                }
+            }
+            FdKind::PipeRead => {
+                // Pipes: check if data available (simplified - just report ready)
+                if (events & POLLIN) != 0 {
+                    // For now, don't report ready to avoid busy-loop
+                    // A real implementation would check pipe buffer
+                }
+            }
+            FdKind::PipeWrite => {
+                if (events & POLLOUT) != 0 {
+                    revents |= POLLOUT;
+                    ready_count += 1;
+                }
+            }
+            FdKind::File => {
+                // Regular files are always ready
+                if (events & POLLIN) != 0 {
+                    revents |= POLLIN;
+                    ready_count += 1;
+                }
+                if (events & POLLOUT) != 0 {
+                    revents |= POLLOUT;
+                    if (revents & POLLIN) == 0 {
+                        ready_count += 1;
+                    }
+                }
+            }
+            FdKind::None => {
+                revents |= POLLERR;
+            }
+        }
+
+        unsafe { core::ptr::write_volatile(revents_ptr, revents); }
+    }
+
+    // If something is ready, return immediately
+    if ready_count > 0 {
+        return ready_count;
+    }
+
+    // If polling stdin and nothing ready, block waiting for UART input
+    if polling_stdin {
+        // Busy-wait for UART data (simple blocking)
+        // A real implementation would put the task to sleep
+        loop {
+            let has_data = unsafe {
+                let fr = (UART_BASE + UART_FR) as *const u32;
+                (core::ptr::read_volatile(fr) & UART_FR_RXFE) == 0
+            };
+
+            if has_data {
+                // Update revents for stdin
+                for i in 0..nfds {
+                    let pollfd_addr = fds + i * POLLFD_SIZE;
+                    let fd = unsafe { core::ptr::read_volatile(pollfd_addr as *const i32) };
+                    let events = unsafe { core::ptr::read_volatile((pollfd_addr + 4) as *const i16) } as u16;
+
+                    if fd == 0 && (events & POLLIN) != 0 {
+                        let revents_ptr = (pollfd_addr + 6) as *mut u16;
+                        unsafe { core::ptr::write_volatile(revents_ptr, POLLIN); }
+                        return 1;
+                    }
+                }
+                return 1;
+            }
+
+            // Yield to other tasks while waiting
+            core::hint::spin_loop();
+        }
+    }
+
+    // Nothing to poll, return 0
+    0
+}
+
 /// Linux dirent64 structure
 #[repr(C)]
 pub struct Dirent64 {
@@ -1891,7 +2288,12 @@ fn sys_wait4(ctx: &mut ExceptionContext, pid: i32, wstatus: usize, options: u32)
 }
 
 /// SYS_BRK - Change data segment size
+///
+/// This implementation allocates and maps pages on demand when brk grows.
 fn sys_brk(addr: usize) -> i64 {
+    use crate::mm::frame::{alloc_frame, PAGE_SIZE};
+    use crate::mm::PageFlags;
+
     let current_id = match sched::current() {
         Some(id) => id,
         None => return ENOMEM,
@@ -1905,19 +2307,60 @@ fn sys_brk(addr: usize) -> i64 {
             return task.heap_brk as i64;
         }
 
-        // Don't allow shrinking below the default
-        if addr < sched::DEFAULT_HEAP_START {
+        // Don't allow shrinking below current heap start
+        // (heap_brk is initialized to end of ELF segments)
+        let heap_start = task.heap_brk.min(addr);
+
+        // Allow brk up to 16MB (well below mmap region at 0x10000000)
+        const BRK_LIMIT: usize = 0x0100_0000;
+        if addr >= BRK_LIMIT {
             return task.heap_brk as i64;
         }
 
-        // Don't allow growing into stack region (2MB)
-        if addr >= 0x0020_0000 {
-            return task.heap_brk as i64;
+        let old_brk = task.heap_brk;
+        let new_brk = addr;
+
+        // If growing, allocate and map new pages
+        if new_brk > old_brk {
+            let old_page = (old_brk + PAGE_SIZE - 1) / PAGE_SIZE;
+            let new_page = (new_brk + PAGE_SIZE - 1) / PAGE_SIZE;
+
+            // Map any new pages needed
+            for page_num in old_page..new_page {
+                let page_vaddr = page_num * PAGE_SIZE;
+
+                // Allocate a physical frame
+                let frame = match alloc_frame() {
+                    Some(f) => f,
+                    None => return task.heap_brk as i64,
+                };
+
+                // Zero the frame
+                core::ptr::write_bytes(frame.0 as *mut u8, 0, PAGE_SIZE);
+
+                // Map into the task's address space
+                let addr_space = match &mut task.addr_space {
+                    Some(aspace) => aspace,
+                    None => return task.heap_brk as i64,
+                };
+
+                if !addr_space.map_4kb(page_vaddr, frame, PageFlags::user_data()) {
+                    return task.heap_brk as i64;
+                }
+
+                // TLB invalidation
+                core::arch::asm!(
+                    "dsb ishst",
+                    "tlbi vaae1is, {0}",
+                    "dsb ish",
+                    "isb",
+                    in(reg) page_vaddr >> 12,
+                    options(nostack)
+                );
+            }
         }
 
         // Update brk
-        // Note: A proper implementation would allocate physical pages and map them
-        // For now we just track the value (memory was already mapped at task creation)
         task.heap_brk = addr;
         addr as i64
     }
@@ -2248,6 +2691,12 @@ pub fn check_and_deliver_signals(ctx: &mut ExceptionContext) {
         let deliverable = task.signal_pending & !task.signal_mask;
         if deliverable == 0 {
             return; // No signals to deliver
+        }
+
+        // Debug: log signal delivery for task 10+
+        if current_id.0 >= 10 {
+            println!("[sig{}] delivering signal, pending={:#x} mask={:#x} deliverable={:#x}",
+                current_id.0, task.signal_pending, task.signal_mask, deliverable);
         }
 
         // Find the lowest numbered signal

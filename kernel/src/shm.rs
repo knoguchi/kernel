@@ -18,8 +18,8 @@ use core::ptr;
 /// Maximum number of shared memory regions
 pub const MAX_SHM_REGIONS: usize = 64;
 
-/// Maximum pages per shared memory region (256 pages = 1MB max)
-const MAX_SHM_PAGES: usize = 256;
+/// Maximum pages per shared memory region (512 pages = 2MB max)
+const MAX_SHM_PAGES: usize = 512;
 
 /// Base virtual address for shared memory mappings
 /// This is in the user address space, after code and stack regions
@@ -463,6 +463,76 @@ pub fn sys_shmgrant(shm_id: usize, target_task: usize) -> i64 {
         }
 
         region.granted[target_task] = true;
+
+        SHM_OK
+    }
+}
+
+/// Destroy a shared memory region and free its resources
+///
+/// Unmaps from all tasks and frees the physical frames.
+/// Only the owner can destroy a region.
+///
+/// # Arguments
+/// * `shm_id` - Shared memory region ID
+///
+/// # Returns
+/// * 0 on success, negative error code on failure
+pub fn sys_shmdestroy(shm_id: usize) -> i64 {
+    let caller = match current() {
+        Some(id) => id,
+        None => return SHM_ERR_INVALID,
+    };
+
+    if shm_id >= MAX_SHM_REGIONS {
+        return SHM_ERR_INVALID;
+    }
+
+    unsafe {
+        let region = &mut SHM_REGIONS[shm_id];
+
+        if !region.in_use {
+            return SHM_ERR_INVALID;
+        }
+
+        // Only owner can destroy
+        if region.owner != caller {
+            return SHM_ERR_PERMISSION;
+        }
+
+        // Unmap from all tasks that have it mapped
+        for task_idx in 0..MAX_TASKS {
+            if let Some(vaddr) = region.mapped_vaddr[task_idx] {
+                let task = &mut TASKS[task_idx];
+                if task.state != TaskState::Free {
+                    if let Some(ref mut addr_space) = task.addr_space {
+                        for i in 0..region.num_frames {
+                            let page_vaddr = vaddr + i * PAGE_SIZE;
+                            addr_space.unmap_4kb(page_vaddr);
+                        }
+                    }
+                }
+                region.mapped_vaddr[task_idx] = None;
+            }
+        }
+
+        // Free physical frames
+        for i in 0..region.num_frames {
+            if let Some(frame) = region.frames[i] {
+                free_frame(frame);
+                region.frames[i] = None;
+            }
+        }
+
+        // Reset region
+        region.in_use = false;
+        region.num_frames = 0;
+        region.size = 0;
+        for i in 0..MAX_TASKS {
+            region.granted[i] = false;
+        }
+
+        invalidate_tlb();
 
         SHM_OK
     }
