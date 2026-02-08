@@ -44,6 +44,8 @@ $(DISK_IMG):
 	./scripts/create_disk.sh $(DISK_IMG) 32
 
 run-kernel: kernel $(DISK_IMG)
+	@stty_orig=$$(stty -g); \
+	stty raw -echo; \
 	$(QEMU) \
 		-M virt \
 		-cpu cortex-a72 \
@@ -55,7 +57,8 @@ run-kernel: kernel $(DISK_IMG)
 		-netdev user,id=net0 \
 		-kernel kernel.elf \
 		-nographic \
-		-serial mon:stdio
+		-serial mon:stdio; \
+	stty $$stty_orig
 
 clean:
 	rm -rf esp kernel.elf $(DISK_IMG)

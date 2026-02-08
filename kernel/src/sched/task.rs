@@ -207,6 +207,12 @@ pub enum PendingSyscall {
     ExecveOpen {
         /// SHM ID containing path (needs cleanup)
         shm_id: usize,
+        /// Argv data: concatenated null-terminated strings
+        argv_data: [u8; 1024],
+        /// Offsets to each argv string in argv_data
+        argv_offsets: [u16; 16],
+        /// Number of arguments
+        argc: usize,
     },
     /// Execve stage 2: waiting for VFS to read the executable file contents
     ExecveRead {
@@ -214,6 +220,12 @@ pub enum PendingSyscall {
         vnode: u64,
         /// SHM ID for file data transfer
         shm_id: usize,
+        /// Argv data: concatenated null-terminated strings
+        argv_data: [u8; 1024],
+        /// Offsets to each argv string in argv_data
+        argv_offsets: [u16; 16],
+        /// Number of arguments
+        argc: usize,
     },
     /// File-backed mmap: waiting for VFS to read file data into mmap region
     MmapFile {
@@ -414,6 +426,8 @@ pub struct Task {
     pub signal_pending: u64,
     /// Signal handlers (SIG_DFL=0, SIG_IGN=1, or handler address)
     pub signal_handlers: [u64; 32],
+    /// Signal restorers (trampoline addresses for sigreturn)
+    pub signal_restorers: [u64; 32],
     /// Pointer to write 0 on thread exit (for futex wakeup)
     pub clear_child_tid: usize,
     /// Cached SHM ID for file I/O (avoids per-read allocation)
@@ -457,6 +471,7 @@ impl Task {
             signal_mask: 0,
             signal_pending: 0,
             signal_handlers: [0; 32],
+            signal_restorers: [0; 32],
             clear_child_tid: 0,
             io_shm_id: None,
             io_shm_size: 0,

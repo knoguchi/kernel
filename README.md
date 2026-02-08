@@ -16,6 +16,10 @@ The kernel boots on QEMU virt and runs multiple user-space servers:
 alignment fault emulation for SIMD instructions, allowing unmodified musl-based
 binaries to run. Type commands at the `/ #` prompt.
 
+**Recent Fix (2026-02-08):** Fixed an IPC race condition where the second `ls` command
+would freeze. The bug was in `sys_recv` incorrectly waking senders using the `sys_call`
+(RPC) pattern, causing replies to be lost when VFS was busy.
+
 Tested features: IPC, shared memory, pipes, file operations, process spawn/execve,
 fork/wait, mmap/munmap (anonymous and file-backed), clock_gettime, signal delivery,
 writev/readv, FAT32 disk I/O, interactive shell (ppoll blocking on stdin).
@@ -68,14 +72,16 @@ make run-kernel
 === Kenix Init ===
 [vfs] Block device connected
 [vfs] FAT32 filesystem mounted at /disk/
-Running BusyBox from disk...
-Forking for busybox...
-execve busybox...
-busybox pid=8
-/ # echo hello
-hello
+--- Starting BusyBox Shell ---
+shell pid=7
+/ # export PATH=/disk/bin
+/ # ls
+disk       hello.txt  test.txt
+/ # ls /disk
+BIN        DATA       HELLO.TXT  TEST.TXT
+/ # cat /hello.txt
+Hello!
 / # exit
-busybox exited status=0
 
 === Init complete ===
 ```

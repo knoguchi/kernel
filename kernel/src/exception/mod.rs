@@ -1845,11 +1845,14 @@ extern "C" fn debug_before_restore(_ctx: &ExceptionContext) {
 extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
     if ctx.is_svc() {
         // System call from userspace
-        let syscall_num = ctx.svc_number();
-        syscall::handle_syscall(ctx, syscall_num);
+        let svc_imm = ctx.svc_number();
+        // AArch64 Linux convention: syscall number is in x8, not the svc immediate
+        let syscall_num = ctx.gpr[8] as u16;
+        syscall::handle_syscall(ctx, svc_imm);
 
         // Check for pending signals before returning to userspace
-        syscall::check_and_deliver_signals(ctx);
+        // Pass the syscall number so signal delivery can report it
+        syscall::check_and_deliver_signals_after_syscall(ctx, syscall_num);
 
     } else if ctx.is_data_abort() {
         let fault_addr = ctx.far as usize;
@@ -1893,8 +1896,9 @@ extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
             core::hint::spin_loop();
         }
     } else if ctx.is_instruction_abort() {
+        let task_id = crate::sched::current().map(|t| t.0).unwrap_or(999);
         exception_println!();
-        exception_println!("USER INSTRUCTION ABORT!");
+        exception_println!("USER INSTRUCTION ABORT! (task {})", task_id);
         exception_println!("Faulting address: {:#018x}", ctx.far);
         print_context(ctx);
 
@@ -1903,9 +1907,26 @@ extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
             core::hint::spin_loop();
         }
     } else {
+        // Check if this might be a page fault with unusual EC (EC=0 happens sometimes)
+        let fault_addr = ctx.far as usize;
+        if fault_addr >= mmap::MMAP_BASE && fault_addr < mmap::MMAP_END {
+            // Try to handle as page fault even though EC is unexpected
+            let result = mmap::handle_page_fault(fault_addr);
+            if result == 0 {
+                // Page allocated successfully, resume execution
+                return;
+            }
+        }
+
         exception_println!();
         exception_println!("USER SYNCHRONOUS EXCEPTION!");
         print_context(ctx);
+
+        // Print all registers to help debug
+        exception_println!("  x0={:#x} x1={:#x} x2={:#x} x3={:#x}",
+            ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]);
+        exception_println!("  x4={:#x} x5={:#x} x6={:#x} x7={:#x}",
+            ctx.gpr[4], ctx.gpr[5], ctx.gpr[6], ctx.gpr[7]);
 
         loop {
             core::hint::spin_loop();

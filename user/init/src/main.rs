@@ -126,11 +126,70 @@ fn main() -> ! {
     print("=== Kenix Init ===\n");
     print("Running BusyBox from disk...\n\n");
 
-    // Run busybox echo command
+    // Run busybox shell
     run_busybox_shell();
 
     print("\n=== Init complete ===\n");
     syscall::exit(0);
+}
+
+fn test_ls_twice() {
+    // Run test binary the first time (smaller than busybox)
+    print("--- First test run ---\n");
+    let pid1 = syscall::fork();
+    if pid1 == 0 {
+        let path = b"/disk/bin/test\0";
+        let argv: [*const u8; 2] = [b"test\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else if pid1 > 0 {
+        let (_, status) = syscall::waitpid(pid1 as i32, 0);
+        print("test 1 exited status=");
+        print_num(status as usize);
+        print("\n");
+    }
+
+    // Run test binary the second time - this may exhibit the same issue
+    print("\n--- Second test run ---\n");
+    let pid2 = syscall::fork();
+    if pid2 == 0 {
+        let path = b"/disk/bin/test\0";
+        let argv: [*const u8; 2] = [b"test\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else if pid2 > 0 {
+        let (_, status) = syscall::waitpid(pid2 as i32, 0);
+        print("test 2 exited status=");
+        print_num(status as usize);
+        print("\n");
+    }
+
+    // Run test binary a third time to really test
+    print("\n--- Third test run ---\n");
+    let pid3 = syscall::fork();
+    if pid3 == 0 {
+        let path = b"/disk/bin/test\0";
+        let argv: [*const u8; 2] = [b"test\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else if pid3 > 0 {
+        let (_, status) = syscall::waitpid(pid3 as i32, 0);
+        print("test 3 exited status=");
+        print_num(status as usize);
+        print("\n");
+    }
 }
 
 fn test_disk_execve() {
@@ -206,27 +265,12 @@ fn test_hello_execve() {
 }
 
 fn run_busybox_shell() {
-    // First test with small binary to verify VFS works
-    print("Testing /disk/bin/test...\n");
-    let test_pid = syscall::fork();
-    if test_pid == 0 {
-        let path = b"/disk/bin/test\0";
-        let argv: [*const u8; 2] = [b"test\0".as_ptr(), core::ptr::null()];
-        let envp: [*const u8; 1] = [core::ptr::null()];
-        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
-        print("execve test failed: ");
-        print_num((-result) as usize);
-        print("\n");
-        syscall::exit(1);
-    } else if test_pid > 0 {
-        let (_, status) = syscall::waitpid(test_pid as i32, 0);
-        print("test exited status=");
-        print_num(status as usize);
-        print("\n");
-    }
+    // Skip test binary - go straight to shell to save time
+    // Start interactive shell using /disk/bin/sh
+    // (sh is a copy of busybox, and busybox uses argv[0] to determine what to run)
+    print("\n--- Starting BusyBox Shell ---\n");
+    print("Type 'exit' to quit.\n\n");
 
-    // Now try busybox
-    print("Forking for busybox...\n");
     let shell_pid = syscall::fork();
     if shell_pid < 0 {
         print("Failed to fork: ");
@@ -234,27 +278,26 @@ fn run_busybox_shell() {
         print("\n");
         return;
     } else if shell_pid == 0 {
-        let busybox_path = b"/disk/bin/busybox\0";
-        let argv: [*const u8; 4] = [
-            b"busybox\0".as_ptr(),
-            b"echo\0".as_ptr(),
-            b"Hello\0".as_ptr(),
+        // Child: execve sh from disk
+        // Since kernel uses basename of path as argv[0], /disk/bin/sh -> "sh"
+        let sh_path = b"/disk/bin/sh\0";
+        let argv: [*const u8; 2] = [
+            b"sh\0".as_ptr(),
             core::ptr::null(),
         ];
         let envp: [*const u8; 1] = [core::ptr::null()];
-        print("execve busybox...\n");
-        let result = syscall::execve(busybox_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        let result = syscall::execve(sh_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
         print("execve failed: ");
         print_num((-result) as usize);
         print("\n");
         syscall::exit(1);
     } else {
-        print("busybox pid=");
+        print("shell pid=");
         print_num(shell_pid as usize);
         print("\n");
         let (wait_result, status) = syscall::waitpid(shell_pid as i32, 0);
         if wait_result >= 0 {
-            print("busybox exited status=");
+            print("\n[init] Shell exited with status=");
             print_num(status as usize);
             print("\n");
         }

@@ -56,7 +56,8 @@ pub const SYS_NOTIFY: u16 = 7;   // Send async notification
 pub const SYS_WAIT_NOTIFY: u16 = 8;  // Wait for notification
 pub const SYS_GETPID: u16 = 172;  // Get current task ID (Linux number)
 pub const SYS_SPAWN: u16 = 21;   // Create new task from ELF
-pub const SYS_FORK: u16 = 22;    // Create child process (fork)
+pub const SYS_FORK: u16 = 22;    // Create child process (fork) - Kenix number
+pub const SYS_CLONE: u16 = 220;  // Linux clone (treated as fork for now)
 
 /// Syscall numbers - IRQ handling
 pub const SYS_IRQ_REGISTER: u16 = 30;  // Register for IRQ handling
@@ -157,6 +158,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
     let syscall_num = ctx.gpr[8] as u16;
 
     let task_id = sched::current().map(|t| t.0).unwrap_or(999);
+    let _ = task_id; // Used for debugging
 
     match syscall_num {
         SYS_YIELD => {
@@ -402,6 +404,11 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         }
 
         SYS_FORK => {
+            ctx.gpr[0] = sys_fork(ctx) as u64;
+        }
+        SYS_CLONE => {
+            // clone(flags, stack, ptid, tls, ctid) - treat as fork for now
+            // musl's fork() calls clone(SIGCHLD, 0, ...) which is equivalent to fork
             ctx.gpr[0] = sys_fork(ctx) as u64;
         }
 
@@ -685,12 +692,11 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
     // Handle based on fd kind
     match fd_entry.kind {
         FdKind::Console => {
-            // Read from UART with line buffering and echo (for interactive shell)
+            // Read from UART - no echo here, let shell handle it
             const UART_BASE: usize = 0x0900_0000;
             const UART_DR: usize = 0x000;
             const UART_FR: usize = 0x018;
             const UART_FR_RXFE: u32 = 1 << 4; // RX FIFO empty
-            const UART_FR_TXFF: u32 = 1 << 5; // TX FIFO full
 
             if len == 0 {
                 return 0;
@@ -698,17 +704,7 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
 
             let mut count = 0usize;
 
-            // Helper to write a char to UART (echo)
-            let uart_putc = |c: u8| unsafe {
-                let fr = (UART_BASE + UART_FR) as *const u32;
-                while (core::ptr::read_volatile(fr) & UART_FR_TXFF) != 0 {
-                    core::hint::spin_loop();
-                }
-                let dr = (UART_BASE + UART_DR) as *mut u8;
-                core::ptr::write_volatile(dr, c);
-            };
-
-            // Read until newline or buffer full
+            // Read characters without echo - let shell handle echo
             unsafe {
                 let fr = (UART_BASE + UART_FR) as *const u32;
                 let dr = (UART_BASE + UART_DR) as *const u8;
@@ -722,29 +718,8 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
 
                     let c = core::ptr::read_volatile(dr);
 
-                    // Handle backspace/delete
-                    if c == 0x7f || c == 0x08 {
-                        if count > 0 {
-                            count -= 1;
-                            uart_putc(0x08); // backspace
-                            uart_putc(b' '); // space
-                            uart_putc(0x08); // backspace
-                        }
-                        continue;
-                    }
-
-                    // Echo the character
-                    uart_putc(c);
-
-                    // Handle enter (CR or LF)
-                    if c == b'\r' || c == b'\n' {
-                        uart_putc(b'\n');
-                        if count < len {
-                            core::ptr::write_volatile((buf + count) as *mut u8, b'\n');
-                            count += 1;
-                        }
-                        break;
-                    }
+                    // Convert CR to LF
+                    let c = if c == b'\r' { b'\n' } else { c };
 
                     // Store character in buffer
                     if count < len {
@@ -752,8 +727,8 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
                         count += 1;
                     }
 
-                    // Buffer full
-                    if count >= len {
+                    // Stop on newline or buffer full
+                    if c == b'\n' || count >= len {
                         break;
                     }
                 }
@@ -1679,26 +1654,94 @@ fn sys_mmap_file(ctx: &mut ExceptionContext, addr: usize, len: usize, prot: u32,
 ///
 /// Opens a file and returns a file descriptor.
 fn sys_open(ctx: &mut ExceptionContext, pathname: usize, flags: u32) -> i64 {
+    use sched::task::TASKS;
+
     let current_id = match sched::current() {
         Some(id) => id,
         None => return EBADF,
     };
 
     // Read pathname from user memory (max 255 chars)
-    let path_bytes = unsafe {
-        let mut len = 0;
-        while len < 255 {
-            let c = core::ptr::read_volatile((pathname + len) as *const u8);
+    let mut user_path = [0u8; 256];
+    let mut user_path_len = 0usize;
+    unsafe {
+        while user_path_len < 255 {
+            let c = core::ptr::read_volatile((pathname + user_path_len) as *const u8);
             if c == 0 {
                 break;
             }
-            len += 1;
+            user_path[user_path_len] = c;
+            user_path_len += 1;
         }
-        core::slice::from_raw_parts(pathname as *const u8, len)
+    }
+
+    if user_path_len == 0 {
+        return ENOENT;
+    }
+
+    // Resolve path: handle ".", "./" prefix, and relative paths
+    let mut resolved_path = [0u8; 256];
+    let resolved_len: usize;
+
+    // Strip "./" prefix from user path if present
+    let (effective_path, effective_len) = if user_path_len >= 2 && user_path[0] == b'.' && user_path[1] == b'/' {
+        // Skip "./" prefix
+        (&user_path[2..], user_path_len - 2)
+    } else {
+        (&user_path[..], user_path_len)
     };
 
-    if path_bytes.is_empty() {
-        return ENOENT;
+    if effective_len > 0 && effective_path[0] == b'/' {
+        // Absolute path - use as-is
+        resolved_path[..effective_len].copy_from_slice(&effective_path[..effective_len]);
+        resolved_len = effective_len;
+    } else if effective_len == 0 || (effective_len == 1 && effective_path[0] == b'.') {
+        // "." or empty (from "./") means current directory
+        let cwd_len = unsafe {
+            let task = &TASKS[current_id.0];
+            let mut len = 0;
+            while len < sched::MAX_PATH_LEN && len < 255 && task.cwd[len] != 0 {
+                resolved_path[len] = task.cwd[len];
+                len += 1;
+            }
+            len
+        };
+        resolved_len = if cwd_len == 0 {
+            // Default to root
+            resolved_path[0] = b'/';
+            1
+        } else {
+            cwd_len
+        };
+    } else {
+        // Relative path - prepend cwd
+        let cwd_len = unsafe {
+            let task = &TASKS[current_id.0];
+            let mut len = 0;
+            while len < sched::MAX_PATH_LEN && len < 200 && task.cwd[len] != 0 {
+                resolved_path[len] = task.cwd[len];
+                len += 1;
+            }
+            len
+        };
+
+        if cwd_len == 0 || resolved_path[0] != b'/' {
+            // No cwd set, use root
+            resolved_path[0] = b'/';
+            let copy_len = effective_len.min(254);
+            resolved_path[1..1 + copy_len].copy_from_slice(&effective_path[..copy_len]);
+            resolved_len = 1 + copy_len;
+        } else {
+            // Append "/" if needed, then path
+            let mut pos = cwd_len;
+            if pos > 0 && resolved_path[pos - 1] != b'/' && pos < 255 {
+                resolved_path[pos] = b'/';
+                pos += 1;
+            }
+            let copy_len = effective_len.min(255 - pos);
+            resolved_path[pos..pos + copy_len].copy_from_slice(&effective_path[..copy_len]);
+            resolved_len = pos + copy_len;
+        }
     }
 
     // Allocate fd first (before IPC)
@@ -1717,19 +1760,19 @@ fn sys_open(ctx: &mut ExceptionContext, pathname: usize, flags: u32) -> i64 {
     }
     let shm_id = shm_id_i64 as usize;
 
-    // Map SHM and copy path
+    // Map SHM and copy resolved path
     let shm_addr = shm::sys_shmmap(shm_id, 0);
     if shm_addr < 0 {
         return ENOMEM;
     }
     unsafe {
         core::ptr::copy_nonoverlapping(
-            path_bytes.as_ptr(),
+            resolved_path.as_ptr(),
             shm_addr as *mut u8,
-            path_bytes.len(),
+            resolved_len,
         );
         // Null-terminate
-        core::ptr::write_volatile((shm_addr as usize + path_bytes.len()) as *mut u8, 0);
+        core::ptr::write_volatile((shm_addr as usize + resolved_len) as *mut u8, 0);
     }
 
     // Grant VFS access
@@ -1747,7 +1790,7 @@ fn sys_open(ctx: &mut ExceptionContext, pathname: usize, flags: u32) -> i64 {
 
     // Send VFS_OPEN request
     // data[0] = shm_id, data[1] = path_len, data[2] = flags
-    let msg = Message::new(VFS_OPEN, [shm_id as u64, path_bytes.len() as u64, flags as u64, 0]);
+    let msg = Message::new(VFS_OPEN, [shm_id as u64, resolved_len as u64, flags as u64, 0]);
     ipc::sys_call(ctx, VFS_TID, msg);
 
     0 // Placeholder - actual return set by complete_pending_syscall
@@ -1797,13 +1840,15 @@ fn sys_chdir(path: usize) -> i64 {
     };
 
     // Read path from user memory
+    let mut user_path = [0u8; 256];
     let mut path_len = 0;
     unsafe {
-        while path_len < sched::MAX_PATH_LEN - 1 {
+        while path_len < 255 {
             let c = core::ptr::read_volatile((path + path_len) as *const u8);
             if c == 0 {
                 break;
             }
+            user_path[path_len] = c;
             path_len += 1;
         }
     }
@@ -1812,18 +1857,50 @@ fn sys_chdir(path: usize) -> i64 {
         return ENOENT;
     }
 
-    // For now, just update cwd without validating the path exists
-    // A proper implementation would call VFS to verify the directory
+    // Build absolute path
+    let mut new_cwd = [0u8; 256];
+    let new_cwd_len: usize;
+
+    if user_path[0] == b'/' {
+        // Absolute path - use as-is
+        new_cwd[..path_len].copy_from_slice(&user_path[..path_len]);
+        new_cwd_len = path_len;
+    } else {
+        // Relative path - prepend current cwd
+        let cwd_len = unsafe {
+            let task = &TASKS[current_id.0];
+            let mut len = 0;
+            while len < sched::MAX_PATH_LEN && len < 200 && task.cwd[len] != 0 {
+                new_cwd[len] = task.cwd[len];
+                len += 1;
+            }
+            len
+        };
+
+        if cwd_len == 0 || new_cwd[0] != b'/' {
+            // No cwd set, use root
+            new_cwd[0] = b'/';
+            let copy_len = path_len.min(254);
+            new_cwd[1..1 + copy_len].copy_from_slice(&user_path[..copy_len]);
+            new_cwd_len = 1 + copy_len;
+        } else {
+            // Append "/" if needed, then path
+            let mut pos = cwd_len;
+            if pos > 0 && new_cwd[pos - 1] != b'/' && pos < 255 {
+                new_cwd[pos] = b'/';
+                pos += 1;
+            }
+            let copy_len = path_len.min(255 - pos);
+            new_cwd[pos..pos + copy_len].copy_from_slice(&user_path[..copy_len]);
+            new_cwd_len = pos + copy_len;
+        }
+    }
+
+    // Store the absolute path as the new cwd
     unsafe {
         let task = &mut TASKS[current_id.0];
-
-        // Copy new path
-        core::ptr::copy_nonoverlapping(
-            path as *const u8,
-            task.cwd.as_mut_ptr(),
-            path_len,
-        );
-        task.cwd[path_len] = 0; // Null-terminate
+        task.cwd[..new_cwd_len].copy_from_slice(&new_cwd[..new_cwd_len]);
+        task.cwd[new_cwd_len] = 0; // Null-terminate
     }
 
     ESUCCESS
@@ -1965,32 +2042,129 @@ fn sys_fstat(ctx: &mut ExceptionContext, fd: usize, statbuf: usize) -> i64 {
 
 /// SYS_FSTATAT - Get file status at directory
 ///
-/// For now this is a simplified implementation that returns ENOENT.
-/// A full implementation would use VFS to stat the path.
-fn sys_fstatat(_ctx: &mut ExceptionContext, dirfd: i32, pathname: usize, _statbuf: usize) -> i64 {
-    // Read the pathname for debugging
-    let path_bytes: [u8; 256] = unsafe {
-        let mut buf = [0u8; 256];
-        for i in 0..255 {
+/// Forwards the request to VFS via IPC.
+fn sys_fstatat(ctx: &mut ExceptionContext, dirfd: i32, pathname: usize, statbuf: usize) -> i64 {
+    use sched::task::TASKS;
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    // Read the pathname from user space (up to 31 chars for inline VFS message)
+    let mut user_path = [0u8; 32];
+    let mut user_path_len = 0usize;
+    unsafe {
+        for i in 0..31 {
             let c = core::ptr::read_volatile((pathname + i) as *const u8);
             if c == 0 {
                 break;
             }
-            buf[i] = c;
+            user_path[i] = c;
+            user_path_len += 1;
         }
-        buf
-    };
+    }
 
-    // Find null terminator
-    let path_len = path_bytes.iter().position(|&c| c == 0).unwrap_or(256);
-    let _path = core::str::from_utf8(&path_bytes[..path_len]).unwrap_or("<invalid>");
+    // Handle empty path with AT_EMPTY_PATH flag (common for fstat-like usage)
+    if user_path_len == 0 {
+        return ENOENT;
+    }
+
+    // Resolve path: handle ".", "./" prefix, and relative paths
+    let mut resolved_path = [0u8; 32];
+    let resolved_len: usize;
 
     // AT_FDCWD = -100, meaning use current working directory
-    let _at_fdcwd = dirfd == -100;
+    let _ = dirfd;
 
-    // For now, return ENOENT for most paths
-    // This allows BusyBox to continue without blocking
-    ENOENT
+    // Strip "./" prefix from user path if present
+    let (effective_path, effective_len) = if user_path_len >= 2 && user_path[0] == b'.' && user_path[1] == b'/' {
+        // Skip "./" prefix
+        let start = 2;
+        let len = user_path_len - 2;
+        let mut tmp = [0u8; 32];
+        tmp[..len].copy_from_slice(&user_path[start..start + len]);
+        (tmp, len)
+    } else {
+        (user_path, user_path_len)
+    };
+
+    if effective_len > 0 && effective_path[0] == b'/' {
+        // Absolute path - use as-is
+        resolved_path[..effective_len].copy_from_slice(&effective_path[..effective_len]);
+        resolved_len = effective_len;
+    } else if effective_len == 0 || (effective_len == 1 && effective_path[0] == b'.') {
+        // "." or empty (from "./") means current directory
+        let cwd_len = unsafe {
+            let task = &TASKS[current_id.0];
+            let mut len = 0;
+            while len < sched::MAX_PATH_LEN && len < 31 && task.cwd[len] != 0 {
+                resolved_path[len] = task.cwd[len];
+                len += 1;
+            }
+            len
+        };
+        resolved_len = if cwd_len == 0 {
+            // Default to root
+            resolved_path[0] = b'/';
+            1
+        } else {
+            cwd_len
+        };
+    } else {
+        // Relative path - prepend cwd
+        let cwd_len = unsafe {
+            let task = &TASKS[current_id.0];
+            let mut len = 0;
+            while len < sched::MAX_PATH_LEN && len < 20 && task.cwd[len] != 0 {
+                resolved_path[len] = task.cwd[len];
+                len += 1;
+            }
+            len
+        };
+
+        if cwd_len == 0 || resolved_path[0] != b'/' {
+            // No cwd set, use root
+            resolved_path[0] = b'/';
+            let copy_len = effective_len.min(30);
+            resolved_path[1..1 + copy_len].copy_from_slice(&effective_path[..copy_len]);
+            resolved_len = 1 + copy_len;
+        } else {
+            // Append "/" if needed, then path
+            let mut pos = cwd_len;
+            if pos > 0 && resolved_path[pos - 1] != b'/' && pos < 31 {
+                resolved_path[pos] = b'/';
+                pos += 1;
+            }
+            let copy_len = effective_len.min(31 - pos);
+            resolved_path[pos..pos + copy_len].copy_from_slice(&effective_path[..copy_len]);
+            resolved_len = pos + copy_len;
+        }
+    }
+
+    // Pack resolved path into message data for VFS_STAT
+    // Format: byte 0 = length, bytes 1-31 = path characters
+    let mut msg_data = [0u64; 4];
+    unsafe {
+        let msg_bytes = core::slice::from_raw_parts_mut(
+            msg_data.as_mut_ptr() as *mut u8,
+            32
+        );
+        msg_bytes[0] = resolved_len as u8;
+        msg_bytes[1..1 + resolved_len].copy_from_slice(&resolved_path[..resolved_len]);
+    }
+
+    // Set up pending syscall to handle the reply
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::VfsStat { statbuf };
+    }
+
+    // Send VFS_STAT request
+    let msg = Message::new(VFS_STAT, msg_data);
+    ipc::sys_call(ctx, VFS_TID, msg);
+
+    0 // Result will be set by IPC reply handler
 }
 
 /// Poll event flags
@@ -2415,7 +2589,7 @@ fn sys_uname(buf: *mut u8) -> i64 {
 /// # Returns
 /// * On success: Does not return (current process is replaced)
 /// * On failure: Negative error code
-fn sys_execve(ctx: &mut ExceptionContext, pathname: usize, _argv: usize, _envp: usize) -> i64 {
+fn sys_execve(ctx: &mut ExceptionContext, pathname: usize, argv: usize, _envp: usize) -> i64 {
     use crate::sched::task::TASKS;
 
     let current_id = match sched::current() {
@@ -2438,6 +2612,62 @@ fn sys_execve(ctx: &mut ExceptionContext, pathname: usize, _argv: usize, _envp: 
 
     if path_bytes.is_empty() {
         return ENOENT;
+    }
+
+    // Read argv from user memory
+    // argv is a pointer to an array of char* pointers, terminated by NULL
+    let mut argv_data = [0u8; 1024];
+    let mut argv_offsets = [0u16; 16];
+    let mut argc = 0usize;
+    let mut data_pos = 0usize;
+
+    if argv != 0 {
+        unsafe {
+            let argv_ptrs = argv as *const usize;
+            // Read up to 15 arguments (leave room for NULL terminator)
+            for i in 0..15 {
+                let arg_ptr = core::ptr::read_volatile(argv_ptrs.add(i));
+                if arg_ptr == 0 {
+                    break; // NULL terminator
+                }
+
+                // Read the string
+                argv_offsets[argc] = data_pos as u16;
+                let mut str_len = 0;
+                while str_len < 256 && data_pos < 1023 {
+                    let c = core::ptr::read_volatile((arg_ptr + str_len) as *const u8);
+                    argv_data[data_pos] = c;
+                    data_pos += 1;
+                    if c == 0 {
+                        break;
+                    }
+                    str_len += 1;
+                }
+                // Ensure null termination
+                if data_pos > 0 && argv_data[data_pos - 1] != 0 {
+                    argv_data[data_pos] = 0;
+                    data_pos += 1;
+                }
+                argc += 1;
+            }
+        }
+    }
+
+    // If no argv provided, use pathname basename as argv[0]
+    if argc == 0 {
+        // Find basename
+        let mut last_slash = 0;
+        for i in 0..path_bytes.len() {
+            if path_bytes[i] == b'/' {
+                last_slash = i + 1;
+            }
+        }
+        let basename = &path_bytes[last_slash..];
+        let basename_len = basename.len().min(255);
+        argv_data[..basename_len].copy_from_slice(&basename[..basename_len]);
+        argv_data[basename_len] = 0;
+        argv_offsets[0] = 0;
+        argc = 1;
     }
 
     // Create SHM for path transfer
@@ -2468,7 +2698,12 @@ fn sys_execve(ctx: &mut ExceptionContext, pathname: usize, _argv: usize, _envp: 
     // Set up pending syscall (stage 1: open the executable)
     unsafe {
         let task = &mut TASKS[current_id.0];
-        task.pending_syscall = PendingSyscall::ExecveOpen { shm_id };
+        task.pending_syscall = PendingSyscall::ExecveOpen {
+            shm_id,
+            argv_data,
+            argv_offsets,
+            argc,
+        };
     }
 
     // Send VFS_OPEN request
@@ -2538,6 +2773,7 @@ fn sys_rt_sigaction(sig: i32, act: usize, oldact: usize) -> i64 {
         if act != 0 {
             let new = act as *const Sigaction;
             task.signal_handlers[(sig - 1) as usize] = (*new).sa_handler;
+            task.signal_restorers[(sig - 1) as usize] = (*new).sa_restorer;
         }
     }
 
@@ -2674,11 +2910,16 @@ pub struct SavedContext {
     pub pstate: u64,
 }
 
-/// Check and deliver pending signals
+/// Check and deliver pending signals (wrapper for backward compatibility)
+pub fn check_and_deliver_signals(ctx: &mut ExceptionContext) {
+    check_and_deliver_signals_after_syscall(ctx, 0);
+}
+
+/// Check and deliver pending signals after a syscall
 ///
 /// Called before returning to user space. If a signal is pending and not masked,
 /// set up the signal frame and redirect execution to the handler.
-pub fn check_and_deliver_signals(ctx: &mut ExceptionContext) {
+pub fn check_and_deliver_signals_after_syscall(ctx: &mut ExceptionContext, _last_syscall: u16) {
     let current_id = match sched::current() {
         Some(id) => id,
         None => return,
@@ -2691,12 +2932,6 @@ pub fn check_and_deliver_signals(ctx: &mut ExceptionContext) {
         let deliverable = task.signal_pending & !task.signal_mask;
         if deliverable == 0 {
             return; // No signals to deliver
-        }
-
-        // Debug: log signal delivery for task 10+
-        if current_id.0 >= 10 {
-            println!("[sig{}] delivering signal, pending={:#x} mask={:#x} deliverable={:#x}",
-                current_id.0, task.signal_pending, task.signal_mask, deliverable);
         }
 
         // Find the lowest numbered signal
@@ -2760,9 +2995,9 @@ pub fn check_and_deliver_signals(ctx: &mut ExceptionContext) {
         ctx.gpr[2] = frame_addr as u64;
 
         // Set up link register (x30) to point to sigreturn trampoline
-        // In a real implementation, the user would provide a restorer via sa_restorer
-        // For now, the handler must call sigreturn() explicitly
-        ctx.gpr[30] = 0; // No automatic return - handler must call sigreturn
+        // Use the restorer provided via sa_restorer in sigaction
+        let restorer = task.signal_restorers[(sig - 1) as usize];
+        ctx.gpr[30] = restorer;
     }
 }
 

@@ -33,12 +33,22 @@ impl AddressSpaceBuilder {
     /// Convert the builder into a complete AddressSpace, consuming itself.
     fn build(self, l2_arr: [Option<PhysAddr>; MAX_L1_ENTRIES], l3_arr: [Option<PhysAddr>; L3_TABLES_COUNT]) -> AddressSpace {
         let ttbr0 = self.ttbr0.expect("TTBR0 should be set for a successful build");
+
+        // Transfer data_pages to data_blocks array
+        let mut data_blocks = [None; MAX_DATA_BLOCKS];
+        for (i, page) in self.data_pages.iter().enumerate() {
+            if i < MAX_DATA_BLOCKS {
+                data_blocks[i] = Some(*page);
+            }
+        }
+
         // Don't free resources when dropped, as ownership is transferred
-        core::mem::forget(self); 
+        core::mem::forget(self);
         AddressSpace {
             ttbr0,
             l2_tables: l2_arr,
             l3_tables: l3_arr,
+            data_blocks,
         }
     }
 }
@@ -149,6 +159,9 @@ const MAX_L1_ENTRIES: usize = 4;
 /// This reduces struct size from ~32KB to ~8KB
 const L3_TABLES_COUNT: usize = ENTRIES_PER_TABLE; // 512 entries for L1[0] only
 
+/// Maximum number of 2MB data blocks tracked per address space
+const MAX_DATA_BLOCKS: usize = 16;
+
 /// Per-task address space
 pub struct AddressSpace {
     /// L1 page table physical address (TTBR0_EL1)
@@ -159,6 +172,8 @@ pub struct AddressSpace {
     /// Only allocated when 4KB mapping is needed in that 2MB region
     /// Index = l2_idx (0-511)
     l3_tables: [Option<PhysAddr>; L3_TABLES_COUNT],
+    /// 2MB data blocks owned by this address space (freed on drop)
+    data_blocks: [Option<PhysAddr>; MAX_DATA_BLOCKS],
 }
 
 impl AddressSpace {
@@ -180,6 +195,7 @@ impl AddressSpace {
             ttbr0: l1_frame,
             l2_tables: [None; MAX_L1_ENTRIES],
             l3_tables: [None; L3_TABLES_COUNT],
+            data_blocks: [None; MAX_DATA_BLOCKS],
         };
 
         // Clone kernel mappings from the kernel's TTBR0
@@ -219,6 +235,7 @@ impl AddressSpace {
             ttbr0: l1_frame,
             l2_tables: [None; MAX_L1_ENTRIES],
             l3_tables: [None; L3_TABLES_COUNT],
+            data_blocks: [None; MAX_DATA_BLOCKS],
         };
 
         // Allocate new L2 tables with necessary mappings
@@ -344,6 +361,18 @@ impl AddressSpace {
             let l2_ptr = l2_frame.0 as *mut u64;
             ptr::write_volatile(l2_ptr.add(l2_idx), 0);
         }
+    }
+
+    /// Track a 2MB data block for cleanup on drop
+    /// Returns true if the block was successfully tracked, false if no slots available
+    pub fn track_data_block(&mut self, paddr: PhysAddr) -> bool {
+        for slot in self.data_blocks.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(paddr);
+                return true;
+            }
+        }
+        false
     }
 
     /// Helper to compute flat index for l3_tables array
@@ -644,6 +673,15 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        // Free data blocks (2MB blocks of user data)
+        for block in self.data_blocks.iter() {
+            if let Some(block_addr) = block {
+                // Each 2MB block = 512 pages of 4KB each
+                for i in 0..512 {
+                    free_frame(PhysAddr(block_addr.0 + i * 4096));
+                }
+            }
+        }
         // Free L3 tables
         for l3 in self.l3_tables.iter() {
             if let Some(frame) = l3 {

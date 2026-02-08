@@ -178,24 +178,25 @@ impl FrameAllocator {
         // Iterate through all 2MB boundaries
         let mut i = first_boundary_page;
         while i < total_pages {
-            // Check if 'count' contiguous pages starting at i are all free
+            // Check if THE ENTIRE 2MB block is free (not just 'count' pages)
+            // This is critical because we'll zero the entire block, so we must
+            // ensure no other allocation (like SHM) has frames in this block.
+            let pages_in_block = PAGES_PER_2MB_BLOCK.min(total_pages.saturating_sub(i));
             let mut all_free = true;
-            for j in 0..count {
-                if i + j >= total_pages || self.get_bit(i + j) {
+            for j in 0..pages_in_block {
+                if self.get_bit(i + j) {
                     all_free = false;
                     break;
                 }
             }
 
-            if all_free {
-                // Found a suitable region at a 2MB boundary.
-                // Mark the ENTIRE 2MB block as used to prevent fragmentation.
-                for j in 0..PAGES_PER_2MB_BLOCK {
-                    if i + j < total_pages {
-                        self.set_bit(i + j, true);
-                    }
+            if all_free && pages_in_block >= count {
+                // Found a completely free 2MB block.
+                // Mark the ENTIRE 2MB block as used.
+                for j in 0..pages_in_block {
+                    self.set_bit(i + j, true);
                 }
-                self.used_count += PAGES_PER_2MB_BLOCK.min(total_pages - i);
+                self.used_count += pages_in_block;
                 return Some(PhysAddr::new(self.memory_start + i * PAGE_SIZE));
             }
 

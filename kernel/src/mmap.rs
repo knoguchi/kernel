@@ -224,8 +224,6 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
         None => return -1,
     };
 
-    crate::println!("[mmap_fault] task={} addr={:#x}", current_id.0, fault_addr);
-
     unsafe {
         let task = &mut TASKS[current_id.0];
 
@@ -233,19 +231,16 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
         let region = match task.mmap_state.find_region_mut(fault_addr) {
             Some(r) => r,
             None => {
-                crate::println!("[mmap_fault] no region found");
-                return -1; // No region for this address
+                crate::println!("[fault] t={} no region for {:#x}, have {} regions",
+                    current_id.0, fault_addr, task.mmap_state.regions.len());
+                return -1;
             }
         };
-
-        crate::println!("[mmap_fault] region vaddr={:#x} len={} prot={:#x}",
-            region.vaddr, region.len, region.prot);
 
         let page_idx = region.page_index(fault_addr);
 
         // Check if page is already allocated (shouldn't happen, but safety check)
         if region.is_page_allocated(page_idx) {
-            crate::println!("[mmap_fault] page {} already allocated!", page_idx);
             return -1; // Page already allocated, shouldn't fault
         }
 
@@ -278,9 +273,6 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
         // Mark the page as allocated
         region.mark_allocated(page_idx);
 
-        crate::println!("[mmap_fault] mapped page vaddr={:#x} paddr={:#x} flags={{w={},x={},u={}}}",
-            page_vaddr, phys_frame.0, page_flags.writable, page_flags.executable, page_flags.user);
-
         // Invalidate TLB for this address
         core::arch::asm!(
             "dsb ishst",
@@ -307,7 +299,7 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
 /// Returns: Virtual address of mapping, or MAP_FAILED on error
 pub fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) -> i64 {
     let task_id = sched::current().map(|id| id.0).unwrap_or(999);
-    crate::println!("[mmap] task={} addr={:#x} len={} prot={:#x} flags={:#x}",
+    crate::println!("[mmap] t={} addr={:#x} len={} prot={:#x} flags={:#x}",
         task_id, addr, len, prot, flags);
 
     // Validate arguments
@@ -344,6 +336,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset:
             // MAP_FIXED: use the requested address exactly
             let aligned_addr = addr & !(PAGE_SIZE - 1);
             if aligned_addr < MMAP_BASE || aligned_addr + aligned_len > MMAP_END {
+                crate::println!("[mmap] t={} FIXED addr {:#x} outside range, fail", task_id, aligned_addr);
                 return -22; // EINVAL - outside mmap region
             }
             // Remove any existing mappings in this range
@@ -366,7 +359,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset:
         let region = MmapRegion::new(vaddr, aligned_len, prot, flags);
         task.mmap_state.add_region(region);
 
-        crate::println!("[mmap] OK: vaddr={:#x}", vaddr);
+        crate::println!("[mmap] t={} -> {:#x}", task_id, vaddr);
         vaddr as i64
     }
 }
@@ -462,20 +455,15 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: u32) -> i64 {
     let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let end_addr = addr + aligned_len;
 
-    crate::println!("[mprotect] task={} addr={:#x} len={} prot={:#x}",
-        current_id.0, addr, len, prot);
-
     unsafe {
         let task = &mut TASKS[current_id.0];
 
         // Find regions that overlap with this range and update their prot
-        let mut found = false;
         for region in task.mmap_state.regions.iter_mut() {
             let region_end = region.vaddr + region.len;
 
             // Check if region overlaps with the mprotect range
             if region.vaddr < end_addr && region_end > addr {
-                found = true;
                 let old_prot = region.prot;
 
                 // Update the region's protection
@@ -484,9 +472,6 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: u32) -> i64 {
                 // For demand-paging (musl's typical pattern), pages are allocated AFTER mprotect,
                 // so this works correctly.
                 region.prot = prot;
-
-                crate::println!("[mprotect] region {:#x} prot {:#x} -> {:#x}",
-                    region.vaddr, old_prot, prot);
 
                 // For already-allocated pages that need permission changes,
                 // unmap them so they'll be re-faulted with correct permissions
@@ -503,18 +488,14 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: u32) -> i64 {
                             // Unmap the page - it will be re-allocated on next access
                             addr_space.unmap_4kb(page_vaddr);
                             region.allocated_pages[i] = false;
-                            crate::println!("[mprotect] unmapped page {:#x} for re-fault", page_vaddr);
                         }
                     }
                 }
             }
         }
 
-        if !found {
-            // No region found for this address - could be brk/stack region
-            // Return success anyway for compatibility (Linux behavior)
-            crate::println!("[mprotect] no mmap region found, returning success");
-        }
+        // Note: if no region found, return success anyway for compatibility (Linux behavior)
+        // This can happen for brk/stack regions
 
         // Invalidate TLB
         core::arch::asm!(

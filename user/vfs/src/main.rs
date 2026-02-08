@@ -696,9 +696,7 @@ fn handle_open(client: usize, msg_data: &[u64; 4]) -> i64 {
             Err(e) => return e,
         };
 
-        if entry.is_directory() {
-            return ERR_ISDIR;
-        }
+        // Note: We allow opening directories - they can be read with getdents64
 
         // Find a free FAT32 file slot
         let fat32_idx = unsafe {
@@ -951,7 +949,7 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
         None => return ERR_INVAL,
     };
 
-    let file = &client_state.files[handle];
+    let file = &mut client_state.files[handle];
     if !file.in_use {
         return ERR_BADF;
     }
@@ -961,7 +959,8 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
     const DT_DIR: u8 = 4;
 
     let mut bytes_written: usize = 0;
-    let mut entry_offset: i64 = 0;
+    let mut entry_offset: i64 = file.offset as i64; // Start from current position
+    let start_entry = file.offset; // Track starting entry index
 
     match file.source {
         FileSource::RamFs => {
@@ -971,10 +970,39 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
                 _ => return ERR_NOTDIR,
             };
 
-            // Write dirent64 entries for each directory entry
-            for i in 0..dir_data.count {
-                let entry = &dir_data.entries[i];
-                let name_len = entry.name_len;
+            // For root directory (inode 0), first entry is synthetic "disk" mount point
+            let is_root = file.handle == 0;
+            let disk_entry_idx = if is_root { 0 } else { usize::MAX };
+            let real_entries_start = if is_root { 1 } else { 0 };
+
+            // Calculate total entries (including synthetic "disk" for root)
+            let total_entries = if is_root { dir_data.count + 1 } else { dir_data.count };
+
+            // Write dirent64 entries starting from current position
+            let mut current_entry = start_entry;
+            while current_entry < total_entries {
+                let (name_buf, name_len, d_ino, d_type): ([u8; 32], usize, u64, u8) =
+                    if is_root && current_entry == disk_entry_idx {
+                        // Synthetic "disk" directory entry
+                        let mut buf = [0u8; 32];
+                        buf[0..4].copy_from_slice(b"disk");
+                        (buf, 4, 0xFFFF_FFFF, DT_DIR) // Special inode for mount point
+                    } else {
+                        // Real ramfs entry
+                        let real_idx = if is_root { current_entry - real_entries_start } else { current_entry };
+                        if real_idx >= dir_data.count {
+                            break;
+                        }
+                        let entry = &dir_data.entries[real_idx];
+                        let d_type = match unsafe { RAMFS.inodes[entry.inode].itype } {
+                            InodeType::File => DT_REG,
+                            InodeType::Directory => DT_DIR,
+                            _ => 0,
+                        };
+                        let mut buf = [0u8; 32];
+                        buf[..entry.name_len].copy_from_slice(&entry.name[..entry.name_len]);
+                        (buf, entry.name_len, entry.inode as u64, d_type)
+                    };
 
                 // Calculate record length: header (19 bytes) + name + null + padding to 8-byte alignment
                 // dirent64: d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + d_name[...]
@@ -988,33 +1016,30 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
 
                 entry_offset += reclen as i64;
 
-                // Get the inode type
-                let d_type = match unsafe { RAMFS.inodes[entry.inode].itype } {
-                    InodeType::File => DT_REG,
-                    InodeType::Directory => DT_DIR,
-                    _ => 0,
-                };
-
                 // Write dirent64 structure to SHM
                 let dest = shm_base + bytes_written;
                 unsafe {
                     // d_ino at offset 0
-                    core::ptr::write_unaligned(dest as *mut u64, entry.inode as u64);
-                    // d_off at offset 8
-                    core::ptr::write_unaligned((dest + 8) as *mut i64, entry_offset);
+                    core::ptr::write_unaligned(dest as *mut u64, d_ino);
+                    // d_off at offset 8 (position AFTER this entry)
+                    core::ptr::write_unaligned((dest + 8) as *mut i64, (current_entry + 1) as i64);
                     // d_reclen at offset 16
                     core::ptr::write_unaligned((dest + 16) as *mut u16, reclen as u16);
                     // d_type at offset 18
                     core::ptr::write_unaligned((dest + 18) as *mut u8, d_type);
                     // d_name at offset 19
                     let name_dest = (dest + 19) as *mut u8;
-                    core::ptr::copy_nonoverlapping(entry.name.as_ptr(), name_dest, name_len);
+                    core::ptr::copy_nonoverlapping(name_buf.as_ptr(), name_dest, name_len);
                     // Null terminator
                     core::ptr::write_unaligned(name_dest.add(name_len), 0u8);
                 }
 
                 bytes_written += reclen;
+                current_entry += 1;
             }
+
+            // Update file offset to track position
+            file.offset = current_entry;
         }
         FileSource::Fat32 => {
             // For FAT32 directories, we need to iterate through the directory
@@ -1035,6 +1060,7 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
             let mut current_cluster = fat32_file.file.first_cluster;
             let blk = unsafe { &BLK_CLIENT };
             let mut sector_buf = [0u8; SECTOR_SIZE];
+            let mut current_entry_idx: usize = 0; // Track entry index for position
 
             'outer: loop {
                 if current_cluster < 2 || current_cluster >= 0x0FFFFFF8 {
@@ -1064,6 +1090,12 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
                         }
                         // Long filename entry (skip for now)
                         if sector_buf[entry_offset_in_sector + 11] == 0x0F {
+                            continue;
+                        }
+
+                        // Skip entries we've already returned
+                        if current_entry_idx < start_entry {
+                            current_entry_idx += 1;
                             continue;
                         }
 
@@ -1107,6 +1139,7 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
                         }
 
                         entry_offset += reclen as i64;
+                        current_entry_idx += 1;
 
                         // Get attributes
                         let attr = sector_buf[entry_offset_in_sector + 11];
@@ -1142,6 +1175,9 @@ fn handle_readdir(client: usize, msg_data: &[u64; 4]) -> i64 {
                 // Follow FAT chain to next cluster
                 current_cluster = fat32_next_cluster(fs, blk, current_cluster);
             }
+
+            // Update file offset to track position for next call
+            file.offset = current_entry_idx;
         }
         FileSource::None => return ERR_BADF,
     }

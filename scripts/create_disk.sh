@@ -60,6 +60,16 @@ if [ -f "$BUSYBOX_PATH" ]; then
     echo "Adding busybox to disk..."
     mmd -i "${DISK_IMG}" ::/bin
     mcopy -i "${DISK_IMG}" "$BUSYBOX_PATH" ::/bin/busybox
+
+    # Create copies of busybox for common commands
+    # (FAT32 doesn't support symlinks, so we copy the binary)
+    # BusyBox checks argv[0] to determine which applet to run
+    # Note: Each copy is ~1.3MB, so we only include essentials
+    echo "Adding command symlinks (copies)..."
+    for cmd in ls cat sh; do
+        mcopy -i "${DISK_IMG}" "$BUSYBOX_PATH" ::/bin/$cmd
+    done
+
     # Also create a simple test script
     echo '#!/bin/busybox sh' > /tmp/test_script
     echo 'echo "Test passed!"' >> /tmp/test_script

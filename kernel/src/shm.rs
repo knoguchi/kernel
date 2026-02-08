@@ -301,6 +301,9 @@ pub fn sys_shmunmap(shm_id: usize) -> i64 {
 ///
 /// Since the kernel has identity mapping, this address can be used directly.
 /// Returns 0 if the SHM doesn't exist.
+///
+/// WARNING: This only works correctly if SHM frames are physically contiguous!
+/// For large SHM regions, use copy_shm_to_buffer instead.
 pub fn get_shm_phys_addr(shm_id: usize) -> usize {
     if shm_id >= MAX_SHM_REGIONS {
         return 0;
@@ -317,6 +320,42 @@ pub fn get_shm_phys_addr(shm_id: usize) -> usize {
             Some(paddr) => paddr.0,
             None => 0,
         }
+    }
+}
+
+/// Copy SHM contents to a contiguous destination buffer.
+/// This handles non-contiguous SHM frames correctly.
+///
+/// Returns the number of bytes copied, or 0 on error.
+pub fn copy_shm_to_buffer(shm_id: usize, dest: *mut u8, max_len: usize) -> usize {
+    if shm_id >= MAX_SHM_REGIONS {
+        return 0;
+    }
+
+    unsafe {
+        let region = &SHM_REGIONS[shm_id];
+        if !region.in_use || region.num_frames == 0 {
+            return 0;
+        }
+
+        let mut copied = 0;
+        for i in 0..region.num_frames {
+            if copied >= max_len {
+                break;
+            }
+            if let Some(frame) = region.frames[i] {
+                let to_copy = PAGE_SIZE.min(max_len - copied);
+                core::ptr::copy_nonoverlapping(
+                    frame.0 as *const u8,
+                    dest.add(copied),
+                    to_copy,
+                );
+                copied += to_copy;
+            } else {
+                break;
+            }
+        }
+        copied
     }
 }
 
@@ -500,42 +539,75 @@ pub fn sys_shmdestroy(shm_id: usize) -> i64 {
             return SHM_ERR_PERMISSION;
         }
 
-        // Unmap from all tasks that have it mapped
-        for task_idx in 0..MAX_TASKS {
-            if let Some(vaddr) = region.mapped_vaddr[task_idx] {
-                let task = &mut TASKS[task_idx];
-                if task.state != TaskState::Free {
-                    if let Some(ref mut addr_space) = task.addr_space {
-                        for i in 0..region.num_frames {
-                            let page_vaddr = vaddr + i * PAGE_SIZE;
-                            addr_space.unmap_4kb(page_vaddr);
-                        }
-                    }
-                }
-                region.mapped_vaddr[task_idx] = None;
-            }
-        }
-
-        // Free physical frames
-        for i in 0..region.num_frames {
-            if let Some(frame) = region.frames[i] {
-                free_frame(frame);
-                region.frames[i] = None;
-            }
-        }
-
-        // Reset region
-        region.in_use = false;
-        region.num_frames = 0;
-        region.size = 0;
-        for i in 0..MAX_TASKS {
-            region.granted[i] = false;
-        }
-
-        invalidate_tlb();
-
+        destroy_shm_internal(shm_id);
         SHM_OK
     }
+}
+
+/// Internal function to destroy SHM without ownership check
+/// Used by kernel for cleanup (e.g., after execve)
+pub fn destroy_shm(shm_id: usize) {
+    if shm_id >= MAX_SHM_REGIONS {
+        return;
+    }
+    unsafe {
+        destroy_shm_internal(shm_id);
+    }
+}
+
+/// Clean up all SHM regions owned by a task (called on task exit)
+pub fn cleanup_task_shm(task_id: TaskId) {
+    unsafe {
+        for i in 0..MAX_SHM_REGIONS {
+            let region = &SHM_REGIONS[i];
+            if region.in_use && region.owner == task_id {
+                destroy_shm_internal(i);
+            }
+        }
+    }
+}
+
+/// Internal implementation of SHM destruction
+unsafe fn destroy_shm_internal(shm_id: usize) {
+    let region = &mut SHM_REGIONS[shm_id];
+
+    if !region.in_use {
+        return;
+    }
+
+    // Unmap from all tasks that have it mapped
+    for task_idx in 0..MAX_TASKS {
+        if let Some(vaddr) = region.mapped_vaddr[task_idx] {
+            let task = &mut TASKS[task_idx];
+            if task.state != TaskState::Free {
+                if let Some(ref mut addr_space) = task.addr_space {
+                    for i in 0..region.num_frames {
+                        let page_vaddr = vaddr + i * PAGE_SIZE;
+                        addr_space.unmap_4kb(page_vaddr);
+                    }
+                }
+            }
+            region.mapped_vaddr[task_idx] = None;
+        }
+    }
+
+    // Free physical frames
+    for i in 0..region.num_frames {
+        if let Some(frame) = region.frames[i] {
+            free_frame(frame);
+            region.frames[i] = None;
+        }
+    }
+
+    // Reset region
+    region.in_use = false;
+    region.num_frames = 0;
+    region.size = 0;
+    for i in 0..MAX_TASKS {
+        region.granted[i] = false;
+    }
+
+    invalidate_tlb();
 }
 
 /// Direct 4KB page mapping without AddressSpace struct

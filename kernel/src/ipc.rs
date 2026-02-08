@@ -199,13 +199,21 @@ pub fn sys_recv(ctx: &mut ExceptionContext, from: Option<TaskId>) -> (TaskId, Me
 
             // Wake up sender if it was SendBlocked
             if sender_task.state == TaskState::SendBlocked {
-                // Set sender's return value (IPC_OK = 0 in x0)
-                let sender_ctx = sender_task.kernel_stack_top as *mut ExceptionContext;
-                if !sender_ctx.is_null() {
-                    (*sender_ctx).gpr[0] = IPC_OK as u64;
+                // Check if sender is doing sys_call (waiting for reply) or sys_send
+                if sender_task.ipc.reply_to.is_some() {
+                    // sys_call pattern: sender should wait for reply
+                    // Transition to ReplyBlocked, don't wake yet
+                    sender_task.state = TaskState::ReplyBlocked;
+                } else {
+                    // sys_send pattern: sender can continue
+                    // Set sender's return value (IPC_OK = 0 in x0)
+                    let sender_ctx = sender_task.kernel_stack_top as *mut ExceptionContext;
+                    if !sender_ctx.is_null() {
+                        (*sender_ctx).gpr[0] = IPC_OK as u64;
+                    }
+                    sender_task.state = TaskState::Ready;
+                    sched::enqueue_task(sender_id);
                 }
-                sender_task.state = TaskState::Ready;
-                sched::enqueue_task(sender_id);
             }
 
             return (sender_id, msg);
@@ -285,14 +293,17 @@ pub fn sys_call(ctx: &mut ExceptionContext, dest: TaskId, msg: Message) -> Messa
         caller_task.state = TaskState::SendBlocked;
         enqueue_sender(dest, caller_id);
 
-        // Context switch
+        // Context switch - we'll wake when receiver processes us
         sched::context_switch_blocking(ctx);
 
-        // Woken up after send completed, now wait for reply
-        // The sender may have transitioned us directly to ReplyBlocked,
-        // or we need to transition now
-        if caller_task.state != TaskState::ReplyBlocked {
-            caller_task.state = TaskState::ReplyBlocked;
+        // Woken up - check if reply was already delivered
+        // If reply_to is None, the reply was delivered while we were in ReplyBlocked
+        // If reply_to is Some, we need to wait for the reply
+        if caller_task.ipc.reply_to.is_some() {
+            // Reply not yet delivered - make sure we're ReplyBlocked and wait
+            if caller_task.state != TaskState::ReplyBlocked {
+                caller_task.state = TaskState::ReplyBlocked;
+            }
             sched::context_switch_blocking(ctx);
         }
 
@@ -719,7 +730,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
 
             PendingSyscallResult::Complete(bytes_written, None)
         }
-        PendingSyscall::ExecveOpen { shm_id } => {
+        PendingSyscall::ExecveOpen { shm_id, argv_data, argv_offsets, argc } => {
             // Stage 1: VFS_OPEN completed - get vnode and read the ELF
             let vnode = reply.tag as i64;
 
@@ -757,12 +768,15 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 new_pending: PendingSyscall::ExecveRead {
                     vnode: vnode as u64,
                     shm_id: data_shm_id,
+                    argv_data,
+                    argv_offsets,
+                    argc,
                 },
                 target: VFS_TID,
                 msg,
             }
         }
-        PendingSyscall::ExecveRead { vnode, shm_id } => {
+        PendingSyscall::ExecveRead { vnode, shm_id, argv_data, argv_offsets, argc } => {
             // Stage 2: VFS_READ_SHM completed - parse ELF and replace the task
             let bytes_read = reply.tag as i64;
 
@@ -778,29 +792,62 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 return PendingSyscallResult::Complete(-5, None); // EIO
             }
 
-            // Get the ELF data from SHM
-            let shm_phys = shm::get_shm_phys_addr(shm_id);
-            if shm_phys == 0 {
-                return PendingSyscallResult::Complete(-12, None); // ENOMEM
+            // SHM frames may NOT be physically contiguous, but we need contiguous
+            // memory to parse the ELF. Allocate a temporary contiguous buffer.
+            let num_pages = ((bytes_read as usize) + crate::mm::frame::PAGE_SIZE - 1)
+                / crate::mm::frame::PAGE_SIZE;
+
+            // Allocate contiguous frames for the temporary ELF buffer
+            let temp_buffer_phys = match crate::mm::frame::alloc_frames_in_2mb_block(num_pages) {
+                Some(addr) => addr,
+                None => {
+                    shm::sys_shmunmap_for_task(caller_id, shm_id);
+                    return PendingSyscallResult::Complete(-12, None); // ENOMEM
+                }
+            };
+
+            // Copy SHM (non-contiguous frames) to contiguous buffer
+            let copied = shm::copy_shm_to_buffer(
+                shm_id,
+                temp_buffer_phys.0 as *mut u8,
+                bytes_read as usize
+            );
+
+            if copied < bytes_read as usize {
+                // Copy failed, free temp buffer
+                for i in 0..num_pages {
+                    crate::mm::frame::free_frame(crate::mm::frame::PhysAddr::new(
+                        temp_buffer_phys.0 + i * crate::mm::frame::PAGE_SIZE
+                    ));
+                }
+                shm::sys_shmunmap_for_task(caller_id, shm_id);
+                return PendingSyscallResult::Complete(-5, None); // EIO
             }
 
-            let elf_data = core::slice::from_raw_parts(shm_phys as *const u8, bytes_read as usize);
+            // Now we have contiguous ELF data in temp_buffer_phys
+            let elf_data = core::slice::from_raw_parts(temp_buffer_phys.0 as *const u8, bytes_read as usize);
 
-            // Replace the current task with the new ELF
-            match crate::sched::replace_task_with_elf(caller_id, elf_data) {
+            // Replace the current task with the new ELF, passing the full argv
+            let result = crate::sched::replace_task_with_elf(caller_id, elf_data, &argv_data, &argv_offsets, argc);
+
+            // Free the temporary buffer (always, regardless of success/failure)
+            for i in 0..num_pages {
+                crate::mm::frame::free_frame(crate::mm::frame::PhysAddr::new(
+                    temp_buffer_phys.0 + i * crate::mm::frame::PAGE_SIZE
+                ));
+            }
+
+            // Clean up SHM
+            shm::sys_shmunmap_for_task(caller_id, shm_id);
+
+            match result {
                 Ok(entry_point) => {
-                    // Clean up SHM
-                    shm::sys_shmunmap_for_task(caller_id, shm_id);
-
                     // Set the entry point in the task's saved context
                     let task = &TASKS[caller_id.0];
                     let ctx = task.kernel_stack_top as *mut ExceptionContext;
                     if !ctx.is_null() {
                         (*ctx).elr = entry_point as u64;
-                        // execve on success returns 0, but we set it at the new entry point
-                        // Actually, execve doesn't return on success - execution starts fresh
-                        // We set x0 = 0 for argc (simplified, no argv/envp support yet)
-                        (*ctx).gpr[0] = 0;
+                        // execve doesn't return on success - execution starts fresh
                     }
 
                     // Return 0 but note: caller won't actually see this because
@@ -808,8 +855,6 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                     PendingSyscallResult::Complete(0, None)
                 }
                 Err(e) => {
-                    // Clean up SHM
-                    shm::sys_shmunmap_for_task(caller_id, shm_id);
                     PendingSyscallResult::Complete(e, None)
                 }
             }

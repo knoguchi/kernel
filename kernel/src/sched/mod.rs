@@ -248,7 +248,17 @@ impl Scheduler {
                 // Wake up any tasks waiting to send to or waiting for reply from this task
                 task::wake_blocked_senders(current_id);
 
+                // Clean up SHM regions owned by this task
+                crate::shm::cleanup_task_shm(current_id);
+
                 let task = &mut TASKS[current_id.0];
+
+                // Drop the address space to free all its data blocks
+                // (code, stack, and any other 2MB blocks)
+                if let Some(addr_space) = task.addr_space.take() {
+                    drop(addr_space);
+                }
+
                 task.exit_code = exit_code;
                 task.state = TaskState::Terminated;
 
@@ -1567,7 +1577,13 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
 /// Preserves: task id, kernel stack, file descriptors, parent, cwd
 /// Resets: address space, entry point, heap, IPC state, notifications
 /// Returns entry_point on success, or negative error code.
-pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, i64> {
+pub fn replace_task_with_elf(
+    task_id: TaskId,
+    elf_data: &[u8],
+    argv_data: &[u8; 1024],
+    argv_offsets: &[u16; 16],
+    argc: usize,
+) -> Result<usize, i64> {
     use crate::elf::Elf64Header;
 
     // Parse ELF header
@@ -1624,17 +1640,36 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
         return Err(-12); // ENOMEM - ELF too large
     }
 
-    // Allocate frames contiguously within a 2MB block
-    let first_frame = match mm::frame::alloc_frames_in_2mb_block(num_code_frames) {
+    // Allocate frames at a 2MB boundary - this is critical because we zero the entire
+    // 2MB block. Using alloc_frames_in_2mb_block could return frames in the middle of a
+    // 2MB block, and zeroing from the block base would corrupt other allocations (like SHM).
+    let first_frame = match mm::frame::alloc_frames_at_2mb_boundary(num_code_frames) {
         Some(frame) => frame,
         None => return Err(-12), // ENOMEM
     };
-    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    // first_frame is already 2MB-aligned when using alloc_frames_at_2mb_boundary
+    let phys_base_2mb = first_frame;
+
+    // Debug: print addresses to understand allocation
+    let elf_phys_start = elf_data.as_ptr() as usize;
+    let elf_phys_end = elf_phys_start + elf_data.len();
+    let code_phys_start = phys_base_2mb.0;
+    let code_phys_end = code_phys_start + BLOCK_SIZE_2MB;
+    crate::println!("[execve] elf={:#x}-{:#x} code={:#x}-{:#x}",
+        elf_phys_start, elf_phys_end, code_phys_start, code_phys_end);
+
+    // Check ELF magic BEFORE zeroing
+    crate::println!("[execve] pre-zero magic={:02x}{:02x}{:02x}{:02x}",
+        elf_data[0], elf_data[1], elf_data[2], elf_data[3]);
 
     // Zero the entire 2MB block
     unsafe {
         core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, BLOCK_SIZE_2MB);
     }
+
+    // Check ELF magic AFTER zeroing
+    crate::println!("[execve] post-zero magic={:02x}{:02x}{:02x}{:02x}",
+        elf_data[0], elf_data[1], elf_data[2], elf_data[3]);
 
     // Load LOAD segments into the 2MB block
     for i in 0..ph_count {
@@ -1680,12 +1715,21 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
         }
     }
 
-    // Allocate a separate 2MB stack block
-    let stack_frame = match mm::frame::alloc_frames_in_2mb_block(512) {
+    // Track code block for cleanup when address space is dropped
+    new_addr_space.track_data_block(phys_base_2mb);
+
+    // Allocate a separate 2MB stack block at a 2MB boundary (same reason as code block)
+    let stack_frame = match mm::frame::alloc_frames_at_2mb_boundary(512) {
         Some(frame) => frame,
         None => return Err(-12), // ENOMEM
     };
-    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
+    // stack_frame is already 2MB-aligned
+    let stack_phys_base_2mb = stack_frame;
+
+    // Zero the stack to avoid leaking data from previous allocations
+    unsafe {
+        core::ptr::write_bytes(stack_phys_base_2mb.0 as *mut u8, 0, BLOCK_SIZE_2MB);
+    }
 
     // Map stack at USER_STACK_VADDR_BASE
     unsafe {
@@ -1693,6 +1737,9 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
             return Err(-12); // ENOMEM
         }
     }
+
+    // Track stack block for cleanup when address space is dropped
+    new_addr_space.track_data_block(stack_phys_base_2mb);
 
     // Set up the user stack with Linux ABI (argc, argv, envp, auxv)
     let stack_virt_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB;
@@ -1714,12 +1761,27 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
         *random_ptr = 0xDEADBEEF12345678u64;
         *random_ptr.add(1) = 0xCAFEBABE87654321u64;
 
-        // 2. Program name string "sh"
-        sp -= 16;
-        let prog_name_vaddr = sp;
-        let prog_name_paddr = virt_to_phys(sp);
-        let prog_name = b"sh\0";
-        core::ptr::copy_nonoverlapping(prog_name.as_ptr(), prog_name_paddr as *mut u8, prog_name.len());
+        // 2. Copy all argv strings to stack and record their virtual addresses
+        let mut argv_vaddrs: [usize; 16] = [0; 16];
+        let actual_argc = argc.min(16);
+
+        for i in (0..actual_argc).rev() {
+            let offset = argv_offsets[i] as usize;
+            // Find string length
+            let mut str_len = 0;
+            while offset + str_len < 1024 && argv_data[offset + str_len] != 0 {
+                str_len += 1;
+            }
+            // Allocate space on stack (aligned to 8 bytes)
+            sp -= (str_len + 1 + 7) & !7;
+            argv_vaddrs[i] = sp;
+            let str_paddr = virt_to_phys(sp);
+            // Copy string including null terminator
+            for j in 0..=str_len {
+                let c = if offset + j < 1024 { argv_data[offset + j] } else { 0 };
+                core::ptr::write((str_paddr + j) as *mut u8, c);
+            }
+        }
 
         // 3. Align to 16 bytes
         sp = sp & !15;
@@ -1769,22 +1831,28 @@ pub fn replace_task_with_elf(task_id: TaskId, elf_data: &[u8]) -> Result<usize, 
         sp -= 8;
         *(virt_to_phys(sp) as *mut u64) = 0;
 
-        // 6. argv[] = { prog_name, NULL }
+        // 6. argv[] = { argv[0], argv[1], ..., NULL }
         sp -= 8;
-        *(virt_to_phys(sp) as *mut u64) = 0;
-        sp -= 8;
-        *(virt_to_phys(sp) as *mut u64) = prog_name_vaddr as u64;
+        *(virt_to_phys(sp) as *mut u64) = 0; // NULL terminator
+        for i in (0..actual_argc).rev() {
+            sp -= 8;
+            *(virt_to_phys(sp) as *mut u64) = argv_vaddrs[i] as u64;
+        }
 
-        // 7. argc = 1
+        // 7. argc
         sp -= 8;
-        *(virt_to_phys(sp) as *mut u64) = 1;
+        *(virt_to_phys(sp) as *mut u64) = actual_argc as u64;
     }
 
     // Update the task
     unsafe {
         let task = &mut TASKS[task_id.0];
 
-        // Replace old address space with new one
+        // Reset mmap state for the new process image
+        task.mmap_state = crate::mmap::MmapState::new();
+
+        // Replace old address space with new one (old one will be dropped and its
+        // data_blocks will be freed automatically)
         task.addr_space = Some(new_addr_space);
         task.entry_point = entry_point;
 

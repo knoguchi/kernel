@@ -82,26 +82,11 @@ fn uart_read(buf: &mut [u8]) -> usize {
     let mut count = 0;
 
     // Block until we get at least one character
+    // Note: No echo here - let the shell handle echo (termios ECHO flag equivalent)
     loop {
         if let Some(c) = uart_getc() {
-            // Echo the character back
-            uart_putc(c);
-
-            // Handle backspace
-            if c == 0x7f || c == 0x08 {
-                if count > 0 {
-                    count -= 1;
-                    // Erase character on terminal
-                    uart_putc(0x08); // backspace
-                    uart_putc(b' '); // space
-                    uart_putc(0x08); // backspace
-                }
-                continue;
-            }
-
-            // Handle enter (CR or LF)
+            // Handle enter (CR or LF) - convert CR to LF
             if c == b'\r' || c == b'\n' {
-                uart_putc(b'\n');
                 if count < buf.len() {
                     buf[count] = b'\n';
                     count += 1;
@@ -109,7 +94,7 @@ fn uart_read(buf: &mut [u8]) -> usize {
                 break;
             }
 
-            // Store character
+            // Store character (including backspace - let shell handle it)
             if count < buf.len() {
                 buf[count] = c;
                 count += 1;
