@@ -1376,6 +1376,7 @@ pub mod msg {
     pub const PIPE_READ: u64 = 501;     // Read from pipe (pipe_id, shm_id, max_len)
     pub const PIPE_WRITE: u64 = 502;    // Write to pipe (pipe_id, shm_id, len)
     pub const PIPE_CLOSE: u64 = 503;    // Close pipe end (pipe_id, is_read_end)
+    pub const PIPE_DUP: u64 = 504;      // Duplicate pipe fd (pipe_id, is_read_end) - increments refcount
 
     // Framebuffer device server messages
     pub const FB_INIT: u64 = 400;       // Get FB info -> [width, height, bpp, stride]

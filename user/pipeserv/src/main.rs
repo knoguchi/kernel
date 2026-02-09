@@ -7,7 +7,7 @@
 #![no_main]
 
 use libkenix::ipc::{self, Message, TASK_ANY};
-use libkenix::msg::{PIPE_CREATE, PIPE_READ, PIPE_WRITE, PIPE_CLOSE, ERR_OK, ERR_NOMEM, ERR_INVAL, ERR_BADF};
+use libkenix::msg::{PIPE_CREATE, PIPE_READ, PIPE_WRITE, PIPE_CLOSE, PIPE_DUP, ERR_OK, ERR_NOMEM, ERR_INVAL, ERR_BADF};
 use libkenix::shm;
 use libkenix::uart;
 
@@ -461,6 +461,37 @@ pub extern "C" fn _start() -> ! {
                 // Free pipe if no more references
                 if pipe.should_free() {
                     free_pipe(pipe_id);
+                }
+
+                let reply = Message::new(ERR_OK as u64, [0; 4]);
+                ipc::reply(&reply);
+            }
+
+            PIPE_DUP => {
+                // PIPE_DUP: data[0] = pipe_id, data[1] = is_read_end (1=read, 0=write)
+                // Increment reference count (used when forking a process with pipe fds)
+                let pipe_id = msg.data[0] as usize;
+                let is_read = msg.data[1] != 0;
+
+                // Validate pipe_id
+                if pipe_id >= MAX_PIPES {
+                    let reply = Message::new(ERR_BADF as u64, [0; 4]);
+                    ipc::reply(&reply);
+                    continue;
+                }
+
+                let pipe = unsafe { &mut PIPES[pipe_id] };
+                if !pipe.in_use {
+                    let reply = Message::new(ERR_BADF as u64, [0; 4]);
+                    ipc::reply(&reply);
+                    continue;
+                }
+
+                // Increment appropriate reference count
+                if is_read {
+                    pipe.readers += 1;
+                } else {
+                    pipe.writers += 1;
                 }
 
                 let reply = Message::new(ERR_OK as u64, [0; 4]);

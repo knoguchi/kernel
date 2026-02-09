@@ -34,6 +34,7 @@ const PIPE_CREATE: u64 = 500;
 const PIPE_READ: u64 = 501;
 const PIPE_WRITE: u64 = 502;
 const PIPE_CLOSE: u64 = 503;
+const PIPE_DUP: u64 = 504;
 
 /// Syscall numbers - IPC (Kenix microkernel)
 pub const SYS_SEND: u16 = 1;     // Send message, block until received
@@ -1205,19 +1206,46 @@ fn sys_fork(ctx: &mut ExceptionContext) -> i64 {
     child_task.kernel_stack_top = child_exception_ctx as usize;
 
 
-    // 6. Duplicate file descriptors
+    // 6. Duplicate file descriptors and collect pipe fds that need PIPE_DUP
+    let mut pipe_fds: [(u64, bool); sched::MAX_FDS] = [(0, false); sched::MAX_FDS];
+    let mut num_pipe_fds = 0usize;
+
     for i in 0..sched::MAX_FDS {
         if parent_task.fds[i].is_valid() {
             child_task.fds[i] = parent_task.fds[i];
-            // TODO: Increment reference counts for underlying file/pipe objects
-            // This is crucial for proper resource management. For now, sharing implicitly.
+
+            // Track pipe fds for reference count increment
+            match parent_task.fds[i].kind {
+                FdKind::PipeRead => {
+                    if num_pipe_fds < sched::MAX_FDS {
+                        pipe_fds[num_pipe_fds] = (parent_task.fds[i].handle, true);
+                        num_pipe_fds += 1;
+                    }
+                }
+                FdKind::PipeWrite => {
+                    if num_pipe_fds < sched::MAX_FDS {
+                        pipe_fds[num_pipe_fds] = (parent_task.fds[i].handle, false);
+                        num_pipe_fds += 1;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
     // 7. Add child to ready queue
     sched::enqueue_task(child_id);
 
-    // 8. Parent returns child's TID
+    // 8. Send PIPE_DUP to pipeserv for each pipe fd to increment reference counts
+    // This must be done after the child is created but before returning to parent
+    for i in 0..num_pipe_fds {
+        let (pipe_id, is_read) = pipe_fds[i];
+        let msg = Message::new(PIPE_DUP, [pipe_id, is_read as u64, 0, 0]);
+        // Use blocking IPC call - pipeserv will reply immediately
+        ipc::sys_call(ctx, PIPESERV_TID, msg);
+    }
+
+    // 9. Parent returns child's TID
     child_id.0 as i64
 }
 
