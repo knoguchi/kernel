@@ -679,7 +679,7 @@ impl Drop for AddressSpace {
                 if (block_addr.0 & (BLOCK_SIZE_2MB - 1)) == 0 {
                     // 2MB-aligned: it's a 2MB block, free all 512 pages
                     for i in 0..512 {
-                        free_frame(PhysAddr(block_addr.0 + i * 4096));
+                        free_frame(PhysAddr(block_addr.0 + i * PAGE_SIZE));
                     }
                 } else {
                     // Not 2MB-aligned: it's a single 4KB page

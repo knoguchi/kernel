@@ -10,8 +10,6 @@
 mod fwcfg;
 mod ramfb;
 mod font;
-mod virtio_mmio;
-mod virtqueue;
 mod virtio_gpu;
 
 use libkenix::{uart, ipc, msg, shm, tasks};

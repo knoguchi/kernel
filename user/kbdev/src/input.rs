@@ -2,8 +2,8 @@
 //!
 //! Handles keyboard input via virtio-input device.
 
-use crate::virtio_mmio::{VirtioMmio, device_id, status, VIRTIO_MMIO_BASE};
-use crate::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
+use libvirtio::mmio::{VirtioMmio, device_id, status, VIRTIO_MMIO_BASE};
+use libvirtio::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
 use libkenix::uart;
 
 /// VirtIO input event (matches Linux input_event structure)

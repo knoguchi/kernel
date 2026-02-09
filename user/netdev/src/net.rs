@@ -4,8 +4,8 @@
 
 #![allow(dead_code)]
 
-use crate::virtio_mmio::{VirtioMmio, status, device_id};
-use crate::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
+use libvirtio::mmio::{VirtioMmio, status, device_id};
+use libvirtio::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
 use core::sync::atomic::{fence, Ordering};
 
 /// Maximum packet size (MTU + Ethernet header)
@@ -330,9 +330,14 @@ impl VirtioNet {
         fence(Ordering::SeqCst);
         self.mmio.notify_queue(1);
 
-        // Wait for completion
-        while !self.tx_queue.has_used() {
-            core::hint::spin_loop();
+        // Wait for completion - yield CPU instead of busy-spin
+        let mut timeout = 100000u32;
+        while !self.tx_queue.has_used() && timeout > 0 {
+            timeout -= 1;
+            libkenix::syscall::yield_cpu();
+        }
+        if timeout == 0 {
+            return -5; // Timeout error
         }
 
         let (_head, _len) = unsafe { self.tx_queue.pop_used().unwrap() };

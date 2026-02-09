@@ -49,8 +49,10 @@ pub mod status {
 
 /// VirtIO device IDs
 pub mod device_id {
-    pub const NET: u32 = 1;
     pub const BLOCK: u32 = 2;
+    pub const NET: u32 = 1;
+    pub const GPU: u32 = 16;
+    pub const INPUT: u32 = 18;
 }
 
 /// VirtIO MMIO magic value
@@ -77,12 +79,12 @@ impl VirtioMmio {
         unsafe { write_volatile((self.base + offset) as *mut u32, value) }
     }
 
-    /// Read from configuration space
+    /// Read from configuration space (generic)
     pub fn read_config<T: Copy>(&self, offset: usize) -> T {
         unsafe { read_volatile((self.base + regs::CONFIG + offset) as *const T) }
     }
 
-    /// Read a byte from configuration space
+    /// Read a single byte from configuration space
     pub fn read_config_byte(&self, offset: usize) -> u8 {
         unsafe { read_volatile((self.base + regs::CONFIG + offset) as *const u8) }
     }

@@ -5,8 +5,6 @@
 #![no_std]
 #![no_main]
 
-mod virtio_mmio;
-mod virtqueue;
 mod blk;
 
 use libkenix::ipc::{self, Message, TASK_ANY};
@@ -16,7 +14,7 @@ use libkenix::syscall;
 use libkenix::uart;
 use libkenix::VIRTIO_BLK_IRQ;
 use blk::{VirtioBlk, SECTOR_SIZE};
-use virtio_mmio::VIRTIO_MMIO_BASE;
+use libvirtio::mmio::VIRTIO_MMIO_BASE;
 
 /// Block device server state
 static mut BLOCK_DEV: VirtioBlk = VirtioBlk::new(VIRTIO_MMIO_BASE);

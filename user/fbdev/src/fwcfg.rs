@@ -199,6 +199,7 @@ impl FwCfg {
         write_volatile(dma_reg, dma_paddr.to_be());
 
         // Poll for completion (control field becomes 0 when done)
+        let mut timeout = 100000u32;
         loop {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             let control = u32::from_be(core::ptr::read_volatile(&DMA_ACCESS.control));
@@ -209,7 +210,12 @@ impl FwCfg {
                 // DMA error
                 break;
             }
-            core::hint::spin_loop();
+            timeout -= 1;
+            if timeout == 0 {
+                // Timeout - DMA taking too long
+                break;
+            }
+            libkenix::syscall::yield_cpu();
         }
     }
 }

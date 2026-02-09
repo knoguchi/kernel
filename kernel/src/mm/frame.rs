@@ -250,6 +250,10 @@ impl FrameAllocator {
 
     /// Get a bit from the bitmap (true = allocated)
     fn get_bit(&self, index: usize) -> bool {
+        if index >= MAX_PAGES {
+            // Out of bounds - treat as allocated to prevent allocation
+            return true;
+        }
         let byte_index = index / 8;
         let bit_offset = index % 8;
         (self.bitmap[byte_index] & (1 << bit_offset)) != 0
@@ -257,6 +261,10 @@ impl FrameAllocator {
 
     /// Set a bit in the bitmap
     fn set_bit(&mut self, index: usize, value: bool) {
+        if index >= MAX_PAGES {
+            // Out of bounds - silently ignore
+            return;
+        }
         let byte_index = index / 8;
         let bit_offset = index % 8;
         if value {

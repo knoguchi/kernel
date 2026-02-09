@@ -4,8 +4,8 @@
 
 #![allow(dead_code)]
 
-use crate::virtio_mmio::{VirtioMmio, status, device_id};
-use crate::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
+use libvirtio::mmio::{VirtioMmio, status, device_id};
+use libvirtio::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
 use core::sync::atomic::{fence, Ordering};
 
 /// Block sector size
@@ -328,11 +328,14 @@ impl VirtioBlk {
         fence(Ordering::SeqCst);
         self.mmio.notify_queue(0);
 
-        // Wait for completion (will be woken by IRQ)
-        while !self.queue.has_used() {
-            // In a real implementation, we'd block here waiting for IRQ
-            // For now, just spin
-            core::hint::spin_loop();
+        // Wait for completion - yield CPU instead of busy-spin
+        let mut timeout = 100000u32;
+        while !self.queue.has_used() && timeout > 0 {
+            timeout -= 1;
+            libkenix::syscall::yield_cpu();
+        }
+        if timeout == 0 {
+            return -5; // Timeout error
         }
 
         // Process completion
@@ -437,9 +440,14 @@ impl VirtioBlk {
         fence(Ordering::SeqCst);
         self.mmio.notify_queue(0);
 
-        // Wait for completion
-        while !self.queue.has_used() {
-            core::hint::spin_loop();
+        // Wait for completion - yield CPU instead of busy-spin
+        let mut timeout = 100000u32;
+        while !self.queue.has_used() && timeout > 0 {
+            timeout -= 1;
+            libkenix::syscall::yield_cpu();
+        }
+        if timeout == 0 {
+            return -5; // Timeout error
         }
 
         // Process completion

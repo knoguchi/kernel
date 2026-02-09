@@ -12,9 +12,9 @@
 
 pub mod task;
 
-pub use task::{TaskId, TaskState, Message, KERNEL_STACK_SIZE, FileDescriptor, MAX_FDS, PendingSyscall, MAX_PATH_LEN, DEFAULT_HEAP_START};
+pub use task::{TaskId, TaskState, Message, KERNEL_STACK_SIZE, FileDescriptor, MAX_FDS, PendingSyscall, MAX_PATH_LEN};
 
-use crate::mm::{self, PhysAddr, AddressSpace, PageFlags};
+use crate::mm::{self, PhysAddr, AddressSpace, PageFlags, PAGE_SIZE};
 use crate::exception::ExceptionContext;
 use crate::elf::{ElfFile, PF_W, PF_X};
 use task::{TASKS, DEFAULT_TIME_SLICE};
@@ -729,7 +729,7 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
             (AT_PHDR, phdr_addr as u64),
             (AT_PHENT, phent),
             (AT_PHNUM, phnum),
-            (AT_PAGESZ, 4096),
+            (AT_PAGESZ, PAGE_SIZE as u64),
             (AT_ENTRY, user_entry_point as u64),
             (AT_UID, 0),
             (AT_EUID, 0),
@@ -1529,7 +1529,7 @@ pub fn replace_task_with_elf(
 
     // Calculate how many frames we need (4KB pages)
     let code_size = max_vaddr - min_vaddr;
-    let num_code_frames = (code_size + 4095) / 4096;
+    let num_code_frames = (code_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
     if num_code_frames > MAX_CODE_FRAMES {
         return Err(-12); // ENOMEM - ELF too large
@@ -1704,7 +1704,7 @@ pub fn replace_task_with_elf(
             (AT_PHDR, phdr_addr as u64),
             (AT_PHENT, phent),
             (AT_PHNUM, phnum),
-            (AT_PAGESZ, 4096),
+            (AT_PAGESZ, PAGE_SIZE as u64),
             (AT_ENTRY, entry_point as u64),
             (AT_UID, 0),
             (AT_EUID, 0),
@@ -1751,8 +1751,9 @@ pub fn replace_task_with_elf(
         task.addr_space = Some(new_addr_space);
         task.entry_point = entry_point;
 
-        // Reset heap to default
-        task.heap_brk = DEFAULT_HEAP_START;
+        // Set heap_brk to end of ELF segments (page-aligned) for musl/Linux compatibility
+        // Linux brk starts at the end of the data segment, not at a fixed address
+        task.heap_brk = (max_vaddr + 0xfff) & !0xfff;
 
         // Reset IPC state
         task.ipc = task::IpcState::empty();

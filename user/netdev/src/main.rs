@@ -5,8 +5,6 @@
 #![no_std]
 #![no_main]
 
-mod virtio_mmio;
-mod virtqueue;
 mod net;
 
 use libkenix::ipc::{self, Message, TASK_ANY};
@@ -16,7 +14,7 @@ use libkenix::syscall;
 use libkenix::uart;
 use libkenix::VIRTIO_NET_IRQ;
 use net::VirtioNet;
-use virtio_mmio::VIRTIO_MMIO_BASE;
+use libvirtio::mmio::VIRTIO_MMIO_BASE;
 
 /// Network device server state
 static mut NET_DEV: VirtioNet = VirtioNet::new(VIRTIO_MMIO_BASE);

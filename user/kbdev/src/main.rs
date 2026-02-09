@@ -6,8 +6,6 @@
 #![no_std]
 #![no_main]
 
-mod virtio_mmio;
-mod virtqueue;
 mod input;
 
 use libkenix::ipc::{self, Message};
@@ -17,7 +15,7 @@ use libkenix::syscall;
 use libkenix::uart;
 use libkenix::tasks;
 use input::{VirtioInput, event_type};
-use virtio_mmio::VIRTIO_MMIO_BASE;
+use libvirtio::mmio::VIRTIO_MMIO_BASE;
 
 /// Keyboard device state
 static mut KB_DEV: VirtioInput = VirtioInput::new(VIRTIO_MMIO_BASE);

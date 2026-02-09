@@ -7,6 +7,7 @@ name = "blkdev"
 version = "0.1.0"
 dependencies = [
  "libkenix",
+ "libvirtio",
 ]
 
 [[package]]
@@ -21,6 +22,7 @@ name = "fbdev"
 version = "0.1.0"
 dependencies = [
  "libkenix",
+ "libvirtio",
 ]
 
 [[package]]
@@ -49,6 +51,7 @@ name = "kbdev"
 version = "0.1.0"
 dependencies = [
  "libkenix",
+ "libvirtio",
 ]
 
 [[package]]
@@ -56,10 +59,15 @@ name = "libkenix"
 version = "0.1.0"
 
 [[package]]
+name = "libvirtio"
+version = "0.1.0"
+
+[[package]]
 name = "netdev"
 version = "0.1.0"
 dependencies = [
  "libkenix",
+ "libvirtio",
 ]
 
 [[package]]

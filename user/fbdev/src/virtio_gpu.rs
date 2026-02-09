@@ -2,8 +2,8 @@
 //!
 //! Implements basic 2D framebuffer using virtio-gpu protocol.
 
-use crate::virtio_mmio::{VirtioMmio, status, VIRTIO_MMIO_BASE};
-use crate::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
+use libvirtio::mmio::{VirtioMmio, status, VIRTIO_MMIO_BASE};
+use libvirtio::virtqueue::{Virtqueue, desc_flags, MAX_QUEUE_SIZE};
 use libkenix::uart;
 use core::sync::atomic::{fence, Ordering};
 
