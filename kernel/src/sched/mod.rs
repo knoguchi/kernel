@@ -581,28 +581,32 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         return None;
     }
 
-    // Calculate the 2MB block that contains all segments
+    // Calculate 2MB-aligned virtual address range
+    // This is critical: even if code_size < 2MB, if the code spans a 2MB boundary,
+    // we need to map multiple 2MB blocks
     let block_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
+    let virt_end = (max_vaddr + BLOCK_SIZE_2MB - 1) & !(BLOCK_SIZE_2MB - 1);
+    let num_2mb_blocks = (virt_end - block_base) / BLOCK_SIZE_2MB;
 
-    // Calculate how many 4KB frames we need for the code
-    let code_size = max_vaddr - min_vaddr;
-    let num_frames = (code_size + mm::frame::PAGE_SIZE - 1) / mm::frame::PAGE_SIZE;
-
-    if num_frames > MAX_CODE_FRAMES {
+    // Check limits - we support up to 4 2MB blocks (8MB total)
+    const MAX_CODE_2MB_BLOCKS: usize = 4;
+    if num_2mb_blocks > MAX_CODE_2MB_BLOCKS {
         // Code too large
         return None;
     }
+
+    // Calculate how many 4KB frames we need
+    let num_frames = num_2mb_blocks * 512; // 512 pages per 2MB block
 
     // Allocate code frames at the START of a 2MB block.
     // Since ELFs are linked at virtual address 0 and we map virtual 0 to phys_base_2mb,
     // the code must be at the start of the physical block.
     let first_frame = mm::frame::alloc_frames_at_2mb_boundary(num_frames)?;
     let phys_base_2mb = first_frame; // first_frame IS the 2MB block base
-    let _first_frame_offset = 0; // Always 0 now
 
-    // Zero the entire 2MB block (ensures .bss is zeroed)
+    // Zero ALL allocated memory (ensures .bss is zeroed)
     unsafe {
-        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, BLOCK_SIZE_2MB);
+        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, num_2mb_blocks * BLOCK_SIZE_2MB);
     }
 
     // Copy all segments directly into the 2MB physical block
@@ -642,12 +646,18 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
     // need to write to global variables. Using RWX is less secure but necessary.
     let flags = PageFlags::user_code_data();
 
-    // Map the 2MB block at the correct virtual address (block_base)
+    // Map ALL 2MB code blocks at the correct virtual addresses
     // Linux binaries are typically linked at 0x400000 (4MB), not 0
-    unsafe {
-        if !addr_space.map_2mb(block_base, phys_base_2mb, flags) {
-            return None;
+    for block_idx in 0..num_2mb_blocks {
+        let block_vaddr = block_base + block_idx * BLOCK_SIZE_2MB;
+        let block_paddr = PhysAddr(phys_base_2mb.0 + block_idx * BLOCK_SIZE_2MB);
+        unsafe {
+            if !addr_space.map_2mb(block_vaddr, block_paddr, flags) {
+                return None;
+            }
         }
+        // Track each code block for cleanup when address space is dropped
+        addr_space.track_data_block(block_paddr);
     }
 
     // Allocate user stack at start of a 2MB block (just like code).
@@ -662,6 +672,8 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
             return None;
         }
     }
+    // Track stack block for cleanup
+    addr_space.track_data_block(stack_phys_base_2mb);
 
     // Get the ELF entry point
     let user_entry_point = elf.entry_point() as usize;
@@ -1527,16 +1539,24 @@ pub fn replace_task_with_elf(
         return Err(-1); // No loadable segments
     }
 
-    // Calculate how many frames we need (4KB pages)
-    let code_size = max_vaddr - min_vaddr;
-    let num_code_frames = (code_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    // Calculate 2MB-aligned virtual address range
+    // This is critical: even if code_size < 2MB, if the code spans a 2MB boundary,
+    // we need to map multiple 2MB blocks
+    let virt_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
+    let virt_end = (max_vaddr + BLOCK_SIZE_2MB - 1) & !(BLOCK_SIZE_2MB - 1);
+    let num_2mb_blocks = (virt_end - virt_base) / BLOCK_SIZE_2MB;
 
-    if num_code_frames > MAX_CODE_FRAMES {
+    // Check limits - we support up to 4 2MB blocks (8MB total)
+    const MAX_CODE_2MB_BLOCKS: usize = 4;
+    if num_2mb_blocks > MAX_CODE_2MB_BLOCKS {
         return Err(-12); // ENOMEM - ELF too large
     }
 
+    // Calculate how many frames we need (4KB pages)
+    let num_code_frames = num_2mb_blocks * 512; // 512 pages per 2MB block
+
     // Allocate frames at a 2MB boundary - this is critical because we zero the entire
-    // 2MB block. Using alloc_frames_in_2mb_block could return frames in the middle of a
+    // memory region. Using alloc_frames_in_2mb_block could return frames in the middle of a
     // 2MB block, and zeroing from the block base would corrupt other allocations (like SHM).
     let first_frame = match mm::frame::alloc_frames_at_2mb_boundary(num_code_frames) {
         Some(frame) => frame,
@@ -1549,24 +1569,25 @@ pub fn replace_task_with_elf(
     let elf_phys_start = elf_data.as_ptr() as usize;
     let elf_phys_end = elf_phys_start + elf_data.len();
     let code_phys_start = phys_base_2mb.0;
-    let code_phys_end = code_phys_start + BLOCK_SIZE_2MB;
-    crate::println!("[execve] elf={:#x}-{:#x} code={:#x}-{:#x}",
-        elf_phys_start, elf_phys_end, code_phys_start, code_phys_end);
+    let code_phys_end = code_phys_start + num_2mb_blocks * BLOCK_SIZE_2MB;
+    crate::println!("[execve] elf={:#x}-{:#x} code={:#x}-{:#x} virt={:#x}-{:#x} blocks={}",
+        elf_phys_start, elf_phys_end, code_phys_start, code_phys_end,
+        virt_base, virt_end, num_2mb_blocks);
 
     // Check ELF magic BEFORE zeroing
     crate::println!("[execve] pre-zero magic={:02x}{:02x}{:02x}{:02x}",
         elf_data[0], elf_data[1], elf_data[2], elf_data[3]);
 
-    // Zero the entire 2MB block
+    // Zero ALL allocated memory (not just one 2MB block)
     unsafe {
-        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, BLOCK_SIZE_2MB);
+        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, num_2mb_blocks * BLOCK_SIZE_2MB);
     }
 
     // Check ELF magic AFTER zeroing
     crate::println!("[execve] post-zero magic={:02x}{:02x}{:02x}{:02x}",
         elf_data[0], elf_data[1], elf_data[2], elf_data[3]);
 
-    // Load LOAD segments into the 2MB block
+    // Load LOAD segments into the allocated memory
     for i in 0..ph_count {
         let ph_start = ph_offset + i * ph_size;
         if ph_start + ph_size > elf_data.len() {
@@ -1579,8 +1600,9 @@ pub fn replace_task_with_elf(
             let file_size = phdr.p_filesz as usize;
             let vaddr = phdr.p_vaddr as usize;
 
-            // Calculate physical offset within the 2MB block
-            let phys_offset = vaddr - min_vaddr;
+            // Calculate physical offset from the base of our allocation
+            // vaddr is relative to virt_base, not min_vaddr
+            let phys_offset = vaddr - virt_base;
             let dest_addr = phys_base_2mb.0 + phys_offset;
 
             if file_offset + file_size <= elf_data.len() {
@@ -1600,18 +1622,19 @@ pub fn replace_task_with_elf(
         None => return Err(-12), // ENOMEM - couldn't create address space
     };
 
-    // Map code at the 2MB-aligned virtual address where the ELF expects to be loaded
-    // Linux binaries are typically linked at 0x400000 (4MB), not 0
-    // Use user_code_data (RWX) since the 2MB block contains both code and writable data
-    let virt_base = min_vaddr & !(BLOCK_SIZE_2MB - 1);
-    unsafe {
-        if !new_addr_space.map_2mb(virt_base, phys_base_2mb, PageFlags::user_code_data()) {
-            return Err(-12); // ENOMEM
+    // Map ALL 2MB code blocks at the aligned virtual addresses
+    // Use user_code_data (RWX) since the blocks contain both code and writable data
+    for block_idx in 0..num_2mb_blocks {
+        let block_vaddr = virt_base + block_idx * BLOCK_SIZE_2MB;
+        let block_paddr = PhysAddr(phys_base_2mb.0 + block_idx * BLOCK_SIZE_2MB);
+        unsafe {
+            if !new_addr_space.map_2mb(block_vaddr, block_paddr, PageFlags::user_code_data()) {
+                return Err(-12); // ENOMEM
+            }
         }
+        // Track each code block for cleanup when address space is dropped
+        new_addr_space.track_data_block(block_paddr);
     }
-
-    // Track code block for cleanup when address space is dropped
-    new_addr_space.track_data_block(phys_base_2mb);
 
     // Allocate a separate 2MB stack block at a 2MB boundary (same reason as code block)
     let stack_frame = match mm::frame::alloc_frames_at_2mb_boundary(512) {
