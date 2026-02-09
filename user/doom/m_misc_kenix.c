@@ -1,0 +1,573 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id:$
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+//
+// Patched for Kenix (64-bit aarch64) by using intptr_t for pointer storage
+//
+//-----------------------------------------------------------------------------
+
+static const char
+rcsid[] = "$Id: m_misc.c,v 1.6 1997/02/03 22:45:10 b1 Exp $";
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdint.h>  // for intptr_t
+
+#include <ctype.h>
+
+
+#include "doomdef.h"
+
+#include "z_zone.h"
+
+#include "m_swap.h"
+#include "m_argv.h"
+
+#include "w_wad.h"
+
+#include "i_system.h"
+#include "i_video.h"
+#include "v_video.h"
+
+#include "hu_stuff.h"
+
+// State.
+#include "doomstat.h"
+
+// Data.
+#include "dstrings.h"
+
+#include "m_misc.h"
+
+//
+// M_DrawText
+// Returns the final X coordinate
+// HU_Init must have been called to init the font
+//
+extern patch_t*		hu_font[HU_FONTSIZE];
+
+int
+M_DrawText
+( int		x,
+  int		y,
+  boolean	direct,
+  char*		string )
+{
+    int 	c;
+    int		w;
+
+    while (*string)
+    {
+	c = toupper(*string) - HU_FONTSTART;
+	string++;
+	if (c < 0 || c> HU_FONTSIZE)
+	{
+	    x += 4;
+	    continue;
+	}
+
+	w = SHORT (hu_font[c]->width);
+	if (x+w > SCREENWIDTH)
+	    break;
+	if (direct)
+	    V_DrawPatchDirect(x, y, 0, hu_font[c]);
+	else
+	    V_DrawPatch(x, y, 0, hu_font[c]);
+	x+=w;
+    }
+
+    return x;
+}
+
+
+
+
+//
+// M_WriteFile
+//
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+
+boolean
+M_WriteFile
+( char const*	name,
+  void*		source,
+  int		length )
+{
+    int		handle;
+    int		count;
+
+    handle = open ( name, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666);
+
+    if (handle == -1)
+	return false;
+
+    count = write (handle, source, length);
+    close (handle);
+
+    if (count < length)
+	return false;
+
+    return true;
+}
+
+
+//
+// M_ReadFile
+//
+int
+M_ReadFile
+( char const*	name,
+  byte**	buffer )
+{
+    int	handle, count, length;
+    struct stat	fileinfo;
+    byte		*buf;
+
+    handle = open (name, O_RDONLY | O_BINARY, 0666);
+    if (handle == -1)
+	I_Error ("Couldn't read file %s", name);
+    if (fstat (handle,&fileinfo) == -1)
+	I_Error ("Couldn't read file %s", name);
+    length = fileinfo.st_size;
+    buf = Z_Malloc (length, PU_STATIC, NULL);
+    count = read (handle, buf, length);
+    close (handle);
+
+    if (count < length)
+	I_Error ("Couldn't read file %s", name);
+
+    *buffer = buf;
+    return length;
+}
+
+
+//
+// DEFAULTS
+//
+int		usemouse;
+int		usejoystick;
+
+extern int	key_right;
+extern int	key_left;
+extern int	key_up;
+extern int	key_down;
+
+extern int	key_strafeleft;
+extern int	key_straferight;
+
+extern int	key_fire;
+extern int	key_use;
+extern int	key_strafe;
+extern int	key_speed;
+
+extern int	mousebfire;
+extern int	mousebstrafe;
+extern int	mousebforward;
+
+extern int	joybfire;
+extern int	joybstrafe;
+extern int	joybuse;
+extern int	joybspeed;
+
+extern int	viewwidth;
+extern int	viewheight;
+
+extern int	mouseSensitivity;
+extern int	showMessages;
+
+extern int	detailLevel;
+
+extern int	screenblocks;
+
+// showMessages already declared above
+
+// machine-independent sound params
+extern	int	numChannels;
+
+
+// UNIX hack, to be removed.
+#ifdef SNDSERV
+extern char*	sndserver_filename;
+extern int	mb_used;
+#endif
+
+#ifdef LINUX
+char*		mousetype;
+char*		mousedev;
+#endif
+
+extern char*	chat_macros[];
+
+
+// Patched struct for 64-bit: use intptr_t for defaultvalue to hold pointers
+typedef struct
+{
+    char*	name;
+    intptr_t*	location;     // Changed from int* to intptr_t* for 64-bit
+    intptr_t	defaultvalue; // Changed from int to intptr_t for 64-bit
+    int		scantranslate;		// PC scan code hack
+    int		untranslated;		// lousy hack
+} default_t;
+
+// String defaults - stored separately for initialization
+static char* sndserver_default = "sndserver";
+static char* mousedev_default = "/dev/ttyS0";
+static char* mousetype_default = "microsoft";
+
+default_t	defaults[] =
+{
+    {"mouse_sensitivity",(intptr_t*)&mouseSensitivity, 5},
+    {"sfx_volume",(intptr_t*)&snd_SfxVolume, 8},
+    {"music_volume",(intptr_t*)&snd_MusicVolume, 8},
+    {"show_messages",(intptr_t*)&showMessages, 1},
+
+
+#ifdef NORMALUNIX
+    {"key_right",(intptr_t*)&key_right, KEY_RIGHTARROW},
+    {"key_left",(intptr_t*)&key_left, KEY_LEFTARROW},
+    {"key_up",(intptr_t*)&key_up, KEY_UPARROW},
+    {"key_down",(intptr_t*)&key_down, KEY_DOWNARROW},
+    {"key_strafeleft",(intptr_t*)&key_strafeleft, ','},
+    {"key_straferight",(intptr_t*)&key_straferight, '.'},
+
+    {"key_fire",(intptr_t*)&key_fire, KEY_RCTRL},
+    {"key_use",(intptr_t*)&key_use, ' '},
+    {"key_strafe",(intptr_t*)&key_strafe, KEY_RALT},
+    {"key_speed",(intptr_t*)&key_speed, KEY_RSHIFT},
+
+// UNIX hack, to be removed.
+#ifdef SNDSERV
+    {"sndserver", (intptr_t *) &sndserver_filename, 0},  // Initialized at runtime
+    {"mb_used", (intptr_t*)&mb_used, 2},
+#endif
+
+#endif
+
+#ifdef LINUX
+    {"mousedev", (intptr_t*)&mousedev, 0},      // Initialized at runtime
+    {"mousetype", (intptr_t*)&mousetype, 0},    // Initialized at runtime
+#endif
+
+    {"use_mouse",(intptr_t*)&usemouse, 1},
+    {"mouseb_fire",(intptr_t*)&mousebfire,0},
+    {"mouseb_strafe",(intptr_t*)&mousebstrafe,1},
+    {"mouseb_forward",(intptr_t*)&mousebforward,2},
+
+    {"use_joystick",(intptr_t*)&usejoystick, 0},
+    {"joyb_fire",(intptr_t*)&joybfire,0},
+    {"joyb_strafe",(intptr_t*)&joybstrafe,1},
+    {"joyb_use",(intptr_t*)&joybuse,3},
+    {"joyb_speed",(intptr_t*)&joybspeed,2},
+
+    {"screenblocks",(intptr_t*)&screenblocks, 9},
+    {"detaillevel",(intptr_t*)&detailLevel, 0},
+
+    {"snd_channels",(intptr_t*)&numChannels, 3},
+
+
+
+    {"usegamma",(intptr_t*)&usegamma, 0},
+
+    {"chatmacro0", (intptr_t *) &chat_macros[0], 0 },  // Initialized at runtime
+    {"chatmacro1", (intptr_t *) &chat_macros[1], 0 },
+    {"chatmacro2", (intptr_t *) &chat_macros[2], 0 },
+    {"chatmacro3", (intptr_t *) &chat_macros[3], 0 },
+    {"chatmacro4", (intptr_t *) &chat_macros[4], 0 },
+    {"chatmacro5", (intptr_t *) &chat_macros[5], 0 },
+    {"chatmacro6", (intptr_t *) &chat_macros[6], 0 },
+    {"chatmacro7", (intptr_t *) &chat_macros[7], 0 },
+    {"chatmacro8", (intptr_t *) &chat_macros[8], 0 },
+    {"chatmacro9", (intptr_t *) &chat_macros[9], 0 }
+
+};
+
+int	numdefaults;
+char*	defaultfile;
+
+
+//
+// M_SaveDefaults
+//
+void M_SaveDefaults (void)
+{
+    int		i;
+    intptr_t	v;
+    FILE*	f;
+
+    f = fopen (defaultfile, "w");
+    if (!f)
+	return; // can't write the file, but don't complain
+
+    for (i=0 ; i<numdefaults ; i++)
+    {
+	if (defaults[i].defaultvalue > -0xfff
+	    && defaults[i].defaultvalue < 0xfff)
+	{
+	    v = *defaults[i].location;
+	    fprintf (f,"%s\t\t%ld\n",defaults[i].name,(long)v);
+	} else {
+	    fprintf (f,"%s\t\t\"%s\"\n",defaults[i].name,
+		     * (char **) (defaults[i].location));
+	}
+    }
+
+    fclose (f);
+}
+
+
+//
+// M_LoadDefaults
+//
+extern byte	scantokey[128];
+
+// Initialize string defaults that can't be done statically on 64-bit
+static void M_InitStringDefaults(void)
+{
+    int i;
+
+#ifdef SNDSERV
+    for (i = 0; i < numdefaults; i++) {
+        if (strcmp(defaults[i].name, "sndserver") == 0)
+            defaults[i].defaultvalue = (intptr_t)sndserver_default;
+    }
+#endif
+
+#ifdef LINUX
+    for (i = 0; i < numdefaults; i++) {
+        if (strcmp(defaults[i].name, "mousedev") == 0)
+            defaults[i].defaultvalue = (intptr_t)mousedev_default;
+        else if (strcmp(defaults[i].name, "mousetype") == 0)
+            defaults[i].defaultvalue = (intptr_t)mousetype_default;
+    }
+#endif
+
+    // Initialize chat macros
+    for (i = 0; i < numdefaults; i++) {
+        if (strcmp(defaults[i].name, "chatmacro0") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO0;
+        else if (strcmp(defaults[i].name, "chatmacro1") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO1;
+        else if (strcmp(defaults[i].name, "chatmacro2") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO2;
+        else if (strcmp(defaults[i].name, "chatmacro3") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO3;
+        else if (strcmp(defaults[i].name, "chatmacro4") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO4;
+        else if (strcmp(defaults[i].name, "chatmacro5") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO5;
+        else if (strcmp(defaults[i].name, "chatmacro6") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO6;
+        else if (strcmp(defaults[i].name, "chatmacro7") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO7;
+        else if (strcmp(defaults[i].name, "chatmacro8") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO8;
+        else if (strcmp(defaults[i].name, "chatmacro9") == 0)
+            defaults[i].defaultvalue = (intptr_t)HUSTR_CHATMACRO9;
+    }
+}
+
+void M_LoadDefaults (void)
+{
+    int		i;
+    int		len;
+    FILE*	f;
+    char	def[80];
+    char	strparm[100];
+    char*	newstring;
+    intptr_t	parm;
+    boolean	isstring;
+
+    // set everything to base values
+    numdefaults = sizeof(defaults)/sizeof(defaults[0]);
+
+    // Initialize string defaults first (64-bit fix)
+    M_InitStringDefaults();
+
+    for (i=0 ; i<numdefaults ; i++)
+	*defaults[i].location = defaults[i].defaultvalue;
+
+    // check for a custom default file
+    i = M_CheckParm ("-config");
+    if (i && i<myargc-1)
+    {
+	defaultfile = myargv[i+1];
+	printf ("	default file: %s\n",defaultfile);
+    }
+    else
+	defaultfile = basedefault;
+
+    // read the file in, overriding any set defaults
+    f = fopen (defaultfile, "r");
+    if (f)
+    {
+	while (!feof(f))
+	{
+	    isstring = false;
+	    if (fscanf (f, "%79s %[^\n]\n", def, strparm) == 2)
+	    {
+		if (strparm[0] == '"')
+		{
+		    // get a string default
+		    isstring = true;
+		    len = strlen(strparm);
+		    newstring = (char *) malloc(len);
+		    strparm[len-1] = 0;
+		    strcpy(newstring, strparm+1);
+		}
+		else if (strparm[0] == '0' && strparm[1] == 'x')
+		    sscanf(strparm+2, "%lx", (unsigned long*)&parm);
+		else
+		    sscanf(strparm, "%ld", (long*)&parm);
+		for (i=0 ; i<numdefaults ; i++)
+		    if (!strcmp(def, defaults[i].name))
+		    {
+			if (!isstring)
+			    *defaults[i].location = parm;
+			else
+			    *defaults[i].location =
+				(intptr_t) newstring;
+			break;
+		    }
+	    }
+	}
+
+	fclose (f);
+    }
+}
+
+
+//
+// SCREEN SHOTS
+//
+
+
+typedef struct
+{
+    char		manufacturer;
+    char		version;
+    char		encoding;
+    char		bits_per_pixel;
+
+    unsigned short	xmin;
+    unsigned short	ymin;
+    unsigned short	xmax;
+    unsigned short	ymax;
+
+    unsigned short	hres;
+    unsigned short	vres;
+
+    unsigned char	palette[48];
+
+    char		reserved;
+    char		color_planes;
+    unsigned short	bytes_per_line;
+    unsigned short	palette_type;
+
+    char		filler[58];
+    unsigned char	data;		// unbounded
+} pcx_t;
+
+
+//
+// WritePCXfile
+//
+void
+WritePCXfile
+( char*		filename,
+  byte*		data,
+  int		width,
+  int		height,
+  byte*		palette )
+{
+    int		i;
+    int		length;
+    pcx_t*	pcx;
+    byte*	pack;
+
+    pcx = Z_Malloc (width*height*2+1000, PU_STATIC, NULL);
+
+    pcx->manufacturer = 0x0a;		// PCX id
+    pcx->version = 5;			// 256 color
+    pcx->encoding = 1;			// uncompressed
+    pcx->bits_per_pixel = 8;		// 256 color
+    pcx->xmin = 0;
+    pcx->ymin = 0;
+    pcx->xmax = SHORT(width-1);
+    pcx->ymax = SHORT(height-1);
+    pcx->hres = SHORT(width);
+    pcx->vres = SHORT(height);
+    memset (pcx->palette,0,sizeof(pcx->palette));
+    pcx->color_planes = 1;		// chunky image
+    pcx->bytes_per_line = SHORT(width);
+    pcx->palette_type = SHORT(2);	// not a grey scale
+    memset (pcx->filler,0,sizeof(pcx->filler));
+
+
+    // pack the image
+    pack = &pcx->data;
+
+    for (i=0 ; i<width*height ; i++)
+    {
+	if ( (*data & 0xc0) != 0xc0)
+	    *pack++ = *data++;
+	else
+	{
+	    *pack++ = 0xc1;
+	    *pack++ = *data++;
+	}
+    }
+
+    // write the palette
+    *pack++ = 0x0c;	// palette ID byte
+    for (i=0 ; i<768 ; i++)
+	*pack++ = *palette++;
+
+    // write output file
+    length = pack - (byte *)pcx;
+    M_WriteFile (filename, pcx, length);
+
+    Z_Free (pcx);
+}
+
+
+//
+// M_ScreenShot
+//
+void M_ScreenShot (void)
+{
+    int		i;
+    byte*	linear;
+    char	lbmname[12];
+
+    // munge planar buffer to linear
+    linear = screens[2];
+    I_ReadScreen (linear);
+
+    // find a file name to save it to
+    strcpy(lbmname,"DOOM00.pcx");
+
+    for (i=0 ; i<=99 ; i++)
+    {
+	lbmname[4] = i/10 + '0';
+	lbmname[5] = i%10 + '0';
+	if (access(lbmname,0) == -1)
+	    break;	// file doesn't exist
+    }
+    if (i==100)
+	I_Error ("M_ScreenShot: Couldn't create a PCX");
+
+    // save the pcx file
+    WritePCXfile (lbmname, linear,
+		  SCREENWIDTH, SCREENHEIGHT,
+		  W_CacheLumpName ("PLAYPAL",PU_CACHE));
+
+    players[consoleplayer].message = "screen shot";
+}
