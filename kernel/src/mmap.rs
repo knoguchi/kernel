@@ -214,9 +214,11 @@ impl MmapState {
 ///
 /// Returns 0 on success (page allocated), or negative error code on failure.
 pub fn handle_page_fault(fault_addr: usize) -> i64 {
-    // Check if fault_addr is in mmap region
-    if fault_addr < MMAP_BASE || fault_addr >= MMAP_END {
-        return -1; // Not in mmap region
+    // Allow faults in the extended mmap range (heap region + mmap region)
+    // This supports MAP_FIXED at addresses below MMAP_BASE
+    const HEAP_MIN: usize = 0x0020_0000; // Same as in sys_mmap
+    if fault_addr < HEAP_MIN || fault_addr >= MMAP_END {
+        return -1; // Outside valid mmap range
     }
 
     let current_id = match sched::current() {
@@ -335,12 +337,18 @@ pub fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset:
         let vaddr = if (flags & MAP_FIXED) != 0 {
             // MAP_FIXED: use the requested address exactly
             let aligned_addr = addr & !(PAGE_SIZE - 1);
-            if aligned_addr < MMAP_BASE || aligned_addr + aligned_len > MMAP_END {
+            // Allow MAP_FIXED in:
+            // 1. The heap region: 0x200000 (below typical ELF) to MMAP_BASE
+            // 2. The mmap region: MMAP_BASE to MMAP_END
+            const HEAP_MIN: usize = 0x0020_0000; // 2MB - below typical ELF at 0x400000
+            if aligned_addr < HEAP_MIN || aligned_addr + aligned_len > MMAP_END {
                 crate::println!("[mmap] t={} FIXED addr {:#x} outside range, fail", task_id, aligned_addr);
-                return -22; // EINVAL - outside mmap region
+                return -22; // EINVAL - outside valid range
             }
-            // Remove any existing mappings in this range
-            task.mmap_state.remove_region(aligned_addr, aligned_len);
+            // Remove any existing mappings in this range (for mmap region)
+            if aligned_addr >= MMAP_BASE {
+                task.mmap_state.remove_region(aligned_addr, aligned_len);
+            }
             aligned_addr
         } else {
             // Find a free region

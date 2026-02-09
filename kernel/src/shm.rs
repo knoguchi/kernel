@@ -42,8 +42,10 @@ pub const SHM_ERR_NO_SLOTS: i64 = -6;
 pub struct ShmRegion {
     /// Whether this slot is in use
     pub in_use: bool,
-    /// Region ID
+    /// Region ID (includes generation counter to prevent ID reuse)
     pub id: ShmId,
+    /// Generation counter for this slot (incremented each time slot is reused)
+    pub generation: u32,
     /// Physical frames backing this region (4KB each)
     pub frames: [Option<PhysAddr>; MAX_SHM_PAGES],
     /// Number of allocated frames
@@ -64,6 +66,7 @@ impl ShmRegion {
         Self {
             in_use: false,
             id: ShmId(0),
+            generation: 0,
             frames: [None; MAX_SHM_PAGES],
             num_frames: 0,
             size: 0,
@@ -72,6 +75,25 @@ impl ShmRegion {
             mapped_vaddr: [None; MAX_TASKS],
         }
     }
+}
+
+/// Extract slot index from SHM ID
+/// ID format: (generation << 8) | slot_idx
+#[inline]
+fn shm_id_to_slot(id: usize) -> usize {
+    id & 0xFF
+}
+
+/// Extract generation from SHM ID
+#[inline]
+fn shm_id_generation(id: usize) -> u32 {
+    (id >> 8) as u32
+}
+
+/// Create SHM ID from slot and generation
+#[inline]
+fn make_shm_id(slot: usize, generation: u32) -> usize {
+    ((generation as usize) << 8) | (slot & 0xFF)
 }
 
 /// Global shared memory region table
@@ -151,8 +173,12 @@ pub fn sys_shmcreate(size: usize) -> i64 {
         }
 
         // Initialize the region
+        // Increment generation to ensure this slot's ID is unique from previous uses
+        region.generation = region.generation.wrapping_add(1);
+        let shm_id = make_shm_id(slot_idx, region.generation);
+
         region.in_use = true;
-        region.id = ShmId(slot_idx);
+        region.id = ShmId(shm_id);
         region.num_frames = num_pages;
         region.size = size_aligned;
         region.owner = owner;
@@ -160,8 +186,8 @@ pub fn sys_shmcreate(size: usize) -> i64 {
         // Grant owner access
         region.granted[owner.0] = true;
 
-        // Return the region ID
-        slot_idx as i64
+        // Return the region ID (includes generation to prevent reuse issues)
+        shm_id as i64
     }
 }
 
@@ -179,14 +205,19 @@ pub fn sys_shmmap(shm_id: usize, vaddr_hint: usize) -> i64 {
         None => return SHM_ERR_INVALID,
     };
 
-    if shm_id >= MAX_SHM_REGIONS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS {
         return SHM_ERR_INVALID;
     }
 
     unsafe {
-        let region = &mut SHM_REGIONS[shm_id];
+        let region = &mut SHM_REGIONS[slot_idx];
 
-        if !region.in_use {
+        // Verify region is in use AND generation matches (prevents stale ID reuse)
+        if !region.in_use || region.generation != gen {
             return SHM_ERR_INVALID;
         }
 
@@ -257,14 +288,18 @@ pub fn sys_shmunmap(shm_id: usize) -> i64 {
         None => return SHM_ERR_INVALID,
     };
 
-    if shm_id >= MAX_SHM_REGIONS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS {
         return SHM_ERR_INVALID;
     }
 
     unsafe {
-        let region = &mut SHM_REGIONS[shm_id];
+        let region = &mut SHM_REGIONS[slot_idx];
 
-        if !region.in_use {
+        if !region.in_use || region.generation != gen {
             return SHM_ERR_INVALID;
         }
 
@@ -305,13 +340,17 @@ pub fn sys_shmunmap(shm_id: usize) -> i64 {
 /// WARNING: This only works correctly if SHM frames are physically contiguous!
 /// For large SHM regions, use copy_shm_to_buffer instead.
 pub fn get_shm_phys_addr(shm_id: usize) -> usize {
-    if shm_id >= MAX_SHM_REGIONS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS {
         return 0;
     }
 
     unsafe {
-        let region = &SHM_REGIONS[shm_id];
-        if !region.in_use || region.num_frames == 0 {
+        let region = &SHM_REGIONS[slot_idx];
+        if !region.in_use || region.generation != gen || region.num_frames == 0 {
             return 0;
         }
 
@@ -328,13 +367,17 @@ pub fn get_shm_phys_addr(shm_id: usize) -> usize {
 ///
 /// Returns the number of bytes copied, or 0 on error.
 pub fn copy_shm_to_buffer(shm_id: usize, dest: *mut u8, max_len: usize) -> usize {
-    if shm_id >= MAX_SHM_REGIONS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS {
         return 0;
     }
 
     unsafe {
-        let region = &SHM_REGIONS[shm_id];
-        if !region.in_use || region.num_frames == 0 {
+        let region = &SHM_REGIONS[slot_idx];
+        if !region.in_use || region.generation != gen || region.num_frames == 0 {
             return 0;
         }
 
@@ -363,14 +406,18 @@ pub fn copy_shm_to_buffer(shm_id: usize, dest: *mut u8, max_len: usize) -> usize
 ///
 /// This is like sys_shmmap but takes an explicit task_id instead of current()
 pub fn sys_shmmap_for_task(task_id: TaskId, shm_id: usize, vaddr_hint: usize) -> i64 {
-    if shm_id >= MAX_SHM_REGIONS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS {
         return SHM_ERR_INVALID;
     }
 
     unsafe {
-        let region = &mut SHM_REGIONS[shm_id];
+        let region = &mut SHM_REGIONS[slot_idx];
 
-        if !region.in_use {
+        if !region.in_use || region.generation != gen {
             return SHM_ERR_INVALID;
         }
 
@@ -429,14 +476,18 @@ pub fn sys_shmmap_for_task(task_id: TaskId, shm_id: usize, vaddr_hint: usize) ->
 
 /// Unmap shared memory for a specific task (used by IPC reply completion)
 pub fn sys_shmunmap_for_task(task_id: TaskId, shm_id: usize) -> i64 {
-    if shm_id >= MAX_SHM_REGIONS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS {
         return SHM_ERR_INVALID;
     }
 
     unsafe {
-        let region = &mut SHM_REGIONS[shm_id];
+        let region = &mut SHM_REGIONS[slot_idx];
 
-        if !region.in_use {
+        if !region.in_use || region.generation != gen {
             return SHM_ERR_INVALID;
         }
 
@@ -479,14 +530,18 @@ pub fn sys_shmgrant(shm_id: usize, target_task: usize) -> i64 {
         None => return SHM_ERR_INVALID,
     };
 
-    if shm_id >= MAX_SHM_REGIONS || target_task >= MAX_TASKS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS || target_task >= MAX_TASKS {
         return SHM_ERR_INVALID;
     }
 
     unsafe {
-        let region = &mut SHM_REGIONS[shm_id];
+        let region = &mut SHM_REGIONS[slot_idx];
 
-        if !region.in_use {
+        if !region.in_use || region.generation != gen {
             return SHM_ERR_INVALID;
         }
 
@@ -523,14 +578,18 @@ pub fn sys_shmdestroy(shm_id: usize) -> i64 {
         None => return SHM_ERR_INVALID,
     };
 
-    if shm_id >= MAX_SHM_REGIONS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS {
         return SHM_ERR_INVALID;
     }
 
     unsafe {
-        let region = &mut SHM_REGIONS[shm_id];
+        let region = &mut SHM_REGIONS[slot_idx];
 
-        if !region.in_use {
+        if !region.in_use || region.generation != gen {
             return SHM_ERR_INVALID;
         }
 
@@ -539,7 +598,7 @@ pub fn sys_shmdestroy(shm_id: usize) -> i64 {
             return SHM_ERR_PERMISSION;
         }
 
-        destroy_shm_internal(shm_id);
+        destroy_shm_internal(slot_idx);
         SHM_OK
     }
 }
@@ -547,11 +606,19 @@ pub fn sys_shmdestroy(shm_id: usize) -> i64 {
 /// Internal function to destroy SHM without ownership check
 /// Used by kernel for cleanup (e.g., after execve)
 pub fn destroy_shm(shm_id: usize) {
-    if shm_id >= MAX_SHM_REGIONS {
+    // Extract slot index and generation from ID
+    let slot_idx = shm_id_to_slot(shm_id);
+    let gen = shm_id_generation(shm_id);
+
+    if slot_idx >= MAX_SHM_REGIONS {
         return;
     }
     unsafe {
-        destroy_shm_internal(shm_id);
+        let region = &SHM_REGIONS[slot_idx];
+        // Only destroy if generation matches (prevents stale ID issues)
+        if region.in_use && region.generation == gen {
+            destroy_shm_internal(slot_idx);
+        }
     }
 }
 

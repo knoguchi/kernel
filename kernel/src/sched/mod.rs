@@ -179,9 +179,39 @@ impl Scheduler {
                 );
             }
 
+            // Complete pending Wait4 syscall by writing exit status to wstatus and reaping child.
+            // This must happen AFTER TTBR0 is loaded so we can write to the task's user memory.
+            if let task::PendingSyscall::Wait4 { wstatus, exit_status, child_id } = next_task.pending_syscall {
+                crate::println!("[ctx_switch] task={} writing wstatus=0x{:x} at 0x{:x} child={}",
+                    next_id.0, ((exit_status & 0xff) << 8) as u32, wstatus, child_id);
+                if wstatus != 0 {
+                    // Linux encodes exit code as (exit_code & 0xff) << 8
+                    let status = ((exit_status & 0xff) << 8) as i32;
+                    core::ptr::write_volatile(wstatus as *mut i32, status);
+                }
+                // Reap the child now that wait4 is completing
+                if child_id != 0 && child_id < task::MAX_TASKS {
+                    let child = &mut TASKS[child_id];
+                    if child.state == TaskState::Terminated {
+                        child.state = TaskState::Free;
+                        child.parent = None;
+                        crate::println!("[ctx_switch] reaped child {}", child_id);
+                    }
+                }
+                next_task.pending_syscall = task::PendingSyscall::None;
+            }
+
             // Switch to the new task's stack and restore its context
             // This function never returns - it does ERET directly
             let new_sp = next_task.kernel_stack_top;
+            // Debug: print context being restored when switching to a different task
+            if current_id != Some(next_id) {
+                let ctx_ptr = new_sp as *const crate::exception::ExceptionContext;
+                crate::println!("[ctx_switch] task={} restore: sp_ptr=0x{:x} elr=0x{:x} sp=0x{:x}",
+                    next_id.0, new_sp, (*ctx_ptr).elr, (*ctx_ptr).sp);
+                crate::println!("[ctx_switch] task={} restore: x0=0x{:x} x1=0x{:x} x2=0x{:x} x30=0x{:x}",
+                    next_id.0, (*ctx_ptr).gpr[0], (*ctx_ptr).gpr[1], (*ctx_ptr).gpr[2], (*ctx_ptr).gpr[30]);
+            }
             switch_context_and_restore(new_sp);
         }
     }
@@ -222,22 +252,55 @@ impl Scheduler {
         self.current = Some(next_id);
         self.switch_count += 1;
 
-        // Switch to new task's stack
-        if current_id != Some(next_id) {
-            // Switch page table if needed
-            if let Some(ref addr_space) = next_task.addr_space {
-                let ttbr0 = addr_space.ttbr0();
-                core::arch::asm!(
-                    "msr ttbr0_el1, {0}",
-                    "isb",
-                    "tlbi vmalle1",
-                    "dsb ish",
-                    "isb",
-                    in(reg) ttbr0,
-                    options(nostack)
-                );
-            }
+        // Always reload TTBR0 from the task's addr_space.
+        // This is important because the task's address space might have been
+        // replaced (e.g., by execve) since we last ran it. Even if we're
+        // "switching" to the same task, the address space could be different.
+        if let Some(ref addr_space) = next_task.addr_space {
+            let ttbr0 = addr_space.ttbr0();
+            core::arch::asm!(
+                "msr ttbr0_el1, {0}",
+                "isb",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                in(reg) ttbr0,
+                options(nostack)
+            );
+        }
 
+        // Complete pending Wait4 syscall by writing exit status to wstatus and reaping child.
+        // This must happen AFTER TTBR0 is loaded so we can write to the task's user memory.
+        if let task::PendingSyscall::Wait4 { wstatus, exit_status, child_id } = next_task.pending_syscall {
+            crate::println!("[ctx_switch_blocking] task={} writing wstatus=0x{:x} at 0x{:x} child={}",
+                next_id.0, ((exit_status & 0xff) << 8) as u32, wstatus, child_id);
+            // Debug: print the saved context that will be restored
+            let saved_ctx = next_task.kernel_stack_top as *const ExceptionContext;
+            if !saved_ctx.is_null() {
+                crate::println!("[ctx_switch_blocking] restoring context at 0x{:x}: elr=0x{:x} sp=0x{:x}",
+                    next_task.kernel_stack_top, (*saved_ctx).elr, (*saved_ctx).sp);
+                crate::println!("[ctx_switch_blocking] saved x0=0x{:x} x1=0x{:x} x2=0x{:x} x30=0x{:x}",
+                    (*saved_ctx).gpr[0], (*saved_ctx).gpr[1], (*saved_ctx).gpr[2], (*saved_ctx).gpr[30]);
+            }
+            if wstatus != 0 {
+                // Linux encodes exit code as (exit_code & 0xff) << 8
+                let status = ((exit_status & 0xff) << 8) as i32;
+                core::ptr::write_volatile(wstatus as *mut i32, status);
+            }
+            // Reap the child now that wait4 is completing
+            if child_id != 0 && child_id < task::MAX_TASKS {
+                let child = &mut TASKS[child_id];
+                if child.state == TaskState::Terminated {
+                    child.state = TaskState::Free;
+                    child.parent = None;
+                    crate::println!("[ctx_switch_blocking] reaped child {}", child_id);
+                }
+            }
+            next_task.pending_syscall = task::PendingSyscall::None;
+        }
+
+        // Switch to new task's stack (only needed when switching to a different task)
+        if current_id != Some(next_id) {
             let new_sp = next_task.kernel_stack_top;
             switch_context_and_restore(new_sp);
         }
@@ -264,19 +327,54 @@ impl Scheduler {
                 }
 
                 task.exit_code = exit_code;
-                task.state = TaskState::Terminated;
 
                 // Signal parent and wake if waiting (WaitBlocked)
                 if let Some(parent_id) = parent_id_opt {
                     let parent = &mut TASKS[parent_id.0];
-                    // Set SIGCHLD pending on parent (signal 17, bit 16)
-                    const SIGCHLD_BIT: u64 = 1 << 16; // SIGCHLD = 17, bit = 17-1 = 16
-                    parent.signal_pending |= SIGCHLD_BIT;
 
                     if parent.state == TaskState::WaitBlocked {
+                        // Parent was already waiting - wait4 will return the child info.
+                        // Don't set SIGCHLD since wait4 provides all the info.
+                        // Parent was blocked in wait4. Set up the return value.
+                        // The parent's saved ExceptionContext is at kernel_stack_top.
+                        crate::println!("[exit_current] child {} exit, parent {} kernel_stack_top=0x{:x}",
+                            current_id.0, parent_id.0, parent.kernel_stack_top);
+                        let parent_ctx = parent.kernel_stack_top as *mut crate::exception::ExceptionContext;
+                        if !parent_ctx.is_null() {
+                            // Debug: print parent's saved context before modifying
+                            crate::println!("[exit_current] parent ctx: elr=0x{:x} sp=0x{:x}",
+                                (*parent_ctx).elr, (*parent_ctx).sp);
+                            crate::println!("[exit_current] parent ctx: x0=0x{:x} x1=0x{:x} x2=0x{:x} x30=0x{:x}",
+                                (*parent_ctx).gpr[0], (*parent_ctx).gpr[1], (*parent_ctx).gpr[2], (*parent_ctx).gpr[30]);
+                            // Set return value (x0) = child's pid
+                            crate::println!("[exit_current] setting parent {} gpr[0] = {} (was 0x{:x})",
+                                parent_id.0, current_id.0, (*parent_ctx).gpr[0]);
+                            (*parent_ctx).gpr[0] = current_id.0 as u64;
+                        }
+
+                        // Update the pending syscall with the exit status and child ID so that
+                        // context_switch can write wstatus and reap the child
+                        if let task::PendingSyscall::Wait4 { ref mut exit_status, ref mut child_id, .. } = parent.pending_syscall {
+                            *exit_status = exit_code;
+                            *child_id = current_id.0;
+                        }
+
+                        // Leave child as Terminated (zombie) for now.
+                        // It will be reaped by context_switch after writing wstatus.
+                        // This allows SIGCHLD handler to also call waitpid and see the zombie.
+                        task.state = TaskState::Terminated;
+
                         parent.state = TaskState::Ready;
                         enqueue_task(parent_id);
+                    } else {
+                        // Parent is not waiting - set SIGCHLD pending and leave child as zombie
+                        const SIGCHLD_BIT: u64 = 1 << 16; // SIGCHLD = 17, bit = 17-1 = 16
+                        parent.signal_pending |= SIGCHLD_BIT;
+                        task.state = TaskState::Terminated;
                     }
+                } else {
+                    // No parent - just mark as free
+                    task.state = TaskState::Free;
                 }
 
                 self.current = None;
@@ -450,23 +548,21 @@ pub fn create_user_task(name: &str, code_paddr: PhysAddr, code_size: usize) -> O
     // Virtual offset_in_block maps to physical first_frame
     let user_entry_point = USER_CODE_VADDR_BASE + offset_in_block;
 
-    // Allocate and map user stack (2MB block)
-    let stack_frame = mm::alloc_frame()?;
-    // Calculate 2MB-aligned base for stack
-    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+    // Allocate user stack at start of a 2MB block.
+    // This ensures each task has its own exclusive 2MB stack region.
+    let stack_frame = mm::frame::alloc_frames_at_2mb_boundary(1)?;
+    let stack_phys_base_2mb = stack_frame; // first_frame IS the 2MB block base
 
     unsafe {
-        // Zero the stack frame
-        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        // Zero the entire 2MB stack block
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, BLOCK_SIZE_2MB);
         if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return None;
         }
     }
 
-    // User stack pointer: use the actual frame we allocated, offset from the virtual base
-    // Stack grows down, so start at the top of the 4KB frame
-    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    // Stack grows down from top of 2MB region
+    let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
 
     // Allocate kernel stack for syscalls/interrupts (4 pages = 16KB)
     let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
@@ -808,9 +904,10 @@ pub fn create_user_task_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskId> 
         task.next = None;
         task.ipc = task::IpcState::empty(); // Reset IPC state for reused slots
         task.mmap_state = crate::mmap::MmapState::new(); // Reset mmap state
-        // Set heap_brk to end of ELF segments (page-aligned) for musl/Linux compatibility
-        // Linux brk starts at the end of the data segment, not at a fixed address
-        task.heap_brk = (max_vaddr + 0xfff) & !0xfff;
+        // Set heap_brk to end of mapped 2MB blocks, but ensure it doesn't conflict with stack.
+        // Stack is at USER_STACK_VADDR_BASE for 2MB. Heap must start after both code and stack.
+        let heap_start_after_stack = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB;
+        task.heap_brk = virt_end.max(heap_start_after_stack);
         task.init_stdio(); // Initialize stdin/stdout/stderr
 
         // Calculate kernel stack top (16-byte aligned)
@@ -1005,19 +1102,21 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
         }
     }
 
-    // Allocate and map user stack
-    let stack_frame = mm::alloc_frame()?;
-    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+    // Allocate user stack at start of a 2MB block (like create_user_task_from_elf).
+    // This ensures each task has its own exclusive 2MB stack region.
+    let stack_frame = mm::frame::alloc_frames_at_2mb_boundary(1)?;
+    let stack_phys_base_2mb = stack_frame; // first_frame IS the 2MB block base
 
     unsafe {
-        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        // Zero the entire 2MB stack block
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, BLOCK_SIZE_2MB);
         if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return None;
         }
     }
 
-    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    // Stack grows down from top of 2MB region
+    let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
     let user_entry_point = first_frame_offset + elf.entry_point() as usize;
 
     // Allocate kernel stack
@@ -1252,19 +1351,21 @@ pub fn create_blkdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         }
     }
 
-    // Allocate and map user stack
-    let stack_frame = mm::alloc_frame()?;
-    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+    // Allocate user stack at start of a 2MB block (like create_user_task_from_elf).
+    // This ensures each task has its own exclusive 2MB stack region.
+    let stack_frame = mm::frame::alloc_frames_at_2mb_boundary(1)?;
+    let stack_phys_base_2mb = stack_frame; // first_frame IS the 2MB block base
 
     unsafe {
-        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        // Zero the entire 2MB stack block
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, BLOCK_SIZE_2MB);
         if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return None;
         }
     }
 
-    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    // Stack grows down from top of 2MB region
+    let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
     // Entry point is directly from ELF since we allocate at 2MB boundary (offset = 0)
     let user_entry_point = elf.entry_point() as usize;
 
@@ -1419,19 +1520,21 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
         }
     }
 
-    // Allocate and map user stack
-    let stack_frame = mm::alloc_frame()?;
-    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+    // Allocate user stack at start of a 2MB block (like create_user_task_from_elf).
+    // This ensures each task has its own exclusive 2MB stack region.
+    let stack_frame = mm::frame::alloc_frames_at_2mb_boundary(1)?;
+    let stack_phys_base_2mb = stack_frame; // first_frame IS the 2MB block base
 
     unsafe {
-        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        // Zero the entire 2MB stack block
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, BLOCK_SIZE_2MB);
         if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return None;
         }
     }
 
-    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    // Stack grows down from top of 2MB region
+    let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
     let user_entry_point = elf.entry_point() as usize;
 
     // Allocate kernel stack
@@ -1598,7 +1701,11 @@ pub fn replace_task_with_elf(
         if phdr.p_type == 1 {
             let file_offset = phdr.p_offset as usize;
             let file_size = phdr.p_filesz as usize;
+            let mem_size = phdr.p_memsz as usize;
             let vaddr = phdr.p_vaddr as usize;
+
+            crate::println!("[execve] PT_LOAD: vaddr=0x{:x} filesz=0x{:x} memsz=0x{:x}",
+                vaddr, file_size, mem_size);
 
             // Calculate physical offset from the base of our allocation
             // vaddr is relative to virt_base, not min_vaddr
@@ -1613,6 +1720,18 @@ pub fn replace_task_with_elf(
                         file_size,
                     );
                 }
+            }
+
+            // Explicitly zero BSS region (memsz - filesz bytes after the copied data)
+            // This should already be zero from the initial memset, but let's be explicit
+            if mem_size > file_size {
+                let bss_start = dest_addr + file_size;
+                let bss_size = mem_size - file_size;
+                unsafe {
+                    core::ptr::write_bytes(bss_start as *mut u8, 0, bss_size);
+                }
+                crate::println!("[execve] zeroing BSS: 0x{:x} - 0x{:x} ({} bytes)",
+                    bss_start, bss_start + bss_size, bss_size);
             }
         }
     }
@@ -1774,9 +1893,12 @@ pub fn replace_task_with_elf(
         task.addr_space = Some(new_addr_space);
         task.entry_point = entry_point;
 
-        // Set heap_brk to end of ELF segments (page-aligned) for musl/Linux compatibility
-        // Linux brk starts at the end of the data segment, not at a fixed address
-        task.heap_brk = (max_vaddr + 0xfff) & !0xfff;
+        // Set heap_brk to end of mapped 2MB blocks, but ensure it doesn't conflict with stack.
+        // Stack is at USER_STACK_VADDR_BASE for 2MB. Heap must start after both code and stack.
+        let heap_start_after_stack = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB;
+        task.heap_brk = virt_end.max(heap_start_after_stack);
+        crate::println!("[execve] task={} virt_end=0x{:x} heap_brk=0x{:x}",
+            task_id.0, virt_end, task.heap_brk);
 
         // Reset IPC state
         task.ipc = task::IpcState::empty();
@@ -1944,19 +2066,21 @@ pub fn create_fbdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskI
         }
     }
 
-    // Allocate and map user stack
-    let stack_frame = mm::alloc_frame()?;
-    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+    // Allocate user stack at start of a 2MB block (like create_user_task_from_elf).
+    // This ensures each task has its own exclusive 2MB stack region.
+    let stack_frame = mm::frame::alloc_frames_at_2mb_boundary(1)?;
+    let stack_phys_base_2mb = stack_frame; // first_frame IS the 2MB block base
 
     unsafe {
-        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        // Zero the entire 2MB stack block
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, BLOCK_SIZE_2MB);
         if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return None;
         }
     }
 
-    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    // Stack grows down from top of 2MB region
+    let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
     // Entry point is directly from ELF since we allocate at 2MB boundary (offset = 0)
     let user_entry_point = elf.entry_point() as usize;
 
@@ -2111,19 +2235,21 @@ pub fn create_kbdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskI
         }
     }
 
-    // Allocate and map user stack
-    let stack_frame = mm::alloc_frame()?;
-    let stack_phys_base_2mb = PhysAddr(stack_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let stack_offset = stack_frame.0 - stack_phys_base_2mb.0;
+    // Allocate user stack at start of a 2MB block (like create_user_task_from_elf).
+    // This ensures each task has its own exclusive 2MB stack region.
+    let stack_frame = mm::frame::alloc_frames_at_2mb_boundary(1)?;
+    let stack_phys_base_2mb = stack_frame; // first_frame IS the 2MB block base
 
     unsafe {
-        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        // Zero the entire 2MB stack block
+        core::ptr::write_bytes(stack_frame.0 as *mut u8, 0, BLOCK_SIZE_2MB);
         if !addr_space.map_2mb(USER_STACK_VADDR_BASE, stack_phys_base_2mb, PageFlags::user_data()) {
             return None;
         }
     }
 
-    let user_stack_top = USER_STACK_VADDR_BASE + stack_offset + mm::frame::PAGE_SIZE - 16;
+    // Stack grows down from top of 2MB region
+    let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
     // Entry point is directly from ELF since we allocate at 2MB boundary (offset = 0)
     let user_entry_point = elf.entry_point() as usize;
 

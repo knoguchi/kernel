@@ -940,6 +940,13 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                         // execve doesn't return on success - execution starts fresh
                     }
 
+                    // Note: We don't switch TTBR0 here because we're still running in
+                    // the context of the task that sent the reply (e.g., VFS), not the
+                    // execve caller. The TTBR0 switch will happen in context_switch
+                    // when the caller is scheduled to run. To ensure this happens even
+                    // when the same task is scheduled again, context_switch always
+                    // reloads TTBR0 from the task's addr_space.
+
                     // Return 0 but note: caller won't actually see this because
                     // execution will start from the new entry point
                     PendingSyscallResult::Complete(0, None)
@@ -1062,6 +1069,11 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             }
 
             PendingSyscallResult::Complete(bytes_read, None)
+        }
+        PendingSyscall::Wait4 { .. } => {
+            // Wait4 is not an IPC-based syscall. It shouldn't reach here.
+            // If it does, just return success (the real value is set by exit_current).
+            PendingSyscallResult::Complete(0, None)
         }
     }
 }

@@ -254,6 +254,17 @@ pub enum PendingSyscall {
         /// SHM ID for file data transfer
         shm_id: usize,
     },
+    /// Wait4: waiting for child process to exit
+    /// When a child exits, exit_current sets the return value.
+    /// The wstatus write and child reaping happens in context_switch after TTBR0 is loaded.
+    Wait4 {
+        /// User pointer to store exit status (0 if not requested)
+        wstatus: usize,
+        /// Exit status to write (set by exit_current when child exits)
+        exit_status: i32,
+        /// Child task ID to reap (set by exit_current when child exits, 0 if not set)
+        child_id: usize,
+    },
 }
 
 impl PendingSyscall {

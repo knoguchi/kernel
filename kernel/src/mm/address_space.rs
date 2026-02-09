@@ -321,6 +321,8 @@ impl AddressSpace {
         let l1_idx = l1_index(vaddr);
         let l2_idx = l2_index(vaddr);
 
+        crate::println!("[map_2mb] vaddr={:#x} paddr={:#x} l1={} l2={} ttbr0={:#x}", vaddr, paddr.0, l1_idx, l2_idx, self.ttbr0.0);
+
         // Ensure we have an L2 table for this L1 index
         if self.l2_tables[l1_idx].is_none() {
             // Allocate a new L2 table
@@ -335,6 +337,13 @@ impl AddressSpace {
                 let l1_entry = PageTableEntry::table(l2_frame.0 as u64);
                 ptr::write_volatile(l1_ptr.add(l1_idx), l1_entry.as_u64());
 
+                // Memory barrier to ensure L1 entry is visible
+                core::arch::asm!(
+                    "dsb ishst",
+                    "isb",
+                    options(nostack)
+                );
+
                 self.l2_tables[l1_idx] = Some(l2_frame);
             } else {
                 return false;
@@ -346,7 +355,18 @@ impl AddressSpace {
         let l2_ptr = l2_frame.0 as *mut u64;
 
         let entry = make_block_entry(paddr.0 as u64, flags);
+        crate::println!("[map_2mb] L2 table at {:#x}, writing entry {:#x} at idx {}", l2_frame.0, entry, l2_idx);
         ptr::write_volatile(l2_ptr.add(l2_idx), entry);
+
+        // Memory barrier to ensure page table write is visible before TLB uses it
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {0}",
+            "dsb ish",
+            "isb",
+            in(reg) vaddr >> 12,
+            options(nostack)
+        );
 
         true
     }

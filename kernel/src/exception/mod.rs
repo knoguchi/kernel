@@ -1731,6 +1731,12 @@ fn print_context(ctx: &ExceptionContext) {
     exception_println!("  FAR_EL1:  {:#018x}", ctx.far);
     exception_println!("  SP:       {:#018x}", ctx.sp);
 
+    // Print some GPRs for debugging
+    exception_println!("  x0:  {:#018x}  x1:  {:#018x}", ctx.gpr[0], ctx.gpr[1]);
+    exception_println!("  x2:  {:#018x}  x3:  {:#018x}", ctx.gpr[2], ctx.gpr[3]);
+    exception_println!("  x19: {:#018x}  x20: {:#018x}", ctx.gpr[19], ctx.gpr[20]);
+    exception_println!("  x29: {:#018x}  x30: {:#018x}", ctx.gpr[29], ctx.gpr[30]);
+
     if ctx.is_data_abort() || ctx.is_instruction_abort() {
         exception_println!("  Fault: {} ({})",
             fault_status_name(ctx.fault_status_code()),
@@ -1887,8 +1893,47 @@ extern "C" fn handle_el0_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
             exception_println!("(Could not emulate this instruction)");
         } else {
             exception_println!("USER DATA ABORT!");
+            // Dump the instruction at ELR to verify memory contents
+            let instr_ptr = ctx.elr as *const u32;
+            let instr = unsafe { core::ptr::read_volatile(instr_ptr) };
+            exception_println!("Instruction at ELR: {:#010x}", instr);
         }
         exception_println!("Faulting address: {:#018x}", ctx.far);
+
+        // Debug: Print TTBR0 to verify correct page table is in use
+        let ttbr0: u64;
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0); }
+        exception_println!("TTBR0_EL1: {:#018x}", ttbr0);
+
+        // Also print task's expected TTBR0
+        if let Some(task_id) = crate::sched::current() {
+            unsafe {
+                let task = &crate::sched::task::TASKS[task_id.0];
+                if let Some(ref addr_space) = task.addr_space {
+                    exception_println!("Task {} addr_space.ttbr0: {:#018x}", task_id.0, addr_space.ttbr0());
+
+                    // Dump L2 table entries for L1[0] to show mapped 2MB blocks
+                    exception_println!("L2 entries for L1[0] (0x0-0x40000000):");
+                    let l1_ptr = addr_space.ttbr0() as *const u64;
+                    let l1_entry = core::ptr::read_volatile(l1_ptr);
+                    if l1_entry & 0b11 == 0b11 {  // Valid table entry
+                        let l2_addr = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+                        for i in 0..8 {  // Print first 8 entries (0-16MB)
+                            let l2_entry = core::ptr::read_volatile(l2_addr.add(i));
+                            if l2_entry & 1 != 0 {  // Valid
+                                let block_type = if l2_entry & 2 == 0 { "BLOCK" } else { "TABLE" };
+                                let paddr = l2_entry & 0x0000_FFFF_FFE0_0000;
+                                exception_println!("  L2[{}]: {} virt=0x{:x}-0x{:x} paddr=0x{:x}",
+                                    i, block_type, i * 0x200000, (i+1) * 0x200000 - 1, paddr);
+                            }
+                        }
+                    }
+                } else {
+                    exception_println!("Task {} has no addr_space!", task_id.0);
+                }
+            }
+        }
+
         print_context(ctx);
 
         // TODO: Send SIGSEGV/SIGBUS to process, for now just halt

@@ -2491,67 +2491,80 @@ fn sys_wait4(ctx: &mut ExceptionContext, pid: i32, wstatus: usize, options: u32)
     };
 
     unsafe {
-        loop {
-            // Find a terminated child
-            let mut found_child: Option<TaskId> = None;
-            let mut has_children = false;
+        // Find a terminated child
+        let mut found_child: Option<TaskId> = None;
+        let mut has_children = false;
 
-            for i in 0..MAX_TASKS {
-                let task = &TASKS[i];
-                if task.parent == Some(current_id) {
-                    has_children = true;
+        for i in 0..MAX_TASKS {
+            let task = &TASKS[i];
+            if task.parent == Some(current_id) {
+                has_children = true;
 
-                    // Check if this child matches the pid filter
-                    let matches = if pid == -1 {
-                        true // Any child
-                    } else if pid > 0 {
-                        i == pid as usize
-                    } else {
-                        true // TODO: process groups not implemented
-                    };
+                // Check if this child matches the pid filter
+                let matches = if pid == -1 {
+                    true // Any child
+                } else if pid > 0 {
+                    i == pid as usize
+                } else {
+                    true // TODO: process groups not implemented
+                };
 
-                    if matches && task.state == TaskState::Terminated {
-                        found_child = Some(TaskId(i));
-                        break;
-                    }
+                if matches && task.state == TaskState::Terminated {
+                    found_child = Some(TaskId(i));
+                    break;
                 }
             }
-
-            if !has_children {
-                return ECHILD;
-            }
-
-            if let Some(child_id) = found_child {
-                // Reap the child
-                let child = &mut TASKS[child_id.0];
-                let exit_code = child.exit_code;
-
-                // Write status if pointer provided
-                if wstatus != 0 {
-                    // Linux encodes exit code as (code << 8)
-                    let status = (exit_code as u32) << 8;
-                    core::ptr::write_volatile(wstatus as *mut i32, status as i32);
-                }
-
-                // Free the child task slot
-                child.state = TaskState::Free;
-                child.parent = None;
-
-                return child_id.0 as i64;
-            }
-
-            // No terminated child found
-            if options & WNOHANG != 0 {
-                return 0; // Non-blocking, no child ready
-            }
-
-            // Block waiting for child - child will wake us when it exits
-            let task = &mut TASKS[current_id.0];
-            task.state = TaskState::WaitBlocked;
-            sched::context_switch_blocking(ctx);
-
-            // When we wake up, loop back and try again to find the terminated child
         }
+
+        if !has_children {
+            return ECHILD;
+        }
+
+        if let Some(child_id) = found_child {
+            // Reap the child immediately (no blocking needed)
+            let child = &mut TASKS[child_id.0];
+            let exit_code = child.exit_code;
+
+            // Write status if pointer provided
+            if wstatus != 0 {
+                // Linux encodes exit code as (code << 8)
+                let status = (exit_code as u32) << 8;
+                core::ptr::write_volatile(wstatus as *mut i32, status as i32);
+            }
+
+            // Free the child task slot
+            child.state = TaskState::Free;
+            child.parent = None;
+
+            return child_id.0 as i64;
+        }
+
+        // No terminated child found
+        if options & WNOHANG != 0 {
+            return 0; // Non-blocking, no child ready
+        }
+
+        // Block waiting for child.
+        // Set up PendingSyscall::Wait4 so that when child exits:
+        // 1. exit_current sets our gpr[0] = child_pid and sets exit_status
+        // 2. context_switch_blocking writes wstatus after TTBR0 is loaded
+        crate::println!("[wait4] task={} blocking: ctx=0x{:x} sp=0x{:x} wstatus_addr=0x{:x}",
+            current_id.0, ctx as *const _ as usize, ctx.sp, wstatus);
+        crate::println!("[wait4] saved: elr=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x} x30=0x{:x}",
+            ctx.elr, ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[30]);
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::Wait4 {
+            wstatus,
+            exit_status: 0, // Will be set by exit_current
+            child_id: 0,    // Will be set by exit_current
+        };
+        task.state = TaskState::WaitBlocked;
+        sched::context_switch_blocking(ctx);
+
+        // NOTE: This code is never reached because context_switch_blocking
+        // ultimately does ERET directly to user space. The return value
+        // is set by exit_current when the child terminates.
+        0
     }
 }
 
@@ -2572,16 +2585,19 @@ fn sys_brk(addr: usize) -> i64 {
 
         if addr == 0 {
             // Query current brk
+            crate::println!("[brk] t={} query -> 0x{:x}", current_id.0, task.heap_brk);
             return task.heap_brk as i64;
         }
+        crate::println!("[brk] t={} set 0x{:x} -> 0x{:x} (old=0x{:x})", current_id.0, addr, addr, task.heap_brk);
 
         // Don't allow shrinking below current heap start
         // (heap_brk is initialized to end of ELF segments)
         let _heap_start = task.heap_brk.min(addr);
 
-        // Allow brk up to 16MB (well below mmap region at 0x10000000)
-        const BRK_LIMIT: usize = 0x0100_0000;
+        // Allow brk up to 128MB (well below mmap region at 0x10000000)
+        const BRK_LIMIT: usize = 0x0800_0000;
         if addr >= BRK_LIMIT {
+            crate::println!("[brk] t={} LIMIT EXCEEDED addr=0x{:x} limit=0x{:x}", current_id.0, addr, BRK_LIMIT);
             return task.heap_brk as i64;
         }
 
@@ -3063,7 +3079,10 @@ pub fn check_and_deliver_signals(ctx: &mut ExceptionContext) {
 ///
 /// Called before returning to user space. If a signal is pending and not masked,
 /// set up the signal frame and redirect execution to the handler.
-pub fn check_and_deliver_signals_after_syscall(ctx: &mut ExceptionContext, _last_syscall: u16) {
+pub fn check_and_deliver_signals_after_syscall(ctx: &mut ExceptionContext, last_syscall: u16) {
+    // Debug: uncomment to trace signal delivery
+    // crate::println!("[signal_check] syscall={} x0=0x{:x} elr=0x{:x}",
+    //     last_syscall, ctx.gpr[0], ctx.elr);
     let current_id = match sched::current() {
         Some(id) => id,
         None => return,
@@ -3114,6 +3133,14 @@ pub fn check_and_deliver_signals_after_syscall(ctx: &mut ExceptionContext, _last
         let frame_size = core::mem::size_of::<SignalFrame>();
         let frame_addr = (ctx.sp as usize - frame_size) & !15; // 16-byte aligned
 
+        crate::println!("[signal] delivering sig={} to task={} handler=0x{:x} sp=0x{:x} frame=0x{:x}",
+            sig, current_id.0, handler, ctx.sp, frame_addr);
+        crate::println!("[signal] saved: x0=0x{:x} x1=0x{:x} x2=0x{:x} x30=0x{:x} elr=0x{:x}",
+            ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[30], ctx.elr);
+        let restorer = task.signal_restorers[(sig - 1) as usize];
+        crate::println!("[signal] new context: x0={} x2=frame(0x{:x}) x30=restorer(0x{:x}) elr=handler(0x{:x})",
+            sig, frame_addr, restorer, handler);
+
         let frame = frame_addr as *mut SignalFrame;
 
         // Save current context
@@ -3139,8 +3166,7 @@ pub fn check_and_deliver_signals_after_syscall(ctx: &mut ExceptionContext, _last
         ctx.gpr[2] = frame_addr as u64;
 
         // Set up link register (x30) to point to sigreturn trampoline
-        // Use the restorer provided via sa_restorer in sigaction
-        let restorer = task.signal_restorers[(sig - 1) as usize];
+        // (restorer already fetched for debug output above)
         ctx.gpr[30] = restorer;
     }
 }
