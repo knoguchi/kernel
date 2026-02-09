@@ -11,6 +11,7 @@ members = [
     "pipeserv",
     "forktest",
     "fbdev",
+    "kbdev",
 ]
 
 [profile.dev]

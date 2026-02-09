@@ -113,6 +113,9 @@ extern "C" {
     // Framebuffer device server ELF (created seventh, gets task ID 7)
     static __fbdev_elf_start: u8;
     static __fbdev_elf_end: u8;
+    // Keyboard device server ELF (created eighth, gets task ID 8)
+    static __kbdev_elf_start: u8;
+    static __kbdev_elf_end: u8;
     // Forktest ELF
     static __forktest_elf_start: u8;
     static __forktest_elf_end: u8;
@@ -397,6 +400,22 @@ pub extern "C" fn kernel_main() -> ! {
         println!("  Created fbdev server (id={}) - runs in EL0 with ramfb access", id.0);
     } else {
         println!("  ERROR: Failed to create fbdev server!");
+    }
+    println!();
+
+    // Create kbdev server (task ID 8)
+    println!("Creating kbdev server...");
+    let kbdev_start = unsafe { &__kbdev_elf_start as *const u8 };
+    let kbdev_end = unsafe { &__kbdev_elf_end as *const u8 };
+    let kbdev_size = kbdev_end as usize - kbdev_start as usize;
+    let kbdev_data = unsafe { core::slice::from_raw_parts(kbdev_start, kbdev_size) };
+
+    println!("  Kbdev ELF at {:#010x}, size {} bytes", kbdev_start as usize, kbdev_size);
+
+    if let Some(id) = sched::create_kbdev_server_from_elf("kbdev", kbdev_data) {
+        println!("  Created kbdev server (id={}) - runs in EL0 with VirtIO-input access", id.0);
+    } else {
+        println!("  ERROR: Failed to create kbdev server!");
     }
     println!();
 

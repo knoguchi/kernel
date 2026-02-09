@@ -64,10 +64,10 @@ impl Ramfb {
         fb_vaddr: usize,
         phys_base: u64,
     ) -> Self {
-        use libkenix::console;
+        use libkenix::uart;
 
-        console::print_hex("[ramfb] Writing config to selector=", selector as u64);
-        console::print_hex("[ramfb] fb_paddr=", fb_paddr);
+        uart::print_hex("[ramfb] Writing config to selector=", selector as u64);
+        uart::print_hex("[ramfb] fb_paddr=", fb_paddr);
 
         let width = DEFAULT_WIDTH;
         let height = DEFAULT_HEIGHT;
@@ -101,7 +101,7 @@ impl Ramfb {
             fwcfg.dma_write(selector, &cfg_bytes, phys_base);
         }
 
-        console::println("[ramfb] DMA write complete");
+        uart::println("[ramfb] DMA write complete");
 
         Self {
             fb_vaddr,

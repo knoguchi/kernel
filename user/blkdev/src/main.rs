@@ -13,7 +13,7 @@ use libkenix::ipc::{self, Message, TASK_ANY};
 use libkenix::msg::{BLK_READ, BLK_WRITE, BLK_INFO, ERR_OK, ERR_IO, ERR_INVAL};
 use libkenix::shm;
 use libkenix::syscall;
-use libkenix::console;
+use libkenix::uart;
 use libkenix::VIRTIO_BLK_IRQ;
 use blk::{VirtioBlk, SECTOR_SIZE};
 use virtio_mmio::VIRTIO_MMIO_BASE;
@@ -188,23 +188,23 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
         BLOCK_DEV.set_phys_base(phys_base);
     }
 
-    console::println("[blkdev] Starting...");
+    uart::println("[blkdev] Starting...");
 
     // Initialize block device
     let init_ok = unsafe { BLOCK_DEV.init() };
 
     if !init_ok {
-        console::println("[blkdev] VirtIO init failed");
+        uart::println("[blkdev] VirtIO init failed");
         syscall::exit(1);
     }
 
     let _capacity = unsafe { BLOCK_DEV.capacity() };
-    console::println("[blkdev] VirtIO ready");
+    uart::println("[blkdev] VirtIO ready");
 
     // Register for IRQ handling
     let irq_result = syscall::irq_register(VIRTIO_BLK_IRQ);
     if irq_result < 0 {
-        console::println("[blkdev] IRQ registration failed");
+        uart::println("[blkdev] IRQ registration failed");
         // Continue anyway - we can poll
     }
 

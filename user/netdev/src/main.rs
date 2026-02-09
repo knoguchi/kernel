@@ -13,7 +13,7 @@ use libkenix::ipc::{self, Message, TASK_ANY};
 use libkenix::msg::{NET_SEND, NET_RECV, NET_INFO, ERR_OK, ERR_IO, ERR_INVAL};
 use libkenix::shm;
 use libkenix::syscall;
-use libkenix::console;
+use libkenix::uart;
 use libkenix::VIRTIO_NET_IRQ;
 use net::VirtioNet;
 use virtio_mmio::VIRTIO_MMIO_BASE;
@@ -38,28 +38,28 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
         NET_DEV.set_phys_base(phys_base);
     }
 
-    console::println("[netdev] Starting...");
+    uart::println("[netdev] Starting...");
 
     // Initialize network device
     let init_ok = unsafe { NET_DEV.init() };
 
     if !init_ok {
-        console::println("[netdev] VirtIO-net init failed");
+        uart::println("[netdev] VirtIO-net init failed");
         syscall::exit(1);
     }
 
     // Print MAC address
     let mac = unsafe { NET_DEV.mac };
-    console::print("[netdev] MAC: ");
+    uart::print("[netdev] MAC: ");
     print_mac(&mac);
-    console::println("");
+    uart::println("");
 
-    console::println("[netdev] VirtIO-net ready");
+    uart::println("[netdev] VirtIO-net ready");
 
     // Register for IRQ handling
     let irq_result = syscall::irq_register(VIRTIO_NET_IRQ);
     if irq_result < 0 {
-        console::println("[netdev] IRQ registration failed");
+        uart::println("[netdev] IRQ registration failed");
         // Continue anyway - we can poll
     }
 
@@ -191,7 +191,7 @@ pub extern "C" fn _start(phys_base: u64) -> ! {
 fn print_mac(mac: &[u8; 6]) {
     for (i, byte) in mac.iter().enumerate() {
         if i > 0 {
-            console::print(":");
+            uart::print(":");
         }
         print_hex_byte(*byte);
     }
@@ -201,5 +201,6 @@ fn print_mac(mac: &[u8; 6]) {
 fn print_hex_byte(b: u8) {
     const HEX: &[u8] = b"0123456789abcdef";
     let buf = [HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize]];
-    syscall::write(1, &buf);
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    uart::print(s);
 }

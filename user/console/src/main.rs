@@ -74,8 +74,41 @@ fn uart_getc() -> Option<u8> {
     }
 }
 
-/// Read from UART into buffer (blocking until at least 1 byte or newline)
-fn uart_read(buf: &mut [u8]) -> usize {
+/// Try to get a character from UART (non-blocking)
+fn try_getc() -> Option<u8> {
+    uart_getc()
+}
+
+// Framebuffer task ID
+const FBDEV_TASK_ID: usize = 7;
+
+/// Forward data to framebuffer via shared memory and IPC
+/// fb_task_id: fbdev task ID
+/// fb_shm_addr: mapped shared memory address
+/// data: bytes to write
+#[inline(never)]
+fn forward_to_fb(fb_task_id: usize, fb_shm_addr: usize, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+
+    // Write data to shared memory buffer
+    let dest = fb_shm_addr as *mut u8;
+    unsafe {
+        for (i, &byte) in data.iter().enumerate() {
+            dest.add(i).write_volatile(byte);
+        }
+    }
+
+    // FB_PRINT message (tag 405): data[0] = offset, data[1] = length
+    const FB_PRINT: u64 = 405;
+    let mut msg = Message::new(FB_PRINT, [0, data.len() as u64, 0, 0]);
+    let _ = ipc::call(fb_task_id, &mut msg);
+}
+
+/// Read into buffer (blocking until at least 1 byte or newline)
+/// Reads from both input buffer (keyboard) and UART (serial)
+fn console_read(buf: &mut [u8]) -> usize {
     if buf.is_empty() {
         return 0;
     }
@@ -85,7 +118,7 @@ fn uart_read(buf: &mut [u8]) -> usize {
     // Block until we get at least one character
     // Note: No echo here - let the shell handle echo (termios ECHO flag equivalent)
     loop {
-        if let Some(c) = uart_getc() {
+        if let Some(c) = try_getc() {
             // Handle enter (CR or LF) - convert CR to LF
             if c == b'\r' || c == b'\n' {
                 if count < buf.len() {
@@ -186,6 +219,12 @@ fn main() -> ! {
     // Print startup message directly to UART
     uart_print("[console] Server started\n");
 
+    // Framebuffer forwarding state
+    let mut fb_task_id: usize = 0;
+    let mut fb_shm_id: u64 = 0;
+    let mut fb_shm_addr: usize = 0;
+    let mut fb_ready: bool = false;
+
     // Main message processing loop
     loop {
         // Wait for a message from any task
@@ -196,12 +235,12 @@ fn main() -> ! {
             let max_len = recv.msg.data[0] as usize;
             let max_len = if max_len > 24 { 24 } else { max_len };
 
-            // Read from UART into reply buffer
+            // Read into reply buffer (reads from keyboard SHM or UART)
             let mut reply = Message::new(0, [0, 0, 0, 0]);
             let data_ptr = reply.data[1..].as_mut_ptr() as *mut u8;
             let buf = unsafe { core::slice::from_raw_parts_mut(data_ptr, max_len) };
 
-            let bytes_read = uart_read(buf);
+            let bytes_read = console_read(buf);
             reply.tag = bytes_read as u64;
             reply.data[0] = bytes_read as u64;
 
@@ -217,6 +256,12 @@ fn main() -> ! {
 
             // Write to UART
             let written = uart_write(buf);
+
+            // Forward to framebuffer if ready
+            if fb_ready {
+                forward_to_fb(fb_task_id, fb_shm_addr, buf);
+            }
+            let _ = fb_shm_id;
 
             // Reply with number of bytes written
             let reply = Message::new(written as u64, [0, 0, 0, 0]);
@@ -236,8 +281,38 @@ fn main() -> ! {
                     };
                     let written = uart_write(buf);
 
+                    // Forward to framebuffer if ready
+                    if fb_ready {
+                        forward_to_fb(fb_task_id, fb_shm_addr, buf);
+                    }
+
                     // Reply with number of bytes written
                     let reply = Message::new(written as u64, [0, 0, 0, 0]);
+                    ipc::reply(&reply);
+                }
+                None => {
+                    // Failed to map SHM
+                    let reply = Message::new(SHM_ERR_INVALID as u64, [0, 0, 0, 0]);
+                    ipc::reply(&reply);
+                }
+            }
+        } else if recv.msg.tag == MSG_SHM_READ {
+            // MSG_SHM_READ: data[0]=shm_id, data[1]=offset, data[2]=max_len
+            let shm_id = recv.msg.data[0];
+            let _offset = recv.msg.data[1] as usize;
+            let max_len = recv.msg.data[2] as usize;
+
+            // Get mapped address for this client's SHM
+            match get_client_shm(recv.sender, shm_id) {
+                Some(shm_base) => {
+                    // Read into SHM buffer
+                    let buf = unsafe {
+                        core::slice::from_raw_parts_mut(shm_base as *mut u8, max_len)
+                    };
+                    let bytes_read = console_read(buf);
+
+                    // Reply with number of bytes read
+                    let reply = Message::new(bytes_read as u64, [0, 0, 0, 0]);
                     ipc::reply(&reply);
                 }
                 None => {
@@ -251,10 +326,29 @@ fn main() -> ! {
             // Just reply with success
             let reply = Message::new(IPC_OK as u64, [0, 0, 0, 0]);
             ipc::reply(&reply);
+        } else if recv.msg.tag == 409 {
+            // FB_REGISTER from fbdev
+            let reg_shm_id = recv.msg.data[0];
+            let addr = shm::map(reg_shm_id, 0);
+            if addr >= 0 {
+                fb_task_id = recv.sender;
+                fb_shm_id = reg_shm_id;
+                fb_shm_addr = addr as usize;
+                fb_ready = true;
+                uart_print("[console] Framebuffer registered\n");
+                let reply = Message::new(IPC_OK as u64, [0, 0, 0, 0]);
+                ipc::reply(&reply);
+            } else {
+                let reply = Message::new(IPC_ERR_INVALID as u64, [0, 0, 0, 0]);
+                ipc::reply(&reply);
+            }
         } else {
             // Unknown message - reply with error
             let reply = Message::new(IPC_ERR_INVALID as u64, [0, 0, 0, 0]);
             ipc::reply(&reply);
         }
+
+        // Suppress unused variable warnings for now
+        let _ = (fb_task_id, fb_shm_id, fb_shm_addr, fb_ready);
     }
 }

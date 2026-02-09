@@ -34,6 +34,7 @@ user:
 	cp user/target/aarch64-kenix-user/release/netdev user/netdev.elf
 	cp user/target/aarch64-kenix-user/release/pipeserv user/pipeserv.elf
 	cp user/target/aarch64-kenix-user/release/fbdev user/fbdev.elf
+	cp user/target/aarch64-kenix-user/release/kbdev user/kbdev.elf
 
 kernel: user
 	cd kernel && cargo +nightly build --release --target aarch64-kenix.json -Zbuild-std=core,alloc
@@ -63,7 +64,10 @@ run-kernel: kernel $(DISK_IMG)
 	stty $$stty_orig
 
 # Run with graphical display (shows ramfb framebuffer)
+# Keyboard input via terminal (UART), display on framebuffer
 run-kernel-fb: kernel $(DISK_IMG)
+	@stty_orig=$$(stty -g); \
+	stty raw -echo; \
 	$(QEMU) \
 		-M virt \
 		-cpu cortex-a72 \
@@ -75,11 +79,32 @@ run-kernel-fb: kernel $(DISK_IMG)
 		-netdev user,id=net0 \
 		-device ramfb \
 		-kernel kernel.elf \
-		-serial stdio
+		-serial mon:stdio; \
+	stty $$stty_orig
+
+# Run with VirtIO-GPU (preferred for graphical display with keyboard input)
+# Uses virtio-gpu-device and virtio-keyboard-device
+run-kernel-gpu: kernel $(DISK_IMG)
+	@stty_orig=$$(stty -g); \
+	stty raw -echo; \
+	$(QEMU) \
+		-M virt \
+		-cpu cortex-a72 \
+		-m 1G \
+		-global virtio-mmio.force-legacy=false \
+		-device virtio-blk-device,drive=disk0 \
+		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
+		-device virtio-net-device,netdev=net0 \
+		-netdev user,id=net0 \
+		-device virtio-gpu-device \
+		-device virtio-keyboard-device \
+		-kernel kernel.elf \
+		-serial mon:stdio; \
+	stty $$stty_orig
 
 clean:
 	rm -rf esp kernel.elf $(DISK_IMG)
-	rm -f user/console.elf user/init.elf user/vfs.elf user/hello.elf user/blkdev.elf user/netdev.elf user/pipeserv.elf user/fbdev.elf user/forktest.elf
+	rm -f user/console.elf user/init.elf user/vfs.elf user/hello.elf user/blkdev.elf user/netdev.elf user/pipeserv.elf user/fbdev.elf user/forktest.elf user/kbdev.elf
 	cd boot && cargo clean
 
 # Note: UEFI firmware is provided by QEMU (Homebrew) at /opt/homebrew/share/qemu/

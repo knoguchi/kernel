@@ -1252,9 +1252,62 @@ pub mod ipc {
 // ============================================================================
 
 pub mod console {
+    use crate::ipc::{self, Message};
+    use crate::msg::MSG_WRITE;
+    use crate::tasks;
+
+    /// Print bytes (up to 24 bytes) via IPC to console server
+    fn print_bytes(bytes: &[u8]) {
+        let len = bytes.len().min(24);
+        let mut msg = Message::new(MSG_WRITE, [len as u64, 0, 0, 0]);
+        let data_ptr = msg.data[1..].as_mut_ptr() as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len);
+        }
+        ipc::call(tasks::CONSOLE, &mut msg);
+    }
+
+    /// Print a string to console (up to 24 bytes at a time)
+    pub fn print(s: &str) {
+        let bytes = s.as_bytes();
+        // Handle strings longer than 24 bytes by chunking
+        for chunk in bytes.chunks(24) {
+            print_bytes(chunk);
+        }
+    }
+
+    /// Print a string with newline
+    pub fn println(s: &str) {
+        print(s);
+        print_bytes(b"\n");
+    }
+
+    /// Print a number in hex
+    pub fn print_hex(prefix: &str, value: u64) {
+        print(prefix);
+        print_bytes(b"0x");
+
+        let mut buf = [0u8; 16];
+        for i in 0..16 {
+            let nibble = ((value >> (60 - i * 4)) & 0xf) as u8;
+            buf[i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        }
+        print_bytes(&buf);
+        print_bytes(b"\n");
+    }
+}
+
+// ============================================================================
+// Direct UART Output (for servers - bypasses IPC to avoid deadlocks)
+// ============================================================================
+
+/// Direct UART output module for system servers.
+/// Use this instead of console:: in servers that might cause IPC deadlocks
+/// (fbdev, kbdev, blkdev, netdev, pipeserv, etc.)
+pub mod uart {
     use super::syscall;
 
-    /// Print a string to stdout
+    /// Print a string directly to UART (bypasses console IPC)
     pub fn print(s: &str) {
         syscall::write(1, s.as_bytes());
     }
@@ -1262,13 +1315,13 @@ pub mod console {
     /// Print a string with newline
     pub fn println(s: &str) {
         print(s);
-        print("\n");
+        syscall::write(1, b"\n");
     }
 
     /// Print a number in hex
     pub fn print_hex(prefix: &str, value: u64) {
         print(prefix);
-        print("0x");
+        syscall::write(1, b"0x");
 
         let mut buf = [0u8; 16];
         for i in 0..16 {
@@ -1276,7 +1329,7 @@ pub mod console {
             buf[i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
         }
         syscall::write(1, &buf);
-        print("\n");
+        syscall::write(1, b"\n");
     }
 }
 
@@ -1289,7 +1342,10 @@ pub mod msg {
     pub const MSG_READ: u64 = 0;
     pub const MSG_WRITE: u64 = 1;
     pub const MSG_EXIT: u64 = 2;
+    pub const MSG_SHM_READ: u64 = 9;
     pub const MSG_SHM_WRITE: u64 = 10;
+    pub const MSG_KEY_INPUT: u64 = 11;  // Inject keyboard input: data[0]=char (deprecated)
+    pub const KB_REGISTER: u64 = 410;   // Kbdev->Console: register keyboard SHM
 
     // IPC result codes
     pub const IPC_OK: i64 = 0;
@@ -1331,6 +1387,7 @@ pub mod msg {
     pub const FB_SCROLL: u64 = 406;     // Scroll up one line
     pub const FB_CURSOR_SET: u64 = 407; // Set cursor: data[0]=col, data[1]=row
     pub const FB_CURSOR_GET: u64 = 408; // Get cursor: returns [col, row]
+    pub const FB_REGISTER: u64 = 409;   // Fbdev->Console: register as ready for output forwarding
 
     // Error codes
     pub const ERR_OK: i64 = 0;
@@ -1366,4 +1423,5 @@ pub mod tasks {
     pub const NETDEV: usize = 5;
     pub const PIPESERV: usize = 6;
     pub const FBDEV: usize = 7;
+    pub const KBDEV: usize = 8;
 }

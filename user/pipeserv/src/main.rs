@@ -9,6 +9,7 @@
 use libkenix::ipc::{self, Message, TASK_ANY};
 use libkenix::msg::{PIPE_CREATE, PIPE_READ, PIPE_WRITE, PIPE_CLOSE, ERR_OK, ERR_NOMEM, ERR_INVAL, ERR_BADF};
 use libkenix::shm;
+use libkenix::uart;
 
 /// Maximum number of pipes
 const MAX_PIPES: usize = 64;
@@ -265,9 +266,7 @@ fn wake_writers_error(pipe: &mut Pipe) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    // Use stack buffer to avoid potential rodata mapping issues
-    let msg: [u8; 24] = *b"[pipeserv] ok, ready!\n\n\n";
-    libkenix::syscall::write(1, &msg);
+    uart::println("[pipeserv] ok, ready!\n");
 
     // Main server loop
     loop {

@@ -10,10 +10,24 @@ extern crate libkenix;
 
 use libkenix::syscall::{self, Timespec, Stat, Sigaction, Rlimit, Iovec, Winsize};
 use libkenix::console;
+use libkenix::ipc::{self, Message};
+use libkenix::msg::MSG_WRITE;
+use libkenix::tasks;
+
+/// Print bytes via IPC to console
+fn print_bytes(bytes: &[u8]) {
+    let len = bytes.len().min(24);
+    let mut msg = Message::new(MSG_WRITE, [len as u64, 0, 0, 0]);
+    let data_ptr = msg.data[1..].as_mut_ptr() as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len);
+    }
+    ipc::call(tasks::CONSOLE, &mut msg);
+}
 
 fn print_num(n: i64) {
     if n < 0 {
-        syscall::write(1, b"-");
+        print_bytes(b"-");
         print_num(-n);
         return;
     }
@@ -21,7 +35,7 @@ fn print_num(n: i64) {
         print_num(n / 10);
     }
     let digit = (n % 10) as u8 + b'0';
-    syscall::write(1, &[digit]);
+    print_bytes(&[digit]);
 }
 
 fn print_hex_byte(b: u8) {
@@ -29,7 +43,7 @@ fn print_hex_byte(b: u8) {
     let lo = b & 0xf;
     let c1 = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
     let c2 = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
-    syscall::write(1, &[c1, c2]);
+    print_bytes(&[c1, c2]);
 }
 
 fn test_clock_gettime() {

@@ -23,9 +23,8 @@ static FORKTEST_ELF: &[u8] = include_bytes!("../data/forktest.elf");
 // Console Client (IPC-based printing)
 // ============================================================================
 
-/// Print a short string (up to 24 bytes) via inline IPC
-fn print(s: &str) {
-    let bytes = s.as_bytes();
+/// Print bytes (up to 24 bytes) via inline IPC to console
+fn print_bytes(bytes: &[u8]) {
     let len = bytes.len().min(24);
 
     let mut msg = Message::new(MSG_WRITE, [len as u64, 0, 0, 0]);
@@ -37,10 +36,15 @@ fn print(s: &str) {
     ipc::call(tasks::CONSOLE, &mut msg);
 }
 
+/// Print a short string (up to 24 bytes) via inline IPC
+fn print(s: &str) {
+    print_bytes(s.as_bytes());
+}
+
 /// Print a number in decimal
 fn print_num(n: usize) {
     if n == 0 {
-        syscall::write(1, b"0");
+        print_bytes(b"0");
         return;
     }
 
@@ -52,17 +56,18 @@ fn print_num(n: usize) {
         buf[i] = b'0' + (num % 10) as u8;
         num /= 10;
     }
-    syscall::write(1, &buf[i..]);
+    print_bytes(&buf[i..]);
 }
 
 /// Print a number in hex
 fn print_hex(n: u64) {
     print("0x");
-    for i in (0..16).rev() {
-        let nibble = ((n >> (i * 4)) & 0xf) as u8;
-        let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-        syscall::write(1, &[c]);
+    let mut buf = [0u8; 16];
+    for i in 0..16 {
+        let nibble = ((n >> ((15 - i) * 4)) & 0xf) as u8;
+        buf[i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
     }
+    print_bytes(&buf);
 }
 
 // ============================================================================
@@ -114,6 +119,21 @@ fn vfs_close(handle: i64) -> i64 {
 }
 
 // ============================================================================
+// Wait for Framebuffer to be Ready
+// ============================================================================
+
+/// Wait for fbdev to be ready by sending FB_INIT and waiting for response.
+/// This ensures fbdev has completed initialization and registered with console
+/// before we start the shell, so all shell output appears on the framebuffer.
+fn wait_for_fbdev() {
+    // FB_INIT message - fbdev will only respond after entering its main IPC loop,
+    // which happens after it registers with console for output forwarding.
+    let mut msg = Message::new(FB_INIT, [0, 0, 0, 0]);
+    ipc::call(tasks::FBDEV, &mut msg);
+    // We don't care about the response - just that fbdev is ready
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -124,6 +144,11 @@ pub extern "C" fn _start() -> ! {
 
 fn main() -> ! {
     print("=== Kenix Init ===\n");
+
+    // Wait for fbdev to be ready before printing anything else.
+    // This ensures shell output will appear on framebuffer.
+    wait_for_fbdev();
+
     print("Running BusyBox from disk...\n\n");
 
     // Run busybox shell
@@ -321,7 +346,7 @@ fn run_all_tests() {
         let n = vfs_read(fd, &mut buf);
         if n > 0 {
             print("Read /hello.txt: ");
-            syscall::write(1, &buf[..n as usize]);
+            print_bytes(&buf[..n as usize]);
         }
         vfs_close(fd);
     }
@@ -341,7 +366,7 @@ fn run_all_tests() {
         let n = vfs_read(disk_fd, &mut buf);
         if n > 0 {
             print("Read from disk: ");
-            syscall::write(1, &buf[..n as usize]);
+            print_bytes(&buf[..n as usize]);
             print("\n");
         } else {
             print("Read failed: ");
@@ -382,7 +407,7 @@ fn run_all_tests() {
         let read_count = syscall::read(read_fd as usize, &mut buf);
         if read_count > 0 {
             print("Read from pipe: ");
-            syscall::write(1, &buf[..read_count as usize]);
+            print_bytes(&buf[..read_count as usize]);
             print("\n");
         } else {
             print("Read failed: ");
@@ -445,7 +470,7 @@ fn run_all_tests() {
         print("getcwd: ");
         // Find null terminator
         let len = cwd_buf.iter().position(|&c| c == 0).unwrap_or(cwd_buf.len());
-        syscall::write(1, &cwd_buf[..len]);
+        print_bytes(&cwd_buf[..len]);
         print("\n");
     } else {
         print("getcwd failed\n");
@@ -461,7 +486,7 @@ fn run_all_tests() {
         if cwd_result > 0 {
             print("getcwd: ");
             let len = cwd_buf.iter().position(|&c| c == 0).unwrap_or(cwd_buf.len());
-            syscall::write(1, &cwd_buf[..len]);
+            print_bytes(&cwd_buf[..len]);
             print("\n");
             print("[debug] after getcwd print\n");
         }

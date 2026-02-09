@@ -5,6 +5,7 @@
 //! Each bit in a byte represents one pixel (MSB = leftmost pixel).
 
 use crate::ramfb::Ramfb;
+use crate::virtio_gpu::VirtioGpu;
 
 /// Font dimensions
 pub const FONT_WIDTH: u32 = 8;
@@ -416,16 +417,74 @@ pub fn draw_char(fb: &mut Ramfb, x: u32, y: u32, c: u8, fg: u32, bg: u32) {
             fb.put_pixel(x + col, y + row, pixel);
         }
     }
+
+    // Memory barrier to ensure all writes are visible
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Draw a character on VirtIO-GPU framebuffer (no flush - caller must flush)
+pub fn draw_char_gpu(gpu: &mut VirtioGpu, x: u32, y: u32, c: u8, fg: u32, bg: u32) {
+    let glyph_offset = (c as usize) * FONT_HEIGHT as usize;
+    let glyph = &FONT_DATA[glyph_offset..glyph_offset + FONT_HEIGHT as usize];
+
+    for row in 0..FONT_HEIGHT {
+        let bits = glyph[row as usize];
+        for col in 0..FONT_WIDTH {
+            let pixel = if (bits >> (7 - col)) & 1 != 0 { fg } else { bg };
+            gpu.put_pixel(x + col, y + row, pixel);
+        }
+    }
 }
 
 /// Text console state
+/// Escape sequence parser state
+#[derive(Clone, Copy, PartialEq)]
+enum EscState {
+    Normal,   // Normal character output
+    Escape,   // Saw ESC (0x1B)
+    Csi,      // Saw ESC [ (Control Sequence Introducer)
+}
+
+/// Standard ANSI colors (0-7)
+const ANSI_COLORS: [u32; 8] = [
+    0x000000, // 0: Black
+    0xCC0000, // 1: Red
+    0x00CC00, // 2: Green
+    0xCCCC00, // 3: Yellow
+    0x0000CC, // 4: Blue
+    0xCC00CC, // 5: Magenta
+    0x00CCCC, // 6: Cyan
+    0xCCCCCC, // 7: White
+];
+
+/// Bright ANSI colors (8-15)
+const ANSI_BRIGHT_COLORS: [u32; 8] = [
+    0x666666, // 8: Bright Black (Gray)
+    0xFF0000, // 9: Bright Red
+    0x00FF00, // 10: Bright Green
+    0xFFFF00, // 11: Bright Yellow
+    0x0000FF, // 12: Bright Blue
+    0xFF00FF, // 13: Bright Magenta
+    0x00FFFF, // 14: Bright Cyan
+    0xFFFFFF, // 15: Bright White
+];
+
 pub struct TextConsole {
     cursor_x: u32,      // Column (0-based)
     cursor_y: u32,      // Row (0-based)
-    fg_color: u32,      // Foreground color
-    bg_color: u32,      // Background color
+    fg_color: u32,      // Current foreground color
+    bg_color: u32,      // Current background color
+    default_fg: u32,    // Default foreground color
+    default_bg: u32,    // Default background color
     cols: u32,          // Number of columns
     rows: u32,          // Number of rows
+    bold: bool,         // Bold/bright mode
+    // Escape sequence state
+    esc_state: EscState,
+    esc_params: [u32; 8],   // CSI parameters (expanded for SGR)
+    esc_param_idx: usize,   // Current parameter index
 }
 
 impl TextConsole {
@@ -436,8 +495,14 @@ impl TextConsole {
             cursor_y: 0,
             fg_color: fg,
             bg_color: bg,
+            default_fg: fg,
+            default_bg: bg,
             cols: fb_width / FONT_WIDTH,
             rows: fb_height / FONT_HEIGHT,
+            bold: false,
+            esc_state: EscState::Normal,
+            esc_params: [0; 8],
+            esc_param_idx: 0,
         }
     }
 
@@ -474,46 +539,290 @@ impl TextConsole {
 
     /// Print a character at the current cursor position
     pub fn put_char(&mut self, fb: &mut Ramfb, c: u8) {
-        match c {
-            b'\n' => {
-                self.cursor_x = 0;
-                self.cursor_y += 1;
-                if self.cursor_y >= self.rows {
-                    self.scroll(fb);
-                    self.cursor_y = self.rows - 1;
-                }
-            }
-            b'\r' => {
-                self.cursor_x = 0;
-            }
-            b'\t' => {
-                // Tab to next 8-column boundary
-                let next_tab = (self.cursor_x + 8) & !7;
-                if next_tab < self.cols {
-                    self.cursor_x = next_tab;
-                } else {
-                    self.cursor_x = 0;
-                    self.cursor_y += 1;
-                    if self.cursor_y >= self.rows {
-                        self.scroll(fb);
-                        self.cursor_y = self.rows - 1;
+        // Handle escape sequence state machine
+        match self.esc_state {
+            EscState::Normal => {
+                match c {
+                    0x1B => {
+                        // ESC - start escape sequence
+                        self.esc_state = EscState::Escape;
                     }
-                }
-            }
-            _ => {
-                let px = self.cursor_x * FONT_WIDTH;
-                let py = self.cursor_y * FONT_HEIGHT;
-                draw_char(fb, px, py, c, self.fg_color, self.bg_color);
+                    b'\n' => {
+                        self.cursor_x = 0;
+                        self.cursor_y += 1;
+                        if self.cursor_y >= self.rows {
+                            self.scroll(fb);
+                            self.cursor_y = 0;  // scroll clears screen, start at top
+                        }
+                    }
+                    b'\r' => {
+                        self.cursor_x = 0;
+                    }
+                    0x08 => {
+                        // Backspace - move cursor left and erase character
+                        if self.cursor_x > 0 {
+                            self.cursor_x -= 1;
+                            // Erase character at cursor position
+                            let px = self.cursor_x * FONT_WIDTH;
+                            let py = self.cursor_y * FONT_HEIGHT;
+                            draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+                        }
+                    }
+                    0x7F => {
+                        // DEL - same as backspace for terminal
+                        if self.cursor_x > 0 {
+                            self.cursor_x -= 1;
+                            let px = self.cursor_x * FONT_WIDTH;
+                            let py = self.cursor_y * FONT_HEIGHT;
+                            draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+                        }
+                    }
+                    b'\t' => {
+                        // Tab to next 8-column boundary
+                        let next_tab = (self.cursor_x + 8) & !7;
+                        if next_tab < self.cols {
+                            self.cursor_x = next_tab;
+                        } else {
+                            self.cursor_x = 0;
+                            self.cursor_y += 1;
+                            if self.cursor_y >= self.rows {
+                                self.scroll(fb);
+                                self.cursor_y = 0;  // scroll clears screen, start at top
+                            }
+                        }
+                    }
+                    _ => {
+                        // Regular character
+                        let px = self.cursor_x * FONT_WIDTH;
+                        let py = self.cursor_y * FONT_HEIGHT;
+                        draw_char(fb, px, py, c, self.fg_color, self.bg_color);
 
-                self.cursor_x += 1;
-                if self.cursor_x >= self.cols {
-                    self.cursor_x = 0;
-                    self.cursor_y += 1;
-                    if self.cursor_y >= self.rows {
-                        self.scroll(fb);
-                        self.cursor_y = self.rows - 1;
+                        self.cursor_x += 1;
+                        if self.cursor_x >= self.cols {
+                            self.cursor_x = 0;
+                            self.cursor_y += 1;
+                            if self.cursor_y >= self.rows {
+                                self.scroll(fb);
+                                self.cursor_y = 0;  // scroll clears screen, start at top
+                            }
+                        }
                     }
                 }
+            }
+            EscState::Escape => {
+                match c {
+                    b'[' => {
+                        // CSI - Control Sequence Introducer
+                        self.esc_state = EscState::Csi;
+                        self.esc_params = [0; 8];
+                        self.esc_param_idx = 0;
+                    }
+                    _ => {
+                        // Unknown escape, ignore and return to normal
+                        self.esc_state = EscState::Normal;
+                    }
+                }
+            }
+            EscState::Csi => {
+                match c {
+                    b'0'..=b'9' => {
+                        // Accumulate parameter digit
+                        if self.esc_param_idx < 8 {
+                            self.esc_params[self.esc_param_idx] =
+                                self.esc_params[self.esc_param_idx] * 10 + (c - b'0') as u32;
+                        }
+                    }
+                    b';' => {
+                        // Parameter separator
+                        if self.esc_param_idx < 7 {
+                            self.esc_param_idx += 1;
+                        }
+                    }
+                    b'A' => {
+                        // Cursor Up
+                        let n = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        self.cursor_y = self.cursor_y.saturating_sub(n);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'B' => {
+                        // Cursor Down
+                        let n = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        self.cursor_y = (self.cursor_y + n).min(self.rows - 1);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'C' => {
+                        // Cursor Forward (Right)
+                        let n = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        self.cursor_x = (self.cursor_x + n).min(self.cols - 1);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'D' => {
+                        // Cursor Back (Left)
+                        let n = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        self.cursor_x = self.cursor_x.saturating_sub(n);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'H' | b'f' => {
+                        // Cursor Position - ESC[row;colH
+                        let row = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        let col = if self.esc_params[1] == 0 { 1 } else { self.esc_params[1] };
+                        self.cursor_y = (row - 1).min(self.rows - 1);
+                        self.cursor_x = (col - 1).min(self.cols - 1);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'J' => {
+                        // Erase in Display
+                        match self.esc_params[0] {
+                            0 => {
+                                // Clear from cursor to end of screen
+                                self.clear_to_end(fb);
+                            }
+                            1 => {
+                                // Clear from beginning to cursor
+                                self.clear_from_start(fb);
+                            }
+                            2 | 3 => {
+                                // Clear entire screen
+                                fb.clear(self.bg_color);
+                                self.cursor_x = 0;
+                                self.cursor_y = 0;
+                            }
+                            _ => {}
+                        }
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'K' => {
+                        // Erase in Line
+                        match self.esc_params[0] {
+                            0 => {
+                                // Clear from cursor to end of line
+                                self.clear_line_to_end(fb);
+                            }
+                            1 => {
+                                // Clear from beginning of line to cursor
+                                self.clear_line_from_start(fb);
+                            }
+                            2 => {
+                                // Clear entire line
+                                self.clear_line(fb);
+                            }
+                            _ => {}
+                        }
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'm' => {
+                        // SGR - Select Graphic Rendition (colors/attributes)
+                        self.handle_sgr();
+                        self.esc_state = EscState::Normal;
+                    }
+                    0x40..=0x7E => {
+                        // Any other final byte - end sequence
+                        self.esc_state = EscState::Normal;
+                    }
+                    _ => {
+                        // Continue accumulating (intermediate bytes, etc.)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear from cursor to end of screen
+    fn clear_to_end(&self, fb: &mut Ramfb) {
+        // Clear rest of current line
+        for x in self.cursor_x..self.cols {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+        }
+        // Clear remaining lines
+        for y in (self.cursor_y + 1)..self.rows {
+            for x in 0..self.cols {
+                let px = x * FONT_WIDTH;
+                let py = y * FONT_HEIGHT;
+                draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+            }
+        }
+    }
+
+    /// Clear from beginning of screen to cursor
+    fn clear_from_start(&self, fb: &mut Ramfb) {
+        // Clear lines before current
+        for y in 0..self.cursor_y {
+            for x in 0..self.cols {
+                let px = x * FONT_WIDTH;
+                let py = y * FONT_HEIGHT;
+                draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+            }
+        }
+        // Clear current line up to cursor
+        for x in 0..=self.cursor_x {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+        }
+    }
+
+    /// Clear from cursor to end of line
+    fn clear_line_to_end(&self, fb: &mut Ramfb) {
+        for x in self.cursor_x..self.cols {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+        }
+    }
+
+    /// Clear from beginning of line to cursor
+    fn clear_line_from_start(&self, fb: &mut Ramfb) {
+        for x in 0..=self.cursor_x {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+        }
+    }
+
+    /// Clear entire line
+    fn clear_line(&self, fb: &mut Ramfb) {
+        for x in 0..self.cols {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char(fb, px, py, b' ', self.fg_color, self.bg_color);
+        }
+    }
+
+    /// Handle SGR (Select Graphic Rendition) escape sequence for colors
+    fn handle_sgr(&mut self) {
+        let count = self.esc_param_idx + 1;
+        for i in 0..count {
+            let param = self.esc_params[i];
+            match param {
+                0 => {
+                    // Reset
+                    self.fg_color = self.default_fg;
+                    self.bg_color = self.default_bg;
+                    self.bold = false;
+                }
+                1 => self.bold = true,
+                22 => self.bold = false,
+                30..=37 => {
+                    let idx = (param - 30) as usize;
+                    self.fg_color = if self.bold { ANSI_BRIGHT_COLORS[idx] } else { ANSI_COLORS[idx] };
+                }
+                39 => self.fg_color = self.default_fg,
+                40..=47 => {
+                    let idx = (param - 40) as usize;
+                    self.bg_color = ANSI_COLORS[idx];
+                }
+                49 => self.bg_color = self.default_bg,
+                90..=97 => {
+                    let idx = (param - 90) as usize;
+                    self.fg_color = ANSI_BRIGHT_COLORS[idx];
+                }
+                100..=107 => {
+                    let idx = (param - 100) as usize;
+                    self.bg_color = ANSI_BRIGHT_COLORS[idx];
+                }
+                _ => {}
             }
         }
     }
@@ -526,7 +835,15 @@ impl TextConsole {
     }
 
     /// Scroll the screen up by one line
+    /// Note: Full-screen scroll is extremely slow on uncached framebuffer (ramfb).
+    /// Instead of scrolling, we just wrap around to the top of the screen.
+    /// For proper scrolling, consider using virtio-gpu which uses DMA.
     pub fn scroll(&self, fb: &mut Ramfb) {
+        // Clear the screen and reset cursor to top-left
+        fb.clear(self.bg_color);
+        // Note: cursor_y will be set to 0 by the caller after this returns
+        return;
+
         let framebuffer = fb.framebuffer();
         let stride_pixels = fb.stride() / 4;
         let line_height = FONT_HEIGHT as usize;
@@ -551,6 +868,287 @@ impl TextConsole {
                         .write_volatile(self.bg_color);
                 }
             }
+        }
+    }
+
+    // ========== VirtIO-GPU specific methods ==========
+
+    /// Print a character at the current cursor position (GPU version)
+    pub fn put_char_gpu(&mut self, gpu: &mut VirtioGpu, c: u8) {
+        // Handle escape sequence state machine
+        match self.esc_state {
+            EscState::Normal => {
+                match c {
+                    0x1B => {
+                        // ESC - start escape sequence
+                        self.esc_state = EscState::Escape;
+                    }
+                    b'\n' => {
+                        self.cursor_x = 0;
+                        self.cursor_y += 1;
+                        if self.cursor_y >= self.rows {
+                            self.scroll_gpu(gpu);
+                            self.cursor_y = 0;  // scroll clears screen, start at top
+                        }
+                    }
+                    b'\r' => {
+                        self.cursor_x = 0;
+                    }
+                    0x08 => {
+                        // Backspace
+                        if self.cursor_x > 0 {
+                            self.cursor_x -= 1;
+                            let px = self.cursor_x * FONT_WIDTH;
+                            let py = self.cursor_y * FONT_HEIGHT;
+                            draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+                            gpu.flush(px, py, FONT_WIDTH, FONT_HEIGHT);
+                        }
+                    }
+                    0x7F => {
+                        // DEL
+                        if self.cursor_x > 0 {
+                            self.cursor_x -= 1;
+                            let px = self.cursor_x * FONT_WIDTH;
+                            let py = self.cursor_y * FONT_HEIGHT;
+                            draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+                            gpu.flush(px, py, FONT_WIDTH, FONT_HEIGHT);
+                        }
+                    }
+                    b'\t' => {
+                        let next_tab = (self.cursor_x + 8) & !7;
+                        if next_tab < self.cols {
+                            self.cursor_x = next_tab;
+                        } else {
+                            self.cursor_x = 0;
+                            self.cursor_y += 1;
+                            if self.cursor_y >= self.rows {
+                                self.scroll_gpu(gpu);
+                                self.cursor_y = 0;  // scroll clears screen, start at top
+                            }
+                        }
+                    }
+                    _ => {
+                        // Regular character
+                        let px = self.cursor_x * FONT_WIDTH;
+                        let py = self.cursor_y * FONT_HEIGHT;
+                        draw_char_gpu(gpu, px, py, c, self.fg_color, self.bg_color);
+                        gpu.flush(px, py, FONT_WIDTH, FONT_HEIGHT);
+
+                        self.cursor_x += 1;
+                        if self.cursor_x >= self.cols {
+                            self.cursor_x = 0;
+                            self.cursor_y += 1;
+                            if self.cursor_y >= self.rows {
+                                self.scroll_gpu(gpu);
+                                self.cursor_y = 0;  // scroll clears screen, start at top
+                            }
+                        }
+                    }
+                }
+            }
+            EscState::Escape => {
+                match c {
+                    b'[' => {
+                        self.esc_state = EscState::Csi;
+                        self.esc_params = [0; 8];
+                        self.esc_param_idx = 0;
+                    }
+                    _ => {
+                        self.esc_state = EscState::Normal;
+                    }
+                }
+            }
+            EscState::Csi => {
+                match c {
+                    b'0'..=b'9' => {
+                        if self.esc_param_idx < 8 {
+                            self.esc_params[self.esc_param_idx] =
+                                self.esc_params[self.esc_param_idx] * 10 + (c - b'0') as u32;
+                        }
+                    }
+                    b';' => {
+                        if self.esc_param_idx < 7 {
+                            self.esc_param_idx += 1;
+                        }
+                    }
+                    b'A' => {
+                        let n = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        self.cursor_y = self.cursor_y.saturating_sub(n);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'B' => {
+                        let n = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        self.cursor_y = (self.cursor_y + n).min(self.rows - 1);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'C' => {
+                        let n = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        self.cursor_x = (self.cursor_x + n).min(self.cols - 1);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'D' => {
+                        let n = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        self.cursor_x = self.cursor_x.saturating_sub(n);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'H' | b'f' => {
+                        let row = if self.esc_params[0] == 0 { 1 } else { self.esc_params[0] };
+                        let col = if self.esc_params[1] == 0 { 1 } else { self.esc_params[1] };
+                        self.cursor_y = (row - 1).min(self.rows - 1);
+                        self.cursor_x = (col - 1).min(self.cols - 1);
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'J' => {
+                        match self.esc_params[0] {
+                            0 => self.clear_to_end_gpu(gpu),
+                            1 => self.clear_from_start_gpu(gpu),
+                            2 | 3 => {
+                                gpu.clear(self.bg_color);
+                                self.cursor_x = 0;
+                                self.cursor_y = 0;
+                            }
+                            _ => {}
+                        }
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'K' => {
+                        match self.esc_params[0] {
+                            0 => self.clear_line_to_end_gpu(gpu),
+                            1 => self.clear_line_from_start_gpu(gpu),
+                            2 => self.clear_line_gpu(gpu),
+                            _ => {}
+                        }
+                        self.esc_state = EscState::Normal;
+                    }
+                    b'm' => {
+                        self.handle_sgr();
+                        self.esc_state = EscState::Normal;
+                    }
+                    0x40..=0x7E => {
+                        self.esc_state = EscState::Normal;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Clear from cursor to end of screen (GPU)
+    fn clear_to_end_gpu(&self, gpu: &mut VirtioGpu) {
+        for x in self.cursor_x..self.cols {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+        }
+        for y in (self.cursor_y + 1)..self.rows {
+            for x in 0..self.cols {
+                let px = x * FONT_WIDTH;
+                let py = y * FONT_HEIGHT;
+                draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+            }
+        }
+        gpu.flush(0, self.cursor_y * FONT_HEIGHT, gpu.width, gpu.height - self.cursor_y * FONT_HEIGHT);
+    }
+
+    /// Clear from beginning of screen to cursor (GPU)
+    fn clear_from_start_gpu(&self, gpu: &mut VirtioGpu) {
+        for y in 0..self.cursor_y {
+            for x in 0..self.cols {
+                let px = x * FONT_WIDTH;
+                let py = y * FONT_HEIGHT;
+                draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+            }
+        }
+        for x in 0..=self.cursor_x {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+        }
+        gpu.flush(0, 0, gpu.width, (self.cursor_y + 1) * FONT_HEIGHT);
+    }
+
+    /// Clear from cursor to end of line (GPU)
+    fn clear_line_to_end_gpu(&self, gpu: &mut VirtioGpu) {
+        for x in self.cursor_x..self.cols {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+        }
+        gpu.flush(self.cursor_x * FONT_WIDTH, self.cursor_y * FONT_HEIGHT,
+                  gpu.width - self.cursor_x * FONT_WIDTH, FONT_HEIGHT);
+    }
+
+    /// Clear from beginning of line to cursor (GPU)
+    fn clear_line_from_start_gpu(&self, gpu: &mut VirtioGpu) {
+        for x in 0..=self.cursor_x {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+        }
+        gpu.flush(0, self.cursor_y * FONT_HEIGHT, (self.cursor_x + 1) * FONT_WIDTH, FONT_HEIGHT);
+    }
+
+    /// Clear entire line (GPU)
+    fn clear_line_gpu(&self, gpu: &mut VirtioGpu) {
+        for x in 0..self.cols {
+            let px = x * FONT_WIDTH;
+            let py = self.cursor_y * FONT_HEIGHT;
+            draw_char_gpu(gpu, px, py, b' ', self.fg_color, self.bg_color);
+        }
+        gpu.flush(0, self.cursor_y * FONT_HEIGHT, gpu.width, FONT_HEIGHT);
+    }
+
+    /// Print a string (GPU version)
+    pub fn print_gpu(&mut self, gpu: &mut VirtioGpu, s: &[u8]) {
+        for &c in s {
+            self.put_char_gpu(gpu, c);
+        }
+    }
+
+    /// Scroll the screen up by one line (GPU version)
+    /// Note: Full-screen scroll is slow even with virtio-gpu due to pixel-by-pixel copy.
+    /// Instead of scrolling, we clear the screen and start from top.
+    pub fn scroll_gpu(&self, gpu: &mut VirtioGpu) {
+        use crate::virtio_gpu::{FB_WIDTH, FB_HEIGHT};
+
+        // Clear the screen and reset cursor to top-left
+        gpu.clear(self.bg_color);
+        gpu.flush(0, 0, FB_WIDTH, FB_HEIGHT);
+        return;
+
+        // Original slow scroll code left for reference:
+        #[allow(unreachable_code)]
+        {
+            use crate::virtio_gpu::FB_STRIDE;
+            let framebuffer = gpu.framebuffer();
+            let stride_pixels = (FB_STRIDE / 4) as usize;
+            let line_height = FONT_HEIGHT as usize;
+            let fb_height = FB_HEIGHT as usize;
+
+            unsafe {
+                // Copy lines up
+                for y in 0..(fb_height - line_height) {
+                    let src_offset = (y + line_height) * stride_pixels;
+                    let dst_offset = y * stride_pixels;
+                    for x in 0..stride_pixels {
+                        let ptr = framebuffer as *mut u32;
+                        let pixel = *ptr.add(src_offset + x);
+                        *ptr.add(dst_offset + x) = pixel;
+                    }
+                }
+
+                // Clear the last line
+                let last_line_start = (fb_height - line_height) * stride_pixels;
+                for y in 0..line_height {
+                    for x in 0..stride_pixels {
+                        let ptr = framebuffer as *mut u32;
+                        *ptr.add(last_line_start + y * stride_pixels + x) = self.bg_color;
+                    }
+                }
+            }
+
+            // Flush entire screen after scroll
+            gpu.flush(0, 0, FB_WIDTH, FB_HEIGHT);
         }
     }
 }

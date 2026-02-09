@@ -123,7 +123,7 @@ impl VirtioBlk {
     ///
     /// Returns true on success, false on failure.
     pub fn init(&mut self) -> bool {
-        use libkenix::console;
+        use libkenix::uart;
 
         // Scan virtio-mmio slots to find block device
         // QEMU virt machine has 32 virtio-mmio slots starting at 0x0a000000, 0x200 apart
@@ -137,11 +137,14 @@ impl VirtioBlk {
             let mmio = VirtioMmio::new(base);
 
             if mmio.is_valid() && mmio.device_id() == device_id::BLOCK {
-                console::print("[blkdev] found at slot ");
-                // Print slot number
-                let digit = (slot as u8) + b'0';
-                libkenix::syscall::write(1, &[digit]);
-                console::println("");
+                uart::print("[blkdev] found at slot ");
+                // Print slot number as two digits
+                let d1 = (slot / 10) as u8 + b'0';
+                let d2 = (slot % 10) as u8 + b'0';
+                let buf = if slot >= 10 { [d1, d2] } else { [d2, b' '] };
+                let s = unsafe { core::str::from_utf8_unchecked(&buf[..if slot >= 10 { 2 } else { 1 }]) };
+                uart::print(s);
+                uart::println("");
                 found_slot = Some(slot);
                 break;
             }
@@ -150,7 +153,7 @@ impl VirtioBlk {
         let slot = match found_slot {
             Some(s) => s,
             None => {
-                console::println("[blkdev] no block device found");
+                uart::println("[blkdev] no block device found");
                 return false;
             }
         };
@@ -193,7 +196,7 @@ impl VirtioBlk {
 
         // Check FEATURES_OK is still set
         if (self.mmio.status() & status::FEATURES_OK) == 0 {
-            console::println("[blkdev] features not OK");
+            uart::println("[blkdev] features not OK");
             self.mmio.set_status(status::FAILED);
             return false;
         }
@@ -205,7 +208,7 @@ impl VirtioBlk {
         self.mmio.select_queue(0);
         let max_size = self.mmio.queue_max_size();
         if max_size == 0 {
-            console::println("[blkdev] queue max size is 0");
+            uart::println("[blkdev] queue max size is 0");
             self.mmio.set_status(status::FAILED);
             return false;
         }

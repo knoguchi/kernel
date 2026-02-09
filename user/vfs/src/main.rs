@@ -13,7 +13,7 @@ mod blk_client;
 use libkenix::ipc::{self, Message, TASK_ANY};
 use libkenix::shm::{self, ShmId};
 use libkenix::msg::*;
-use libkenix::console;
+use libkenix::uart;
 
 use fat32::{Fat32, FatTable, DirEntry, DirIterator, Fat32File, SECTOR_SIZE};
 use blk_client::BlkClient;
@@ -1394,12 +1394,12 @@ fn main() -> ! {
         RAMFS.init();
     }
 
-    console::println("[vfs] Server started");
+    uart::println("[vfs] Server started");
 
     // Initialize block device client
     let blk_ok = unsafe { BLK_CLIENT.init() };
     if blk_ok {
-        console::println("[vfs] Block device connected");
+        uart::println("[vfs] Block device connected");
 
         // Read boot sector
         let boot_ok = unsafe {
@@ -1409,16 +1409,16 @@ fn main() -> ! {
         if boot_ok {
             // Try to parse as FAT32
             if let Some(fs) = Fat32::new(unsafe { &SECTOR_BUF }) {
-                console::println("[vfs] FAT32 filesystem mounted at /disk/");
+                uart::println("[vfs] FAT32 filesystem mounted at /disk/");
                 unsafe { FAT32_FS = Some(fs); }
             } else {
-                console::println("[vfs] No FAT32 found on disk");
+                uart::println("[vfs] No FAT32 found on disk");
             }
         } else {
-            console::println("[vfs] Failed to read boot sector");
+            uart::println("[vfs] Failed to read boot sector");
         }
     } else {
-        console::println("[vfs] No block device available");
+        uart::println("[vfs] No block device available");
     }
 
     loop {

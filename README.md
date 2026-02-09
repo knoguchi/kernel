@@ -6,18 +6,28 @@ user-space device drivers, and a VFS layer with FAT32 support.
 ## Current Status
 
 The kernel boots on QEMU virt and runs multiple user-space servers:
-- **Console server** - UART driver, handles stdin/stdout
+- **Console server** - UART driver, handles stdin/stdout, forwards to framebuffer
 - **VFS server** - Virtual filesystem with ramfs and FAT32
 - **Block device server** - VirtIO-blk driver
 - **Network device server** - VirtIO-net driver
-- **Framebuffer server** - ramfb driver with text console (800x600)
-- **Init process** - System tests and process spawning
+- **Pipe server** - Blocking pipes with deferred IPC replies
+- **Framebuffer server** - VirtIO-GPU or ramfb with text console (800x600)
+- **Keyboard server** - VirtIO-input driver for GUI keyboard input
+- **Init process** - System startup and shell launching
 
 **Phase 3 Complete:** BusyBox shell runs interactively! The kernel now includes
 alignment fault emulation for SIMD instructions, allowing unmodified musl-based
 binaries to run. Type commands at the `/ #` prompt.
 
 **Recent Fixes (2026-02-08):**
+- **Framebuffer output for shell:** Console writes now go through IPC to the console
+  server, which forwards to the framebuffer. The shell prompt and command output
+  appear on both UART and the graphical framebuffer window.
+- **Fixed sys_writev bypassing console server:** `writev()` was writing directly to
+  UART, bypassing the console server's framebuffer forwarding. Now properly routes
+  through IPC like `write()`.
+- **Fixed fbdev/shell race condition:** Init now waits for fbdev to complete
+  initialization before starting the shell, ensuring all output appears on FB.
 - Added blocking pipe support via deferred IPC replies. Pipe reads now block when
   empty (instead of returning 0), enabling shell pipelines like `echo hello | cat`.
 - Added `sys_reply_to` syscall for replying to specific tasks (not just last caller),
@@ -151,10 +161,16 @@ kenix/
 │   ├── fbdev/             # Framebuffer device server
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── main.rs       # IPC server loop
+│   │       ├── main.rs       # IPC server loop, backend selection
+│   │       ├── virtio_gpu.rs # VirtIO-GPU driver (preferred)
+│   │       ├── ramfb.rs      # ramfb driver (fallback)
 │   │       ├── fwcfg.rs      # QEMU fw_cfg interface
-│   │       ├── ramfb.rs      # ramfb driver
-│   │       └── font.rs       # 8x16 VGA bitmap font
+│   │       └── font.rs       # 8x16 VGA bitmap font, text console
+│   ├── kbdev/             # Keyboard device server
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs       # IPC server, keyboard polling
+│   │       └── input.rs      # VirtIO-input driver
 │   ├── pipeserv/          # Pipe server (blocking pipes via deferred IPC)
 │   │   ├── Cargo.toml
 │   │   └── src/main.rs
@@ -246,11 +262,12 @@ sigaction(SIGINT, &sa, NULL);
 - [x] Asynchronous notifications (notify/wait_notify)
 
 ### Servers
-- [x] Console server (UART)
+- [x] Console server (UART + framebuffer forwarding)
 - [x] VFS server (ramfs + FAT32)
 - [x] Block device server (VirtIO-blk)
 - [x] Network device server (VirtIO-net)
-- [x] Framebuffer server (ramfb with text console)
+- [x] Framebuffer server (VirtIO-GPU or ramfb with text console)
+- [x] Keyboard server (VirtIO-input for GUI keyboard)
 - [x] Pipe server (blocking pipes with deferred replies)
 - [x] FAT32 filesystem
 
@@ -310,7 +327,9 @@ sigaction(SIGINT, &sa, NULL);
 ### Hardware Support
 - [x] VirtIO-blk driver (block device)
 - [x] VirtIO-net driver (network)
-- [x] ramfb driver (framebuffer via fw_cfg)
+- [x] VirtIO-GPU driver (framebuffer with 2D acceleration)
+- [x] VirtIO-input driver (keyboard)
+- [x] ramfb driver (framebuffer via fw_cfg, fallback)
 - [x] ARM GIC (Generic Interrupt Controller)
 - [x] ARM timer interrupts (preemption)
 - [ ] VirtIO interrupt-driven I/O

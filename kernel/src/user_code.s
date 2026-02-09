@@ -52,6 +52,13 @@ __fbdev_elf_start:
 .incbin "../user/fbdev.elf"
 __fbdev_elf_end:
 
+// Keyboard device server ELF (task ID 8)
+.global __kbdev_elf_start
+.global __kbdev_elf_end
+__kbdev_elf_start:
+.incbin "../user/kbdev.elf"
+__kbdev_elf_end:
+
 // Forktest ELF
 .global __forktest_elf_start
 .global __forktest_elf_end

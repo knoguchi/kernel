@@ -69,9 +69,12 @@ unsafe fn set_call_return(task_id: TaskId, reply: &Message) {
 }
 
 /// Message tag values for built-in services
-pub const MSG_WRITE: u64 = 1;      // Console write request
+pub const MSG_READ: u64 = 0;       // Console read request (inline data)
+pub const MSG_WRITE: u64 = 1;      // Console write request (inline data)
 pub const MSG_EXIT: u64 = 2;       // Process exit
 pub const MSG_YIELD: u64 = 3;      // Yield time slice
+pub const MSG_SHM_READ: u64 = 9;   // Console read via shared memory
+pub const MSG_SHM_WRITE: u64 = 10; // Console write via shared memory
 
 /// IPC result codes
 pub const IPC_OK: i64 = 0;
@@ -1001,6 +1004,64 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
 
             // Return the virtual address of the mapped region
             PendingSyscallResult::Complete(vaddr as i64, None)
+        }
+        PendingSyscall::ConsoleWrite { len, shm_id } => {
+            // Console write completed - clean up SHM if used
+            if let Some(shm) = shm_id {
+                shm::sys_shmunmap_for_task(caller_id, shm);
+            }
+            // Return number of bytes written
+            PendingSyscallResult::Complete(len as i64, None)
+        }
+        PendingSyscall::ConsoleRead { user_buf, max_len, shm_id } => {
+            // Console read completed - copy data to user buffer
+            let bytes_read = reply.tag as i64;
+
+            if bytes_read > 0 {
+                let caller_task = &TASKS[caller_id.0];
+                let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
+
+                // Switch to caller's address space
+                let saved_ttbr0: u64;
+                core::arch::asm!(
+                    "mrs {0}, ttbr0_el1",
+                    "msr ttbr0_el1, {1}",
+                    "isb", "dsb sy", "tlbi vmalle1is", "dsb sy", "isb",
+                    out(reg) saved_ttbr0,
+                    in(reg) caller_ttbr0,
+                );
+
+                if shm_id == 0 {
+                    // Inline read: data is in reply.data[1..] (up to 24 bytes)
+                    let copy_len = (bytes_read as usize).min(max_len).min(24);
+                    let src = reply.data[1..].as_ptr() as *const u8;
+                    core::ptr::copy_nonoverlapping(src, user_buf as *mut u8, copy_len);
+                } else {
+                    // SHM-based read: data is in shared memory
+                    let shm_phys = shm::get_shm_phys_addr(shm_id);
+                    if shm_phys != 0 {
+                        core::ptr::copy_nonoverlapping(
+                            shm_phys as *const u8,
+                            user_buf as *mut u8,
+                            bytes_read as usize,
+                        );
+                    }
+                }
+
+                // Restore original page table
+                core::arch::asm!(
+                    "msr ttbr0_el1, {0}",
+                    "isb", "dsb sy", "tlbi vmalle1is", "dsb sy", "isb",
+                    in(reg) saved_ttbr0,
+                );
+            }
+
+            // Clean up SHM if used
+            if shm_id != 0 {
+                shm::sys_shmunmap_for_task(caller_id, shm_id);
+            }
+
+            PendingSyscallResult::Complete(bytes_read, None)
         }
     }
 }

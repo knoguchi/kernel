@@ -34,7 +34,9 @@ pub extern "C" fn _start() -> ! {
 
     // Print PID as single digit (we know it's small)
     let digit = (pid as u8) + b'0';
-    syscall::write(1, &[digit, b'\n']);
+    let mut msg = Message::new(MSG_WRITE, [2, 0, 0, 0]);
+    msg.data[1] = u64::from_le_bytes([digit, b'\n', 0, 0, 0, 0, 0, 0]);
+    ipc::call(tasks::CONSOLE, &mut msg);
 
     print("[hello] Goodbye!\n");
 

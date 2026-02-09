@@ -203,6 +203,22 @@ pub enum PendingSyscall {
         /// SHM ID for data transfer (needs cleanup)
         shm_id: usize,
     },
+    /// Console write: waiting for console server to acknowledge write
+    ConsoleWrite {
+        /// Number of bytes written (for return value)
+        len: usize,
+        /// SHM ID if using SHM transfer (None for inline)
+        shm_id: Option<usize>,
+    },
+    /// Console read: waiting for console server to provide input
+    ConsoleRead {
+        /// User buffer address to copy data to
+        user_buf: usize,
+        /// Maximum bytes to read
+        max_len: usize,
+        /// SHM ID for data transfer
+        shm_id: usize,
+    },
     /// Execve stage 1: waiting for VFS to open the executable file
     ExecveOpen {
         /// SHM ID containing path (needs cleanup)

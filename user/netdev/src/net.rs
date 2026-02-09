@@ -116,7 +116,7 @@ impl VirtioNet {
     ///
     /// Returns true on success, false on failure.
     pub fn init(&mut self) -> bool {
-        use libkenix::console;
+        use libkenix::uart;
 
         // Scan virtio-mmio slots to find network device
         const VIRTIO_BASE: usize = 0x0a00_0000;
@@ -129,10 +129,14 @@ impl VirtioNet {
             let mmio = VirtioMmio::new(base);
 
             if mmio.is_valid() && mmio.device_id() == device_id::NET {
-                console::print("[netdev] found at slot ");
-                let digit = (slot as u8) + b'0';
-                libkenix::syscall::write(1, &[digit]);
-                console::println("");
+                uart::print("[netdev] found at slot ");
+                // Print slot number as two digits
+                let d1 = (slot / 10) as u8 + b'0';
+                let d2 = (slot % 10) as u8 + b'0';
+                let buf = if slot >= 10 { [d1, d2] } else { [d2, b' '] };
+                let s = unsafe { core::str::from_utf8_unchecked(&buf[..if slot >= 10 { 2 } else { 1 }]) };
+                uart::print(s);
+                uart::println("");
                 found_slot = Some(slot);
                 break;
             }
@@ -141,7 +145,7 @@ impl VirtioNet {
         let slot = match found_slot {
             Some(s) => s,
             None => {
-                console::println("[netdev] no network device found");
+                uart::println("[netdev] no network device found");
                 return false;
             }
         };
@@ -182,7 +186,7 @@ impl VirtioNet {
 
         // Check FEATURES_OK is still set
         if (self.mmio.status() & status::FEATURES_OK) == 0 {
-            console::println("[netdev] features not OK");
+            uart::println("[netdev] features not OK");
             self.mmio.set_status(status::FAILED);
             return false;
         }
@@ -198,7 +202,7 @@ impl VirtioNet {
         self.mmio.select_queue(0);
         let rx_max_size = self.mmio.queue_max_size();
         if rx_max_size == 0 {
-            console::println("[netdev] RX queue max size is 0");
+            uart::println("[netdev] RX queue max size is 0");
             self.mmio.set_status(status::FAILED);
             return false;
         }
@@ -222,7 +226,7 @@ impl VirtioNet {
         self.mmio.select_queue(1);
         let tx_max_size = self.mmio.queue_max_size();
         if tx_max_size == 0 {
-            console::println("[netdev] TX queue max size is 0");
+            uart::println("[netdev] TX queue max size is 0");
             self.mmio.set_status(status::FAILED);
             return false;
         }

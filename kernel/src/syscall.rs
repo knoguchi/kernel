@@ -16,7 +16,7 @@
 use crate::exception::ExceptionContext;
 use crate::sched::{self, TaskId, Message, TaskState, FileDescriptor, PendingSyscall, KERNEL_STACK_SIZE};
 use crate::sched::task::find_free_slot;
-use crate::ipc;
+use crate::ipc::{self, MSG_READ, MSG_WRITE, MSG_SHM_READ, MSG_SHM_WRITE};
 use crate::shm;
 use crate::irq;
 use crate::timer;
@@ -707,49 +707,61 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
     // Handle based on fd kind
     match fd_entry.kind {
         FdKind::Console => {
-            // Read from UART - no echo here, let shell handle it
-            const UART_BASE: usize = 0x0900_0000;
-            const UART_DR: usize = 0x000;
-            const UART_FR: usize = 0x018;
-            const UART_FR_RXFE: u32 = 1 << 4; // RX FIFO empty
+            // Read via IPC to console server
+            // Console server handles both UART and keyboard input
+            use sched::task::CONSOLE_SERVER_TID;
 
             if len == 0 {
                 return 0;
             }
 
-            let mut count = 0usize;
+            // For small reads (≤24 bytes), use inline MSG_READ
+            // For larger reads, use MSG_SHM_READ with shared memory
+            if len <= 24 {
+                // Inline read: send max length, receive data in reply
+                let msg = Message::new(MSG_READ, [len as u64, 0, 0, 0]);
 
-            // Read characters without echo - let shell handle echo
-            unsafe {
-                let fr = (UART_BASE + UART_FR) as *const u32;
-                let dr = (UART_BASE + UART_DR) as *const u8;
-
-                loop {
-                    // Wait for a character
-                    while (core::ptr::read_volatile(fr) & UART_FR_RXFE) != 0 {
-                        // Yield to other tasks while waiting
-                        sched::yield_cpu();
-                    }
-
-                    let c = core::ptr::read_volatile(dr);
-
-                    // Convert CR to LF
-                    let c = if c == b'\r' { b'\n' } else { c };
-
-                    // Store character in buffer
-                    if count < len {
-                        core::ptr::write_volatile((buf + count) as *mut u8, c);
-                        count += 1;
-                    }
-
-                    // Stop on newline or buffer full
-                    if c == b'\n' || count >= len {
-                        break;
-                    }
+                // Set up pending syscall for inline read
+                // We use ConsoleRead but with shm_id=0 to indicate inline
+                // The reply handler will copy inline data to user buffer
+                unsafe {
+                    let task = &mut TASKS[current_id.0];
+                    task.pending_syscall = PendingSyscall::ConsoleRead {
+                        user_buf: buf,
+                        max_len: len,
+                        shm_id: 0, // 0 means inline, not SHM
+                    };
                 }
-            }
 
-            count as i64
+                // Send to console server
+                ipc::sys_call(ctx, CONSOLE_SERVER_TID, msg);
+                0 // Return value set by complete_pending_syscall
+            } else {
+                // Large read: use shared memory
+                let shm_id_i64 = shm::sys_shmcreate(len);
+                if shm_id_i64 < 0 {
+                    return ENOMEM;
+                }
+                let shm_id = shm_id_i64 as usize;
+
+                // Grant console server access
+                shm::sys_shmgrant(shm_id, CONSOLE_SERVER_TID.0);
+
+                // Set up pending syscall with SHM
+                unsafe {
+                    let task = &mut TASKS[current_id.0];
+                    task.pending_syscall = PendingSyscall::ConsoleRead {
+                        user_buf: buf,
+                        max_len: len,
+                        shm_id,
+                    };
+                }
+
+                // MSG_SHM_READ: data[0]=shm_id, data[1]=offset, data[2]=max_len
+                let msg = Message::new(MSG_SHM_READ, [shm_id as u64, 0, len as u64, 0]);
+                ipc::sys_call(ctx, CONSOLE_SERVER_TID, msg);
+                0 // Return value set by complete_pending_syscall
+            }
         }
         FdKind::PipeRead => {
             let pipe_id = fd_entry.handle;
@@ -885,31 +897,70 @@ fn sys_write(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i
     // Handle based on fd kind
     match fd_entry.kind {
         FdKind::Console => {
-            // Write to UART
-            const UART_BASE: usize = 0x0900_0000;
-            const UART_DR: usize = 0x000;
-            const UART_FR: usize = 0x018;
-            const UART_FR_TXFF: u32 = 1 << 5;
+            // Forward to console server via IPC
+            // Console server handles UART output + framebuffer forwarding
+            use sched::task::CONSOLE_SERVER_TID;
 
-            // Limit write size to prevent excessive time in kernel
             let len = len.min(4096);
-
-            for i in 0..len {
-                let c = unsafe {
-                    core::ptr::read_volatile((buf + i) as *const u8)
-                };
-
-                unsafe {
-                    let fr = (UART_BASE + UART_FR) as *const u32;
-                    while (core::ptr::read_volatile(fr) & UART_FR_TXFF) != 0 {
-                        core::hint::spin_loop();
-                    }
-                    let dr = (UART_BASE + UART_DR) as *mut u8;
-                    core::ptr::write_volatile(dr, c);
-                }
+            if len == 0 {
+                return 0;
             }
 
-            len as i64
+            // For small writes (≤24 bytes), use inline MSG_WRITE
+            // For larger writes, use MSG_SHM_WRITE with shared memory
+            if len <= 24 {
+                // Inline write: copy data into message
+                let mut data = [0u64; 4];
+                data[0] = len as u64;
+                unsafe {
+                    let dest = data[1..].as_mut_ptr() as *mut u8;
+                    core::ptr::copy_nonoverlapping(buf as *const u8, dest, len);
+                }
+                let msg = Message::new(MSG_WRITE, data);
+
+                // Set up pending syscall for inline write (no SHM used)
+                unsafe {
+                    let task = &mut TASKS[current_id.0];
+                    task.pending_syscall = PendingSyscall::ConsoleWrite { len, shm_id: None };
+                }
+
+                // Send to console server
+                ipc::sys_call(ctx, CONSOLE_SERVER_TID, msg);
+                0 // Return value set by complete_pending_syscall
+            } else {
+                // Large write: use shared memory
+                let shm_id_i64 = shm::sys_shmcreate(len);
+                if shm_id_i64 < 0 {
+                    return ENOMEM;
+                }
+                let shm_id = shm_id_i64 as usize;
+
+                let shm_addr = shm::sys_shmmap(shm_id, 0);
+                if shm_addr < 0 {
+                    return ENOMEM;
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        buf as *const u8,
+                        shm_addr as *mut u8,
+                        len,
+                    );
+                }
+
+                // Grant console server access
+                shm::sys_shmgrant(shm_id, CONSOLE_SERVER_TID.0);
+
+                // Set up pending syscall with SHM for cleanup
+                unsafe {
+                    let task = &mut TASKS[current_id.0];
+                    task.pending_syscall = PendingSyscall::ConsoleWrite { len, shm_id: Some(shm_id) };
+                }
+
+                // MSG_SHM_WRITE: data[0]=shm_id, data[1]=offset, data[2]=len
+                let msg = Message::new(MSG_SHM_WRITE, [shm_id as u64, 0, len as u64, 0]);
+                ipc::sys_call(ctx, CONSOLE_SERVER_TID, msg);
+                0 // Return value set by complete_pending_syscall
+            }
         }
         FdKind::PipeWrite => {
             let pipe_id = fd_entry.handle;
@@ -3257,39 +3308,8 @@ fn sys_writev(ctx: &mut ExceptionContext, fd: usize, iov: usize, iovcnt: usize) 
         return EBADF;
     }
 
-    // For console, iterate through iovecs and write each
-    if fd_entry.kind == FdKind::Console {
-        let mut total: i64 = 0;
-
-        const UART_BASE: usize = 0x0900_0000;
-        const UART_DR: usize = 0x000;
-        const UART_FR: usize = 0x018;
-        const UART_FR_TXFF: u32 = 1 << 5;
-
-        unsafe {
-            let iovecs = iov as *const Iovec;
-            for i in 0..iovcnt {
-                let iov_entry = &*iovecs.add(i);
-                let buf = iov_entry.iov_base;
-                let len = iov_entry.iov_len.min(4096);
-
-                for j in 0..len {
-                    let c = core::ptr::read_volatile((buf + j) as *const u8);
-                    let fr = (UART_BASE + UART_FR) as *const u32;
-                    while (core::ptr::read_volatile(fr) & UART_FR_TXFF) != 0 {
-                        core::hint::spin_loop();
-                    }
-                    let dr = (UART_BASE + UART_DR) as *mut u8;
-                    core::ptr::write_volatile(dr, c);
-                }
-                total += len as i64;
-            }
-        }
-
-        return total;
-    }
-
-    // For other fd types, fall back to iterating and calling sys_write
+    // For all fd types (including Console), iterate and call sys_write
+    // This ensures console output goes through IPC to console server
     let mut total: i64 = 0;
     unsafe {
         let iovecs = iov as *const Iovec;

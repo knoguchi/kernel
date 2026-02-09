@@ -45,6 +45,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbdev"
+version = "0.1.0"
+dependencies = [
+ "libkenix",
+]
+
+[[package]]
 name = "libkenix"
 version = "0.1.0"
 
