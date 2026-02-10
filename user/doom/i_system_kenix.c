@@ -9,6 +9,47 @@
 #include <unistd.h>
 
 #include "doomdef.h"
+
+// Override musl's SIMD-optimized memory functions to avoid alignment faults
+// These simple byte-by-byte versions are slower but don't cause SIMD alignment issues
+
+void *memcpy(void *dest, const void *src, size_t n) {
+    unsigned char *d = dest;
+    const unsigned char *s = src;
+    while (n--) *d++ = *s++;
+    return dest;
+}
+
+void *memmove(void *dest, const void *src, size_t n) {
+    unsigned char *d = dest;
+    const unsigned char *s = src;
+    if (d < s) {
+        while (n--) *d++ = *s++;
+    } else {
+        d += n;
+        s += n;
+        while (n--) *--d = *--s;
+    }
+    return dest;
+}
+
+void *memset(void *s, int c, size_t n) {
+    unsigned char *p = s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
+}
+
+// Override getenv for Kenix - no environment variables
+// DOOM needs HOME for .doomrc and DOOMWADDIR for WAD files
+char *getenv(const char *name) {
+    if (strcmp(name, "HOME") == 0) {
+        return "/disk";  // Config files go to /disk/.doomrc
+    }
+    if (strcmp(name, "DOOMWADDIR") == 0) {
+        return "/disk";  // WAD files are in /disk/
+    }
+    return NULL;
+}
 #include "m_misc.h"
 #include "i_video.h"
 #include "i_sound.h"
@@ -61,6 +102,12 @@ int I_GetTime(void) {
 
     long elapsed_sec = ts.tv_sec - basetime_sec;
     long elapsed_nsec = ts.tv_nsec - basetime_nsec;
+
+    // Normalize if nsec is negative (when nsec rolled over but sec increased)
+    if (elapsed_nsec < 0) {
+        elapsed_sec--;
+        elapsed_nsec += 1000000000L;
+    }
 
     // Convert to tics (1/35 second each)
     // tics = elapsed_seconds * 35 + elapsed_nsec * 35 / 1000000000

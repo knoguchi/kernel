@@ -207,14 +207,15 @@ char*		mousedev;
 extern char*	chat_macros[];
 
 
-// Patched struct for 64-bit: use intptr_t for defaultvalue to hold pointers
+// Patched struct for 64-bit: use union to properly handle both int and pointer types
 typedef struct
 {
     char*	name;
-    intptr_t*	location;     // Changed from int* to intptr_t* for 64-bit
-    intptr_t	defaultvalue; // Changed from int to intptr_t for 64-bit
+    void*	location;     // Generic pointer - can point to int or char*
+    intptr_t	defaultvalue; // Can hold int value or pointer (for strings)
     int		scantranslate;		// PC scan code hack
     int		untranslated;		// lousy hack
+    int		isstring;	// 1 if this is a string (char*) default, 0 for int
 } default_t;
 
 // String defaults - stored separately for initialization
@@ -222,70 +223,71 @@ static char* sndserver_default = "sndserver";
 static char* mousedev_default = "/dev/ttyS0";
 static char* mousetype_default = "microsoft";
 
+// Note: last field isstring: 0 = int, 1 = char* pointer
 default_t	defaults[] =
 {
-    {"mouse_sensitivity",(intptr_t*)&mouseSensitivity, 5},
-    {"sfx_volume",(intptr_t*)&snd_SfxVolume, 8},
-    {"music_volume",(intptr_t*)&snd_MusicVolume, 8},
-    {"show_messages",(intptr_t*)&showMessages, 1},
+    {"mouse_sensitivity", &mouseSensitivity, 5, 0, 0, 0},
+    {"sfx_volume", &snd_SfxVolume, 8, 0, 0, 0},
+    {"music_volume", &snd_MusicVolume, 8, 0, 0, 0},
+    {"show_messages", &showMessages, 1, 0, 0, 0},
 
 
 #ifdef NORMALUNIX
-    {"key_right",(intptr_t*)&key_right, KEY_RIGHTARROW},
-    {"key_left",(intptr_t*)&key_left, KEY_LEFTARROW},
-    {"key_up",(intptr_t*)&key_up, KEY_UPARROW},
-    {"key_down",(intptr_t*)&key_down, KEY_DOWNARROW},
-    {"key_strafeleft",(intptr_t*)&key_strafeleft, ','},
-    {"key_straferight",(intptr_t*)&key_straferight, '.'},
+    {"key_right", &key_right, KEY_RIGHTARROW, 0, 0, 0},
+    {"key_left", &key_left, KEY_LEFTARROW, 0, 0, 0},
+    {"key_up", &key_up, KEY_UPARROW, 0, 0, 0},
+    {"key_down", &key_down, KEY_DOWNARROW, 0, 0, 0},
+    {"key_strafeleft", &key_strafeleft, ',', 0, 0, 0},
+    {"key_straferight", &key_straferight, '.', 0, 0, 0},
 
-    {"key_fire",(intptr_t*)&key_fire, KEY_RCTRL},
-    {"key_use",(intptr_t*)&key_use, ' '},
-    {"key_strafe",(intptr_t*)&key_strafe, KEY_RALT},
-    {"key_speed",(intptr_t*)&key_speed, KEY_RSHIFT},
+    {"key_fire", &key_fire, KEY_RCTRL, 0, 0, 0},
+    {"key_use", &key_use, ' ', 0, 0, 0},
+    {"key_strafe", &key_strafe, KEY_RALT, 0, 0, 0},
+    {"key_speed", &key_speed, KEY_RSHIFT, 0, 0, 0},
 
 // UNIX hack, to be removed.
 #ifdef SNDSERV
-    {"sndserver", (intptr_t *) &sndserver_filename, 0},  // Initialized at runtime
-    {"mb_used", (intptr_t*)&mb_used, 2},
+    {"sndserver", &sndserver_filename, 0, 0, 0, 1},  // String - initialized at runtime
+    {"mb_used", &mb_used, 2, 0, 0, 0},
 #endif
 
 #endif
 
 #ifdef LINUX
-    {"mousedev", (intptr_t*)&mousedev, 0},      // Initialized at runtime
-    {"mousetype", (intptr_t*)&mousetype, 0},    // Initialized at runtime
+    {"mousedev", &mousedev, 0, 0, 0, 1},      // String - initialized at runtime
+    {"mousetype", &mousetype, 0, 0, 0, 1},    // String - initialized at runtime
 #endif
 
-    {"use_mouse",(intptr_t*)&usemouse, 1},
-    {"mouseb_fire",(intptr_t*)&mousebfire,0},
-    {"mouseb_strafe",(intptr_t*)&mousebstrafe,1},
-    {"mouseb_forward",(intptr_t*)&mousebforward,2},
+    {"use_mouse", &usemouse, 1, 0, 0, 0},
+    {"mouseb_fire", &mousebfire, 0, 0, 0, 0},
+    {"mouseb_strafe", &mousebstrafe, 1, 0, 0, 0},
+    {"mouseb_forward", &mousebforward, 2, 0, 0, 0},
 
-    {"use_joystick",(intptr_t*)&usejoystick, 0},
-    {"joyb_fire",(intptr_t*)&joybfire,0},
-    {"joyb_strafe",(intptr_t*)&joybstrafe,1},
-    {"joyb_use",(intptr_t*)&joybuse,3},
-    {"joyb_speed",(intptr_t*)&joybspeed,2},
+    {"use_joystick", &usejoystick, 0, 0, 0, 0},
+    {"joyb_fire", &joybfire, 0, 0, 0, 0},
+    {"joyb_strafe", &joybstrafe, 1, 0, 0, 0},
+    {"joyb_use", &joybuse, 3, 0, 0, 0},
+    {"joyb_speed", &joybspeed, 2, 0, 0, 0},
 
-    {"screenblocks",(intptr_t*)&screenblocks, 9},
-    {"detaillevel",(intptr_t*)&detailLevel, 0},
+    {"screenblocks", &screenblocks, 9, 0, 0, 0},
+    {"detaillevel", &detailLevel, 0, 0, 0, 0},
 
-    {"snd_channels",(intptr_t*)&numChannels, 3},
+    {"snd_channels", &numChannels, 3, 0, 0, 0},
 
 
 
-    {"usegamma",(intptr_t*)&usegamma, 0},
+    {"usegamma", &usegamma, 0, 0, 0, 0},
 
-    {"chatmacro0", (intptr_t *) &chat_macros[0], 0 },  // Initialized at runtime
-    {"chatmacro1", (intptr_t *) &chat_macros[1], 0 },
-    {"chatmacro2", (intptr_t *) &chat_macros[2], 0 },
-    {"chatmacro3", (intptr_t *) &chat_macros[3], 0 },
-    {"chatmacro4", (intptr_t *) &chat_macros[4], 0 },
-    {"chatmacro5", (intptr_t *) &chat_macros[5], 0 },
-    {"chatmacro6", (intptr_t *) &chat_macros[6], 0 },
-    {"chatmacro7", (intptr_t *) &chat_macros[7], 0 },
-    {"chatmacro8", (intptr_t *) &chat_macros[8], 0 },
-    {"chatmacro9", (intptr_t *) &chat_macros[9], 0 }
+    {"chatmacro0", &chat_macros[0], 0, 0, 0, 1},  // String - initialized at runtime
+    {"chatmacro1", &chat_macros[1], 0, 0, 0, 1},
+    {"chatmacro2", &chat_macros[2], 0, 0, 0, 1},
+    {"chatmacro3", &chat_macros[3], 0, 0, 0, 1},
+    {"chatmacro4", &chat_macros[4], 0, 0, 0, 1},
+    {"chatmacro5", &chat_macros[5], 0, 0, 0, 1},
+    {"chatmacro6", &chat_macros[6], 0, 0, 0, 1},
+    {"chatmacro7", &chat_macros[7], 0, 0, 0, 1},
+    {"chatmacro8", &chat_macros[8], 0, 0, 0, 1},
+    {"chatmacro9", &chat_macros[9], 0, 0, 0, 1}
 
 };
 
@@ -299,7 +301,7 @@ char*	defaultfile;
 void M_SaveDefaults (void)
 {
     int		i;
-    intptr_t	v;
+    int		v;
     FILE*	f;
 
     f = fopen (defaultfile, "w");
@@ -308,14 +310,15 @@ void M_SaveDefaults (void)
 
     for (i=0 ; i<numdefaults ; i++)
     {
-	if (defaults[i].defaultvalue > -0xfff
-	    && defaults[i].defaultvalue < 0xfff)
+	if (!defaults[i].isstring)
 	{
-	    v = *defaults[i].location;
-	    fprintf (f,"%s\t\t%ld\n",defaults[i].name,(long)v);
+	    // Integer - read 4 bytes
+	    v = *(int*)defaults[i].location;
+	    fprintf (f,"%s\t\t%d\n",defaults[i].name,v);
 	} else {
+	    // String - read char*
 	    fprintf (f,"%s\t\t\"%s\"\n",defaults[i].name,
-		     * (char **) (defaults[i].location));
+		     *(char**)defaults[i].location);
 	}
     }
 
@@ -391,8 +394,16 @@ void M_LoadDefaults (void)
     // Initialize string defaults first (64-bit fix)
     M_InitStringDefaults();
 
-    for (i=0 ; i<numdefaults ; i++)
-	*defaults[i].location = defaults[i].defaultvalue;
+    // Apply defaults with proper type handling for 64-bit
+    for (i=0 ; i<numdefaults ; i++) {
+	if (defaults[i].isstring) {
+	    // String pointer - write 8 bytes (char*)
+	    *(char**)defaults[i].location = (char*)defaults[i].defaultvalue;
+	} else {
+	    // Integer - write 4 bytes (int)
+	    *(int*)defaults[i].location = (int)defaults[i].defaultvalue;
+	}
+    }
 
     // check for a custom default file
     i = M_CheckParm ("-config");
@@ -429,11 +440,13 @@ void M_LoadDefaults (void)
 		for (i=0 ; i<numdefaults ; i++)
 		    if (!strcmp(def, defaults[i].name))
 		    {
-			if (!isstring)
-			    *defaults[i].location = parm;
-			else
-			    *defaults[i].location =
-				(intptr_t) newstring;
+			if (!isstring) {
+			    // Integer - write 4 bytes
+			    *(int*)defaults[i].location = (int)parm;
+			} else {
+			    // String - write 8 bytes (char*)
+			    *(char**)defaults[i].location = newstring;
+			}
 			break;
 		    }
 	    }

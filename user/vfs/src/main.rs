@@ -263,11 +263,20 @@ impl RamFs {
 // FAT32 Integration
 // ============================================================================
 
-/// FAT32 open file handle
+/// Cluster skip table stride - store cluster number every N clusters
+const CLUSTER_SKIP_STRIDE: usize = 32;
+/// Max entries in skip table (supports files up to 32*256 = 8192 clusters = ~32MB with 4KB clusters)
+const MAX_SKIP_ENTRIES: usize = 256;
+
+/// FAT32 open file handle with cluster skip table for O(1) seeks
 #[derive(Clone, Copy)]
 struct Fat32OpenFile {
     file: Fat32File,
     in_use: bool,
+    /// Cluster skip table: skip_table[i] = cluster number at position i * CLUSTER_SKIP_STRIDE
+    skip_table: [u32; MAX_SKIP_ENTRIES],
+    /// Number of valid entries in skip table
+    skip_count: usize,
 }
 
 impl Fat32OpenFile {
@@ -281,7 +290,78 @@ impl Fat32OpenFile {
                 cluster_offset: 0,
             },
             in_use: false,
+            skip_table: [0; MAX_SKIP_ENTRIES],
+            skip_count: 0,
         }
+    }
+
+    /// Build cluster skip table for fast seeks
+    fn build_skip_table(&mut self, fs: &Fat32) {
+        if self.file.first_cluster < 2 {
+            self.skip_count = 0;
+            return;
+        }
+
+        let cluster_size = (fs.sectors_per_cluster as u32) * SECTOR_SIZE as u32;
+        let total_clusters = (self.file.size + cluster_size - 1) / cluster_size;
+        let entries_needed = ((total_clusters as usize) + CLUSTER_SKIP_STRIDE - 1) / CLUSTER_SKIP_STRIDE;
+        let entries = entries_needed.min(MAX_SKIP_ENTRIES);
+
+        let mut cluster = self.file.first_cluster;
+        let mut idx = 0;
+
+        // Store first cluster
+        self.skip_table[0] = cluster;
+        idx = 1;
+
+        // Walk chain and store every CLUSTER_SKIP_STRIDE clusters
+        let mut count = 0;
+        while idx < entries {
+            // Walk CLUSTER_SKIP_STRIDE clusters
+            for _ in 0..CLUSTER_SKIP_STRIDE {
+                match fat32_get_next_cluster(fs, cluster) {
+                    Some(next) if next < 0x0FFFFFF8 => cluster = next,
+                    _ => {
+                        // End of chain
+                        self.skip_count = idx;
+                        return;
+                    }
+                }
+                count += 1;
+            }
+            self.skip_table[idx] = cluster;
+            idx += 1;
+        }
+
+        self.skip_count = entries;
+    }
+
+    /// Get cluster for a given cluster index using skip table
+    fn get_cluster_at(&self, fs: &Fat32, cluster_idx: u32) -> Option<u32> {
+        if self.skip_count == 0 {
+            // No skip table, fall back to walking from beginning
+            let mut cluster = self.file.first_cluster;
+            for _ in 0..cluster_idx {
+                cluster = fat32_get_next_cluster(fs, cluster)?;
+            }
+            return Some(cluster);
+        }
+
+        // Find nearest skip table entry
+        let skip_idx = (cluster_idx as usize) / CLUSTER_SKIP_STRIDE;
+        if skip_idx >= self.skip_count {
+            return None;
+        }
+
+        let mut cluster = self.skip_table[skip_idx];
+        let remaining = (cluster_idx as usize) % CLUSTER_SKIP_STRIDE;
+
+        // Walk remaining clusters
+        for _ in 0..remaining {
+            cluster = fat32_get_next_cluster(fs, cluster)?;
+        }
+
+        Some(cluster)
     }
 }
 
@@ -363,8 +443,9 @@ static mut CLUSTER_BUF: [u8; 131072] = [0; 131072];
 // FAT Sector Cache - LRU cache for FAT table lookups
 // ============================================================================
 
-/// Number of FAT sectors to cache (16 sectors = 8KB, covers 2048 cluster entries)
-const FAT_CACHE_SIZE: usize = 16;
+/// Number of FAT sectors to cache (256 sectors = 128KB, covers 32768 cluster entries)
+/// Large cache eliminates disk I/O for FAT lookups on files up to ~128MB
+const FAT_CACHE_SIZE: usize = 256;
 
 /// Cached FAT sector data
 static mut FAT_CACHE: [[u8; SECTOR_SIZE]; FAT_CACHE_SIZE] = [[0; SECTOR_SIZE]; FAT_CACHE_SIZE];
@@ -570,6 +651,75 @@ fn fat32_count_consecutive_clusters(fs: &Fat32, start_cluster: u32, max_clusters
     count
 }
 
+/// Seek to a position in a FAT32 file
+/// Optimized: if seeking forward, continue from current cluster instead of resetting
+fn fat32_seek_indexed(file_idx: usize, new_pos: usize) {
+    let fs = unsafe {
+        match &FAT32_FS {
+            Some(fs) => fs,
+            None => {
+                // If no filesystem, just update position
+                FAT32_FILES[file_idx].file.position = new_pos as u32;
+                return;
+            }
+        }
+    };
+
+    let cluster_size = (fs.sectors_per_cluster as u32) * SECTOR_SIZE as u32;
+
+    unsafe {
+        let file = &mut FAT32_FILES[file_idx].file;
+        let new_pos = (new_pos as u32).min(file.size);
+        let old_pos = file.position;
+
+        // Calculate cluster indices
+        let new_cluster_idx = new_pos / cluster_size;
+        let old_cluster_idx = old_pos / cluster_size;
+
+        // If seeking forward and we have a valid current cluster, continue from there
+        if new_pos >= old_pos && file.current_cluster >= 2 {
+            let clusters_to_skip = new_cluster_idx - old_cluster_idx;
+
+            if clusters_to_skip == 0 {
+                // Same cluster, just update offset
+                file.position = new_pos;
+                file.cluster_offset = new_pos % cluster_size;
+                return;
+            }
+
+            // Walk forward from current cluster
+            let mut cluster = file.current_cluster;
+            for _ in 0..clusters_to_skip {
+                match fat32_get_next_cluster(fs, cluster) {
+                    Some(next) if next < 0x0FFFFFF8 => cluster = next,
+                    _ => break,
+                }
+            }
+
+            file.position = new_pos;
+            file.current_cluster = cluster;
+            file.cluster_offset = new_pos % cluster_size;
+        } else {
+            // Seeking backward - must reset to beginning
+            file.position = new_pos;
+            file.current_cluster = file.first_cluster;
+            file.cluster_offset = 0;
+
+            if new_pos > 0 && file.first_cluster >= 2 {
+                let mut cluster = file.first_cluster;
+                for _ in 0..new_cluster_idx {
+                    match fat32_get_next_cluster(fs, cluster) {
+                        Some(next) if next < 0x0FFFFFF8 => cluster = next,
+                        _ => break,
+                    }
+                }
+                file.current_cluster = cluster;
+                file.cluster_offset = new_pos % cluster_size;
+            }
+        }
+    }
+}
+
 /// Read data from a FAT32 file (optimized with bulk reads and FAT caching)
 fn fat32_read(file_idx: usize, buf: &mut [u8]) -> Result<usize, i64> {
     let fs = unsafe {
@@ -712,7 +862,13 @@ fn handle_open(client: usize, msg_data: &[u64; 4]) -> i64 {
                     FAT32_FILES[i] = Fat32OpenFile {
                         file: Fat32File::from_dir_entry(&entry),
                         in_use: true,
+                        skip_table: [0; MAX_SKIP_ENTRIES],
+                        skip_count: 0,
                     };
+                    // Skip table disabled - use simple forward seek instead
+                    // if let Some(ref fs) = FAT32_FS {
+                    //     FAT32_FILES[i].build_skip_table(fs);
+                    // }
                     i
                 }
                 None => return ERR_NFILE,
@@ -1288,6 +1444,79 @@ fn handle_read_shm(client: usize, msg_data: &[u64; 4]) -> i64 {
     }
 }
 
+/// Handle VFS_LSEEK message
+/// data[0] = file handle, data[1] = offset low, data[2] = offset high, data[3] = whence
+fn handle_lseek(client: usize, msg_data: &[u64; 4]) -> i64 {
+    const SEEK_SET: u64 = 0;
+    const SEEK_CUR: u64 = 1;
+    const SEEK_END: u64 = 2;
+
+    if client >= MAX_CLIENTS {
+        return ERR_INVAL;
+    }
+
+    let handle = msg_data[0] as usize;
+    let offset_lo = msg_data[1];
+    let offset_hi = msg_data[2];
+    let whence = msg_data[3];
+
+    // Reconstruct 64-bit offset
+    let offset = (offset_hi << 32) | offset_lo;
+
+    if handle >= MAX_OPEN_FILES {
+        return ERR_BADF;
+    }
+
+    let client_state = unsafe { &mut CLIENTS[client] };
+    let file = &mut client_state.files[handle];
+    if !file.in_use {
+        return ERR_BADF;
+    }
+
+    match file.source {
+        FileSource::RamFs => {
+            // Get file size
+            let file_size = match unsafe { &RAMFS.inodes[file.handle].data } {
+                InodeData::File(f) => f.size,
+                _ => return ERR_ISDIR,
+            };
+
+            let new_pos = match whence {
+                SEEK_SET => offset as usize,
+                SEEK_CUR => (file.offset as u64).wrapping_add(offset) as usize,
+                SEEK_END => {
+                    let signed_offset = offset as i64;
+                    (file_size as i64 + signed_offset) as usize
+                }
+                _ => return ERR_INVAL,
+            };
+
+            file.offset = new_pos;
+            new_pos as i64
+        }
+        FileSource::Fat32 => {
+            // For FAT32, we need to update the file's position
+            let fat32_idx = file.handle;
+            let fat32_file = unsafe { &FAT32_FILES[fat32_idx] };
+
+            let new_pos = match whence {
+                SEEK_SET => offset as usize,
+                SEEK_CUR => (fat32_file.file.position as u64).wrapping_add(offset) as usize,
+                SEEK_END => {
+                    let signed_offset = offset as i64;
+                    (fat32_file.file.size as i64 + signed_offset) as usize
+                }
+                _ => return ERR_INVAL,
+            };
+
+            // Update FAT32 file position using skip table for O(1) seeks
+            fat32_seek_indexed(fat32_idx, new_pos);
+            new_pos as i64
+        }
+        FileSource::None => ERR_BADF,
+    }
+}
+
 fn handle_write_shm(client: usize, msg_data: &[u64; 4]) -> i64 {
     if client >= MAX_CLIENTS {
         return ERR_INVAL;
@@ -1436,6 +1665,7 @@ fn main() -> ! {
             VFS_WRITE_SHM => handle_write_shm(client, &recv.msg.data),
             VFS_WRITE => handle_write(client, recv.msg.data[0], recv.msg.data[1], recv.msg.data[2]),
             VFS_READDIR => handle_readdir(client, &recv.msg.data),
+            VFS_LSEEK => handle_lseek(client, &recv.msg.data),
             _ => ERR_INVAL,
         };
 

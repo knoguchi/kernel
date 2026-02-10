@@ -146,16 +146,148 @@ fn main() -> ! {
     print("=== Kenix Init ===\n");
 
     // Wait for fbdev to be ready before printing anything else.
-    // This ensures shell output will appear on framebuffer.
     wait_for_fbdev();
 
-    print("Running BusyBox from disk...\n\n");
-
-    // Run busybox shell
-    run_busybox_shell();
+    // Run DOOM
+    print("Running DOOM...\n\n");
+    run_doom();
 
     print("\n=== Init complete ===\n");
     syscall::exit(0);
+}
+
+fn run_time_test() {
+    let pid = syscall::fork();
+    if pid < 0 {
+        print("Failed to fork for time_test: ");
+        print_num((-pid) as usize);
+        print("\n");
+        return;
+    } else if pid == 0 {
+        let path = b"/disk/timetest\0";
+        let argv: [*const u8; 2] = [
+            b"time_test\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve time_test failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else {
+        print("time_test pid=");
+        print_num(pid as usize);
+        print("\n");
+        let (wait_result, status) = syscall::waitpid(pid as i32, 0);
+        if wait_result >= 0 {
+            print("\n[init] time_test exited with status=");
+            print_num(status as usize);
+            print("\n");
+        }
+    }
+}
+
+fn run_program(path: &[u8], name: &[u8]) {
+    let pid = syscall::fork();
+    if pid < 0 {
+        print("Failed to fork: ");
+        print_num((-pid) as usize);
+        print("\n");
+        return;
+    } else if pid == 0 {
+        // Child: execve program from disk
+        let argv: [*const u8; 2] = [
+            name.as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else {
+        print("pid=");
+        print_num(pid as usize);
+        print("\n");
+        let (wait_result, status) = syscall::waitpid(pid as i32, 0);
+        if wait_result >= 0 {
+            print("\n[init] exited with status=");
+            print_num(status as usize);
+            print("\n");
+        }
+    }
+}
+
+/// Run fbtest (framebuffer animation test)
+fn run_fbtest() {
+    let pid = syscall::fork();
+    if pid < 0 {
+        print("Failed to fork for fbtest: ");
+        print_num((-pid) as usize);
+        print("\n");
+        return;
+    } else if pid == 0 {
+        let path = b"/disk/fbtest\0";
+        let argv: [*const u8; 2] = [
+            b"fbtest\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve fbtest failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else {
+        print("fbtest pid=");
+        print_num(pid as usize);
+        print("\n");
+        let (wait_result, status) = syscall::waitpid(pid as i32, 0);
+        if wait_result >= 0 {
+            print("\n[init] fbtest exited with status=");
+            print_num(status as usize);
+            print("\n");
+        }
+    }
+}
+
+/// Run DOOM with -warp 1 1 to skip demos and start in E1M1
+fn run_doom() {
+    let pid = syscall::fork();
+    if pid < 0 {
+        print("Failed to fork for doom: ");
+        print_num((-pid) as usize);
+        print("\n");
+        return;
+    } else if pid == 0 {
+        // Child: execve DOOM with -warp 1 1
+        let path = b"/disk/doom\0";
+        let argv: [*const u8; 5] = [
+            b"doom\0".as_ptr(),
+            b"-warp\0".as_ptr(),
+            b"1\0".as_ptr(),
+            b"1\0".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let result = syscall::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        print("execve doom failed: ");
+        print_num((-result) as usize);
+        print("\n");
+        syscall::exit(1);
+    } else {
+        print("doom pid=");
+        print_num(pid as usize);
+        print("\n");
+        let (wait_result, status) = syscall::waitpid(pid as i32, 0);
+        if wait_result >= 0 {
+            print("\n[init] DOOM exited with status=");
+            print_num(status as usize);
+            print("\n");
+        }
+    }
 }
 
 #[allow(dead_code)]

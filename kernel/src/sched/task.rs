@@ -70,6 +70,8 @@ pub struct FileDescriptor {
     pub server: TaskId,
     /// Server-side handle (vnode, pipe id, etc.)
     pub handle: u64,
+    /// Current file position (for lseek/read/write)
+    pub position: u64,
 }
 
 impl FileDescriptor {
@@ -79,6 +81,7 @@ impl FileDescriptor {
             flags: FdFlags { readable: false, writable: false },
             server: TaskId(0),
             handle: 0,
+            position: 0,
         }
     }
 
@@ -88,6 +91,7 @@ impl FileDescriptor {
             flags: FdFlags::read_only(),
             server: CONSOLE_SERVER_TID,
             handle: 0,
+            position: 0,
         }
     }
 
@@ -97,6 +101,7 @@ impl FileDescriptor {
             flags: FdFlags::write_only(),
             server: CONSOLE_SERVER_TID,
             handle: 1,
+            position: 0,
         }
     }
 
@@ -106,6 +111,7 @@ impl FileDescriptor {
             flags: FdFlags::write_only(),
             server: CONSOLE_SERVER_TID,
             handle: 2,
+            position: 0,
         }
     }
 
@@ -180,6 +186,8 @@ pub enum PendingSyscall {
         /// User buffer for stat structure
         statbuf: usize,
     },
+    /// VFS access: just checking if file exists (no stat data needed)
+    VfsAccess,
     /// VFS getdents: waiting for VFS to fill directory entries
     VfsGetdents {
         /// User buffer for dirent64 structures
@@ -191,6 +199,8 @@ pub enum PendingSyscall {
     },
     /// VFS read: waiting for VFS to fill SHM buffer with file data
     VfsRead {
+        /// File descriptor (for updating position after read)
+        fd: usize,
         /// User buffer address to copy data to
         user_buf: usize,
         /// Maximum bytes to read

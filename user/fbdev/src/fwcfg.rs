@@ -180,7 +180,7 @@ impl FwCfg {
 
         // Calculate physical address of data buffer
         let data_vaddr = DMA_DATA_BUF.0.as_ptr() as usize;
-        let data_paddr = data_vaddr as u64 + phys_base;
+        let data_paddr = libkenix::va_to_pa(data_vaddr as u64, phys_base);
 
         // Set up DMA access structure in static memory
         DMA_ACCESS.control = (FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_WRITE | ((selector as u32) << 16)).to_be();
@@ -192,7 +192,7 @@ impl FwCfg {
 
         // Calculate physical address of DMA structure
         let dma_vaddr = core::ptr::addr_of!(DMA_ACCESS) as usize;
-        let dma_paddr = dma_vaddr as u64 + phys_base;
+        let dma_paddr = libkenix::va_to_pa(dma_vaddr as u64, phys_base);
 
         // Write DMA address to trigger the operation (big-endian)
         let dma_reg = (self.base + FWCFG_DMA) as *mut u64;

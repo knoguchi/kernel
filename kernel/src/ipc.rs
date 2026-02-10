@@ -15,6 +15,7 @@ use crate::sched::{self, current};
 use crate::exception::ExceptionContext;
 use crate::shm;
 use crate::timer;
+use crate::mmap;
 
 /// Result of completing a pending syscall
 enum PendingSyscallResult {
@@ -540,6 +541,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 flags: FdFlags::read_only(),
                 server: TaskId(6), // PIPESERV_TID
                 handle: pipe_id as u64,
+                position: 0,
             };
 
             // Allocate write fd
@@ -555,6 +557,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 flags: FdFlags::write_only(),
                 server: TaskId(6), // PIPESERV_TID
                 handle: pipe_id as u64,
+                position: 0,
             };
 
             PendingSyscallResult::Complete(read_fd as i64, Some(write_fd as i64))
@@ -566,6 +569,11 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 // Get physical address of SHM (kernel has identity mapping)
                 let shm_phys = shm::get_shm_phys_addr(shm_id);
                 if shm_phys != 0 {
+                    // Pre-fault user pages before copying (demand paging support)
+                    // This must be done BEFORE switching TTBR0 because the page fault
+                    // handler needs the correct task's mmap state
+                    mmap::ensure_user_pages_mapped(user_buf, bytes_read as usize, caller_id);
+
                     let caller_task = &TASKS[caller_id.0];
                     let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
@@ -646,6 +654,7 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 },
                 server: TaskId(3), // VFS_TID
                 handle: vnode as u64,
+                position: 0,
             };
 
             let _ = is_dir; // We track this in handle for now
@@ -660,6 +669,10 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 // data[1] = mode (S_IFREG/S_IFDIR | permissions)
                 // data[2] = device (1=ramfs, 2=FAT32)
                 // data[3] = inode
+
+                // Pre-fault user pages for stat buffer (128 bytes)
+                mmap::ensure_user_pages_mapped(statbuf, 128, caller_id);
+
                 let caller_task = &TASKS[caller_id.0];
                 let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
@@ -729,6 +742,11 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
 
             PendingSyscallResult::Complete(result, None)
         }
+        PendingSyscall::VfsAccess => {
+            // Just check if VFS returned success or error (no stat data needed)
+            let result = reply.tag as i64;
+            PendingSyscallResult::Complete(result, None)
+        }
         PendingSyscall::VfsGetdents { buf, count: _, shm_id } => {
             let bytes_read = reply.tag as i64;
 
@@ -736,6 +754,9 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
                 // Copy from SHM to user buffer
                 let shm_phys = shm::get_shm_phys_addr(shm_id);
                 if shm_phys != 0 {
+                    // Pre-fault user pages before copying
+                    mmap::ensure_user_pages_mapped(buf, bytes_read as usize, caller_id);
+
                     let caller_task = &TASKS[caller_id.0];
                     let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
@@ -767,13 +788,16 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
 
             PendingSyscallResult::Complete(bytes_read, None)
         }
-        PendingSyscall::VfsRead { user_buf, max_len: _, shm_id } => {
+        PendingSyscall::VfsRead { fd: _, user_buf, max_len: _, shm_id } => {
             let bytes_read = reply.tag as i64;
 
             if bytes_read > 0 {
                 // Copy from SHM to user buffer
                 let shm_phys = shm::get_shm_phys_addr(shm_id);
                 if shm_phys != 0 {
+                    // Pre-fault user pages before copying
+                    mmap::ensure_user_pages_mapped(user_buf, bytes_read as usize, caller_id);
+
                     let caller_task = &TASKS[caller_id.0];
                     let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
@@ -1025,6 +1049,14 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
             let bytes_read = reply.tag as i64;
 
             if bytes_read > 0 {
+                // Pre-fault user pages before copying (demand paging support)
+                let copy_len = if shm_id == 0 {
+                    (bytes_read as usize).min(max_len).min(24)
+                } else {
+                    bytes_read as usize
+                };
+                mmap::ensure_user_pages_mapped(user_buf, copy_len, caller_id);
+
                 let caller_task = &TASKS[caller_id.0];
                 let caller_ttbr0 = caller_task.addr_space.as_ref().map(|aspace| aspace.ttbr0()).unwrap_or(0);
 
@@ -1040,7 +1072,6 @@ unsafe fn complete_pending_syscall(caller_id: TaskId, pending: PendingSyscall, r
 
                 if shm_id == 0 {
                     // Inline read: data is in reply.data[1..] (up to 24 bytes)
-                    let copy_len = (bytes_read as usize).min(max_len).min(24);
                     let src = reply.data[1..].as_ptr() as *const u8;
                     core::ptr::copy_nonoverlapping(src, user_buf as *mut u8, copy_len);
                 } else {

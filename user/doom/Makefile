@@ -10,19 +10,22 @@ OBJCOPY = aarch64-elf-objcopy
 # musl paths
 MUSL = ../../musl-kenix
 
-# DOOM source
-DOOM_SRC = ../../DOOM/linuxdoom-1.10
+# DOOM source (use arm64-macOS port which has 64-bit fixes already)
+DOOM_SRC = ../../DOOM-arm64-macOS/linuxdoom-1.10
 
 # Compiler flags
 # Use gnu89 mode because DOOM source uses old-style declarations
+# Include stdint.h for int32_t types used in DOOM-arm64-macOS port
 CFLAGS = -std=gnu89 -O2 -g \
          -nostdlib -nostdinc \
          -isystem $(MUSL)/include \
+         -include stdint.h \
          -I$(DOOM_SRC) \
          -DNORMALUNIX -DKENIX -DLINUX \
          -fno-stack-protector \
          -fno-builtin \
          -ffreestanding \
+         -fno-tree-vectorize \
          -Wall -Wno-unused-variable -Wno-unused-but-set-variable \
          -Wno-pointer-sign -Wno-unused-function \
          -Wno-implicit-int -Wno-return-type
@@ -114,10 +117,19 @@ ALL_OBJS = $(DOOM_OBJS) $(KENIX_OBJS)
 
 # Target
 TARGET = doom.elf
+MINIMAL_TARGET = doom_minimal.elf
 
-.PHONY: all clean
+.PHONY: all clean minimal
 
 all: $(TARGET)
+
+# Minimal test build
+minimal: obj $(MINIMAL_TARGET)
+
+$(MINIMAL_TARGET): obj/minimal_main.o
+	$(CC) $(LDFLAGS) -o $@ $(CRT_START) obj/minimal_main.o $(LIBS) $(CRT_END)
+	@echo "Built $@"
+	@ls -la $@
 
 $(TARGET): obj $(ALL_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(CRT_START) $(ALL_OBJS) $(LIBS) $(CRT_END)

@@ -423,6 +423,58 @@ fn handle_message(_sender: usize, msg: &ipc::Message) {
             }
         }
 
+        msg::FB_BLIT => {
+            // Blit 32bpp pixel data from shared memory to framebuffer
+            // data[0] = shm_id, data[1] = x|(y<<16), data[2] = w|(h<<16), data[3] = stride
+            let shm_id = msg.data[0];
+            let xy = msg.data[1];
+            let wh = msg.data[2];
+            let src_stride = msg.data[3] as usize;
+            let x = (xy & 0xFFFF) as u32;
+            let y = ((xy >> 16) & 0xFFFF) as u32;
+            let w = (wh & 0xFFFF) as usize;
+            let h = ((wh >> 16) & 0xFFFF) as usize;
+
+            // Map the shared memory
+            let shm_addr = shm::map(shm_id, 0);
+            if shm_addr < 0 {
+                reply.tag = msg::ERR_IO as u64;
+            } else {
+                let src = shm_addr as *const u32;
+                unsafe {
+                    match &mut BACKEND {
+                        Some(FbBackend::VirtioGpu(gpu)) => {
+                            // Copy pixels to GPU framebuffer
+                            let src_stride_pixels = src_stride / 4;
+                            for row in 0..h {
+                                for col in 0..w {
+                                    let pixel = *src.add(row * src_stride_pixels + col);
+                                    gpu.put_pixel(x + col as u32, y + row as u32, pixel);
+                                }
+                            }
+                            gpu.flush(x, y, w as u32, h as u32);
+                            reply.tag = msg::ERR_OK as u64;
+                        }
+                        Some(FbBackend::Ramfb(fb)) => {
+                            let src_stride_pixels = src_stride / 4;
+                            for row in 0..h {
+                                for col in 0..w {
+                                    let pixel = *src.add(row * src_stride_pixels + col);
+                                    fb.put_pixel(x + col as u32, y + row as u32, pixel);
+                                }
+                            }
+                            reply.tag = msg::ERR_OK as u64;
+                        }
+                        None => {
+                            reply.tag = msg::ERR_IO as u64;
+                        }
+                    }
+                }
+                // Unmap shared memory (pass shm_id, not shm_addr!)
+                let _ = shm::unmap(shm_id);
+            }
+        }
+
         _ => {
             reply.tag = msg::ERR_INVAL as u64;
         }

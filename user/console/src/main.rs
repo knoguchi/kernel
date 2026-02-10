@@ -148,6 +148,28 @@ fn console_read(buf: &mut [u8]) -> usize {
     count
 }
 
+/// Non-blocking read - returns immediately with available data (may be 0 bytes)
+/// Used by games and other apps that poll for input without blocking
+fn console_read_nonblock(buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0;
+
+    // Read available characters without blocking
+    while count < buf.len() {
+        if let Some(c) = try_getc() {
+            buf[count] = c;
+            count += 1;
+        } else {
+            break;  // No more data available, return immediately
+        }
+    }
+
+    count
+}
+
 // ============================================================================
 // Client SHM Tracking
 // ============================================================================
@@ -243,6 +265,25 @@ fn main() -> ! {
             let bytes_read = console_read(buf);
             reply.tag = bytes_read as u64;
             reply.data[0] = bytes_read as u64;
+
+            ipc::reply(&reply);
+        } else if recv.msg.tag == 302 {
+            // MSG_READ_NONBLOCK (302): Non-blocking read for games/polling apps
+            // data[0] = max length to read
+            let max_len = recv.msg.data[0] as usize;
+            let max_len = if max_len > 24 { 24 } else { max_len };
+
+            // Read into reply buffer without blocking
+            let mut reply = Message::new(0, [0, 0, 0, 0]);
+            let data_ptr = reply.data[1..].as_mut_ptr() as *mut u8;
+            let buf = unsafe { core::slice::from_raw_parts_mut(data_ptr, max_len) };
+
+            let bytes_read = console_read_nonblock(buf);
+            reply.tag = bytes_read as u64;
+            reply.data[0] = bytes_read as u64;
+
+            // Debug: print to UART when non-blocking read is called
+            uart_putc(b'.');
 
             ipc::reply(&reply);
         } else if recv.msg.tag == MSG_WRITE {

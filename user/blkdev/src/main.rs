@@ -173,9 +173,7 @@ fn cache_invalidate_range(start_sector: u64, count: usize) {
 #[inline]
 #[allow(dead_code)]
 fn va_to_pa(va: u64) -> u64 {
-    // Our address space: VA 0 maps to PA PHYS_BASE
-    // So PA = VA + PHYS_BASE
-    unsafe { va + PHYS_BASE }
+    unsafe { libkenix::va_to_pa(va, PHYS_BASE) }
 }
 
 #[no_mangle]

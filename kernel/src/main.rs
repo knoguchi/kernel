@@ -85,6 +85,7 @@ const UART_FR_TXFF: u32 = 1 << 5;  // TX FIFO full
 // Control register bits
 const UART_CR_UARTEN: u32 = 1 << 0;  // UART enable
 const UART_CR_TXE: u32 = 1 << 8;     // TX enable
+const UART_CR_RXE: u32 = 1 << 9;     // RX enable
 
 // Memory layout for QEMU virt machine
 const RAM_START: usize = 0x4000_0000;
@@ -136,9 +137,9 @@ impl Uart {
             return;
         }
         unsafe {
-            // Enable UART and TX
+            // Enable UART, TX, and RX
             let cr = (self.base + UART_CR) as *mut u32;
-            core::ptr::write_volatile(cr, UART_CR_UARTEN | UART_CR_TXE);
+            core::ptr::write_volatile(cr, UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE);
         }
         self.initialized = true;
     }

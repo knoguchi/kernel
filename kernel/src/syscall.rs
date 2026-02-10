@@ -72,6 +72,7 @@ pub const SYS_OPENAT: u16 = 56;  // Open file relative to directory fd
 pub const SYS_CLOSE: u16 = 57;   // Close file descriptor
 pub const SYS_PIPE: u16 = 59;    // Create pipe
 pub const SYS_GETDENTS64: u16 = 61;  // Get directory entries
+pub const SYS_LSEEK: u16 = 62;   // Seek in file
 pub const SYS_READ: u16 = 63;    // Read from file descriptor
 pub const SYS_WRITE: u16 = 64;   // Write to file descriptor
 pub const SYS_READV: u16 = 65;   // Read into multiple buffers (scatter)
@@ -145,6 +146,7 @@ pub const EFAULT: i64 = -14;   // Bad address
 pub const ENOTDIR: i64 = -20;  // Not a directory
 pub const EINVAL: i64 = -22;   // Invalid argument
 pub const EMFILE: i64 = -24;   // Too many open files
+pub const ESPIPE: i64 = -29;   // Illegal seek
 pub const ENOSYS: i64 = -38;   // Function not implemented
 pub const ENAMETOOLONG: i64 = -36;  // File name too long
 
@@ -297,6 +299,15 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
         SYS_CLOSE => {
             let fd = ctx.gpr[0] as usize;
             ctx.gpr[0] = sys_close(ctx, fd) as u64;
+        }
+
+        // SYS_LSEEK: x0=fd, x1=offset, x2=whence → returns new position
+        SYS_LSEEK => {
+            let fd = ctx.gpr[0] as usize;
+            let offset = ctx.gpr[1] as i64;
+            let whence = ctx.gpr[2] as i32;
+            sys_lseek(ctx, fd, offset, whence);
+            // Return value set by IPC reply for File fds
         }
 
         // SYS_DUP: x0=oldfd → returns new_fd in x0
@@ -461,8 +472,12 @@ pub fn handle_syscall(ctx: &mut ExceptionContext, _svc_imm: u16) {
             ctx.gpr[0] = sys_ioctl(fd, request, arg) as u64;
         }
         SYS_FACCESSAT => {
-            // faccessat(dirfd, pathname, mode, flags) - return 0 (file accessible)
-            ctx.gpr[0] = 0;
+            // faccessat(dirfd, pathname, mode, flags) - check if file exists
+            let dirfd = ctx.gpr[0] as i32;
+            let pathname = ctx.gpr[1] as usize;
+            let _mode = ctx.gpr[2] as u32;
+            let _flags = ctx.gpr[3] as u32;
+            ctx.gpr[0] = sys_faccessat(ctx, dirfd, pathname) as u64;
         }
         SYS_CLOCK_GETTIME => {
             let clock_id = ctx.gpr[0] as i32;
@@ -851,6 +866,7 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
             unsafe {
                 let task = &mut TASKS[current_id.0];
                 task.pending_syscall = PendingSyscall::VfsRead {
+                    fd,
                     user_buf: buf,
                     max_len: actual_len,
                     shm_id,
@@ -859,6 +875,7 @@ fn sys_read(ctx: &mut ExceptionContext, fd: usize, buf: usize, len: usize) -> i6
 
             // Send VFS_READ_SHM request
             // data[0] = vnode, data[1] = shm_id, data[2] = shm_offset, data[3] = max_len
+            // Note: file offset is maintained by VFS per-file handle
             let msg = Message::new(VFS_READ_SHM, [vnode, shm_id as u64, 0, actual_len as u64]);
             ipc::sys_call(ctx, VFS_TID, msg);
 
@@ -1093,6 +1110,65 @@ fn sys_close(ctx: &mut ExceptionContext, fd: usize) -> i64 {
 
         ESUCCESS
     }
+}
+
+/// SYS_LSEEK - Seek in file
+///
+/// Changes the file position for a file descriptor.
+/// For VFS-managed files, sends VFS_LSEEK message to update VFS's internal offset.
+///
+/// # Arguments
+/// * `ctx` - Exception context for IPC
+/// * `fd` - File descriptor
+/// * `offset` - Offset to seek to
+/// * `whence` - How to interpret offset: SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
+fn sys_lseek(ctx: &mut ExceptionContext, fd: usize, offset: i64, whence: i32) {
+    use sched::task::TASKS;
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => {
+            ctx.gpr[0] = EBADF as u64;
+            return;
+        }
+    };
+
+    let (fd_kind, vnode) = unsafe {
+        let task = &TASKS[current_id.0];
+        if fd >= sched::MAX_FDS {
+            ctx.gpr[0] = EBADF as u64;
+            return;
+        }
+
+        let fd_entry = &task.fds[fd];
+        if fd_entry.kind == FdKind::None {
+            ctx.gpr[0] = EBADF as u64;
+            return;
+        }
+
+        (fd_entry.kind, fd_entry.handle)
+    };
+
+    // Only file descriptors support seeking
+    if fd_kind != FdKind::File {
+        ctx.gpr[0] = ESPIPE as u64;  // Illegal seek (pipes, etc.)
+        return;
+    }
+
+    // Set up pending syscall - VfsLseek just returns new position
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::VfsAccess;  // Reuse VfsAccess - just needs result
+    }
+
+    // Send VFS_LSEEK request
+    // data[0] = vnode, data[1] = offset (low 32 bits), data[2] = offset (high 32 bits), data[3] = whence
+    let offset_lo = (offset as u64) & 0xFFFFFFFF;
+    let offset_hi = ((offset as u64) >> 32) & 0xFFFFFFFF;
+    let msg = Message::new(VFS_LSEEK, [vnode, offset_lo, offset_hi, whence as u64]);
+    ipc::sys_call(ctx, VFS_TID, msg);
+
+    // Return value set by complete_pending_syscall
 }
 
 /// SYS_PIPE - Create a pipe
@@ -1538,6 +1614,7 @@ const VFS_READ_SHM: u64 = 110;
 const VFS_WRITE_SHM: u64 = 111;
 const VFS_STAT: u64 = 104;
 const VFS_READDIR: u64 = 105;
+const VFS_LSEEK: u64 = 106;
 
 /// Open flags (Linux-compatible)
 pub const O_RDONLY: u32 = 0;
@@ -2255,6 +2332,118 @@ fn sys_fstatat(ctx: &mut ExceptionContext, dirfd: i32, pathname: usize, statbuf:
     }
 
     // Send VFS_STAT request
+    let msg = Message::new(VFS_STAT, msg_data);
+    ipc::sys_call(ctx, VFS_TID, msg);
+
+    0 // Result will be set by IPC reply handler
+}
+
+/// SYS_FACCESSAT - Check file accessibility
+///
+/// Uses VFS_STAT to check if file exists. Returns 0 if accessible, -ENOENT if not.
+fn sys_faccessat(ctx: &mut ExceptionContext, dirfd: i32, pathname: usize) -> i64 {
+    use sched::task::TASKS;
+
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return EINVAL,
+    };
+
+    // Read the pathname from user space (up to 31 chars for inline VFS message)
+    let mut user_path = [0u8; 32];
+    let mut user_path_len = 0usize;
+    unsafe {
+        for i in 0..31 {
+            let c = core::ptr::read_volatile((pathname + i) as *const u8);
+            if c == 0 {
+                break;
+            }
+            user_path[i] = c;
+            user_path_len += 1;
+        }
+    }
+
+    // Handle empty path
+    if user_path_len == 0 {
+        return ENOENT;
+    }
+
+    // Resolve path: handle ".", "./" prefix, and relative paths
+    let mut resolved_path = [0u8; 32];
+    let resolved_len: usize;
+
+    // AT_FDCWD = -100, meaning use current working directory
+    let _ = dirfd;
+
+    // Strip "./" prefix from user path if present
+    let (effective_path, effective_len) = if user_path_len >= 2 && user_path[0] == b'.' && user_path[1] == b'/' {
+        // Skip "./" prefix
+        let start = 2;
+        let len = user_path_len - 2;
+        let mut tmp = [0u8; 32];
+        tmp[..len].copy_from_slice(&user_path[start..start + len]);
+        (tmp, len)
+    } else {
+        (user_path, user_path_len)
+    };
+
+    if effective_len > 0 && effective_path[0] == b'/' {
+        // Absolute path - use as-is
+        resolved_path[..effective_len].copy_from_slice(&effective_path[..effective_len]);
+        resolved_len = effective_len;
+    } else if effective_len == 0 || (effective_len == 1 && effective_path[0] == b'.') {
+        // Current directory
+        let cwd = unsafe {
+            let task = &TASKS[current_id.0];
+            &task.cwd
+        };
+        let cwd_len = cwd.iter().position(|&c| c == 0).unwrap_or(cwd.len());
+        resolved_path[..cwd_len].copy_from_slice(&cwd[..cwd_len]);
+        resolved_len = cwd_len;
+    } else {
+        // Relative path - prepend cwd
+        let cwd = unsafe {
+            let task = &TASKS[current_id.0];
+            &task.cwd
+        };
+        let cwd_len = cwd.iter().position(|&c| c == 0).unwrap_or(cwd.len());
+
+        if cwd_len + 1 + effective_len > 31 {
+            return ENAMETOOLONG;
+        }
+
+        resolved_path[..cwd_len].copy_from_slice(&cwd[..cwd_len]);
+        if cwd_len > 0 && resolved_path[cwd_len - 1] != b'/' {
+            resolved_path[cwd_len] = b'/';
+            resolved_path[cwd_len + 1..cwd_len + 1 + effective_len]
+                .copy_from_slice(&effective_path[..effective_len]);
+            resolved_len = cwd_len + 1 + effective_len;
+        } else {
+            resolved_path[cwd_len..cwd_len + effective_len]
+                .copy_from_slice(&effective_path[..effective_len]);
+            resolved_len = cwd_len + effective_len;
+        }
+    }
+
+    // Build inline VFS message with path
+    // Format: byte 0 = length, bytes 1-31 = path characters
+    let mut msg_data = [0u64; 4];
+    unsafe {
+        let msg_bytes = core::slice::from_raw_parts_mut(
+            msg_data.as_mut_ptr() as *mut u8,
+            32
+        );
+        msg_bytes[0] = resolved_len as u8;
+        msg_bytes[1..1 + resolved_len].copy_from_slice(&resolved_path[..resolved_len]);
+    }
+
+    // Set up pending syscall - VfsAccess just returns success/failure
+    unsafe {
+        let task = &mut TASKS[current_id.0];
+        task.pending_syscall = PendingSyscall::VfsAccess;
+    }
+
+    // Send VFS_STAT request (reuse stat IPC, we just care about success/failure)
     let msg = Message::new(VFS_STAT, msg_data);
     ipc::sys_call(ctx, VFS_TID, msg);
 

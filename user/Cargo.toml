@@ -13,6 +13,7 @@ members = [
     "forktest",
     "fbdev",
     "kbdev",
+    "fbtest",
 ]
 
 [profile.dev]

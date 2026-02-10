@@ -26,6 +26,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbtest"
+version = "0.1.0"
+dependencies = [
+ "libkenix",
+]
+
+[[package]]
 name = "forktest"
 version = "0.1.0"
 dependencies = [

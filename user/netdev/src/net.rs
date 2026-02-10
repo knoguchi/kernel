@@ -109,7 +109,7 @@ impl VirtioNet {
     /// Convert virtual address to physical for DMA
     #[inline]
     fn va_to_pa(&self, va: u64) -> u64 {
-        va + self.phys_base
+        libkenix::va_to_pa(va, self.phys_base)
     }
 
     /// Initialize the network device

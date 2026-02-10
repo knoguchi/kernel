@@ -182,8 +182,6 @@ impl Scheduler {
             // Complete pending Wait4 syscall by writing exit status to wstatus and reaping child.
             // This must happen AFTER TTBR0 is loaded so we can write to the task's user memory.
             if let task::PendingSyscall::Wait4 { wstatus, exit_status, child_id } = next_task.pending_syscall {
-                crate::println!("[ctx_switch] task={} writing wstatus=0x{:x} at 0x{:x} child={}",
-                    next_id.0, ((exit_status & 0xff) << 8) as u32, wstatus, child_id);
                 if wstatus != 0 {
                     // Linux encodes exit code as (exit_code & 0xff) << 8
                     let status = ((exit_status & 0xff) << 8) as i32;
@@ -195,7 +193,6 @@ impl Scheduler {
                     if child.state == TaskState::Terminated {
                         child.state = TaskState::Free;
                         child.parent = None;
-                        crate::println!("[ctx_switch] reaped child {}", child_id);
                     }
                 }
                 next_task.pending_syscall = task::PendingSyscall::None;
@@ -204,14 +201,6 @@ impl Scheduler {
             // Switch to the new task's stack and restore its context
             // This function never returns - it does ERET directly
             let new_sp = next_task.kernel_stack_top;
-            // Debug: print context being restored when switching to a different task
-            if current_id != Some(next_id) {
-                let ctx_ptr = new_sp as *const crate::exception::ExceptionContext;
-                crate::println!("[ctx_switch] task={} restore: sp_ptr=0x{:x} elr=0x{:x} sp=0x{:x}",
-                    next_id.0, new_sp, (*ctx_ptr).elr, (*ctx_ptr).sp);
-                crate::println!("[ctx_switch] task={} restore: x0=0x{:x} x1=0x{:x} x2=0x{:x} x30=0x{:x}",
-                    next_id.0, (*ctx_ptr).gpr[0], (*ctx_ptr).gpr[1], (*ctx_ptr).gpr[2], (*ctx_ptr).gpr[30]);
-            }
             switch_context_and_restore(new_sp);
         }
     }
@@ -1002,72 +991,35 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
         return None;
     }
 
-    // Allocate the first code frame
-    let first_frame = mm::alloc_frame()?;
-    let phys_base_2mb = PhysAddr(first_frame.0 & !(BLOCK_SIZE_2MB - 1));
-    let first_frame_offset = first_frame.0 - phys_base_2mb.0;
+    // Allocate code frames at the START of a 2MB block (like other servers).
+    // This ensures all frames are contiguous and within the same 2MB region.
+    let first_frame = mm::frame::alloc_frames_at_2mb_boundary(num_frames)?;
+    let phys_base_2mb = first_frame; // first_frame IS the 2MB block base
 
-    // Zero and track all frames
-    let mut code_frames: [PhysAddr; MAX_CODE_FRAMES] = [PhysAddr(0); MAX_CODE_FRAMES];
-    code_frames[0] = first_frame;
-
+    // Zero the entire 2MB block (ensures .bss is zeroed)
     unsafe {
-        core::ptr::write_bytes(first_frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
+        core::ptr::write_bytes(phys_base_2mb.0 as *mut u8, 0, BLOCK_SIZE_2MB);
     }
 
-    // Allocate remaining frames, checking they're in the same 2MB block
-    for i in 1..num_frames {
-        let frame = mm::alloc_frame()?;
-        let frame_2mb_base = PhysAddr(frame.0 & !(BLOCK_SIZE_2MB - 1));
-
-        if frame_2mb_base.0 != phys_base_2mb.0 {
-            return None;
-        }
-
-        code_frames[i] = frame;
-        unsafe {
-            core::ptr::write_bytes(frame.0 as *mut u8, 0, mm::frame::PAGE_SIZE);
-        }
-    }
-
-    // Copy all segments to the appropriate frames
-    // The ELF is linked at block_base (typically 0), and we copy it to our frames.
-    // The frames will be mapped at virtual address first_frame_offset.
+    // Copy all segments directly into the 2MB physical block
     for phdr in elf.load_segments() {
         let vaddr = phdr.p_vaddr as usize;
         let filesz = phdr.p_filesz as usize;
-        let memsz = phdr.p_memsz as usize;
 
-        if memsz == 0 || filesz == 0 {
+        if filesz == 0 {
             continue;
         }
 
         let segment_data = elf.segment_data(phdr).ok()?;
-        let offset_in_frames = vaddr - block_base;
+        let offset_in_block = vaddr - block_base;
+        let dest_paddr = phys_base_2mb.0 + offset_in_block;
 
-        let mut bytes_copied = 0usize;
-        while bytes_copied < filesz {
-            let current_offset = offset_in_frames + bytes_copied;
-            let frame_idx = current_offset / mm::frame::PAGE_SIZE;
-            let offset_in_frame = current_offset % mm::frame::PAGE_SIZE;
-
-            if frame_idx >= num_frames {
-                break;
-            }
-
-            let bytes_left_in_frame = mm::frame::PAGE_SIZE - offset_in_frame;
-            let bytes_left_to_copy = filesz - bytes_copied;
-            let copy_size = bytes_left_in_frame.min(bytes_left_to_copy);
-
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    segment_data.as_ptr().add(bytes_copied),
-                    (code_frames[frame_idx].0 + offset_in_frame) as *mut u8,
-                    copy_size,
-                );
-            }
-
-            bytes_copied += copy_size;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                segment_data.as_ptr(),
+                dest_paddr as *mut u8,
+                filesz,
+            );
         }
     }
 
@@ -1084,9 +1036,9 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
         PageFlags::user_code()
     };
 
-    // Map the code block
+    // Map the code block at its proper virtual address (0x400000)
     unsafe {
-        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+        if !addr_space.map_2mb(block_base, phys_base_2mb, flags) {
             return None;
         }
     }
@@ -1117,7 +1069,7 @@ pub fn create_console_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Tas
 
     // Stack grows down from top of 2MB region
     let user_stack_top = USER_STACK_VADDR_BASE + BLOCK_SIZE_2MB - 16;
-    let user_entry_point = first_frame_offset + elf.entry_point() as usize;
+    let user_entry_point = elf.entry_point() as usize;
 
     // Allocate kernel stack
     let stack_pages = KERNEL_STACK_SIZE / mm::frame::PAGE_SIZE;
@@ -1334,9 +1286,9 @@ pub fn create_blkdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
     // Use RWX flags for user code block (2MB granularity requires combined permissions)
     let flags = PageFlags::user_code_data();
 
-    // Map the code block
+    // Map the code block at its proper virtual address
     unsafe {
-        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+        if !addr_space.map_2mb(block_base, phys_base_2mb, flags) {
             return None;
         }
     }
@@ -1503,9 +1455,9 @@ pub fn create_netdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<Task
     // Use RWX flags for user code block (2MB granularity requires combined permissions)
     let flags = PageFlags::user_code_data();
 
-    // Map the code block
+    // Map the code block at its proper virtual address
     unsafe {
-        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+        if !addr_space.map_2mb(block_base, phys_base_2mb, flags) {
             return None;
         }
     }
@@ -2024,9 +1976,9 @@ pub fn create_fbdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskI
     // Use RWX flags for user code block (2MB granularity requires combined permissions)
     let flags = PageFlags::user_code_data();
 
-    // Map the code block
+    // Map the code block at its proper virtual address
     unsafe {
-        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+        if !addr_space.map_2mb(block_base, phys_base_2mb, flags) {
             return None;
         }
     }
@@ -2219,9 +2171,9 @@ pub fn create_kbdev_server_from_elf(name: &str, elf_data: &[u8]) -> Option<TaskI
     // Use RWX flags for user code block (2MB granularity requires combined permissions)
     let flags = PageFlags::user_code_data();
 
-    // Map the code block
+    // Map the code block at its proper virtual address
     unsafe {
-        if !addr_space.map_2mb(0, phys_base_2mb, flags) {
+        if !addr_space.map_2mb(block_base, phys_base_2mb, flags) {
             return None;
         }
     }

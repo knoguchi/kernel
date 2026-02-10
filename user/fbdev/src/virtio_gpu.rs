@@ -210,7 +210,7 @@ impl VirtioGpu {
 
     /// Convert virtual address to physical address
     fn virt_to_phys(&self, vaddr: usize) -> u64 {
-        self.phys_base + vaddr as u64
+        libkenix::va_to_pa(vaddr as u64, self.phys_base)
     }
 
     /// Find and initialize virtio-gpu device
@@ -344,8 +344,8 @@ impl VirtioGpu {
             // Zero response area
             core::ptr::write_bytes(CMD_BUF.as_mut_ptr().add(resp_offset), 0, resp.len());
 
-            let cmd_phys = phys_base + CMD_BUF.as_ptr().add(cmd_offset) as u64;
-            let resp_phys = phys_base + CMD_BUF.as_ptr().add(resp_offset) as u64;
+            let cmd_phys = libkenix::va_to_pa(CMD_BUF.as_ptr().add(cmd_offset) as u64, phys_base);
+            let resp_phys = libkenix::va_to_pa(CMD_BUF.as_ptr().add(resp_offset) as u64, phys_base);
 
             // Allocate 2 descriptors for command chain
             let desc0 = match ctrlq.alloc_desc() {

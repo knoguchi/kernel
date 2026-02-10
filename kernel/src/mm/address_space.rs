@@ -412,8 +412,13 @@ impl AddressSpace {
         let l2_idx = l2_index(vaddr);
         let l3_idx = l3_index(vaddr);
 
-        // Bounds check
+        // Bounds check - L3 tables only supported for L1[0] (user space)
         if l1_idx >= MAX_L1_ENTRIES {
+            return false;
+        }
+
+        // L3 tables are only tracked for L1[0], reject 4KB mappings in other L1 entries
+        if l1_idx != 0 {
             return false;
         }
 
@@ -483,7 +488,8 @@ impl AddressSpace {
         let l2_idx = l2_index(vaddr);
         let l3_idx = l3_index(vaddr);
 
-        if l1_idx >= MAX_L1_ENTRIES {
+        // L3 tables are only tracked for L1[0]
+        if l1_idx >= MAX_L1_ENTRIES || l1_idx != 0 {
             return;
         }
 
@@ -503,7 +509,8 @@ impl AddressSpace {
         let l2_idx = l2_index(vaddr);
         let l3_idx = l3_index(vaddr);
 
-        if l1_idx >= MAX_L1_ENTRIES {
+        // L3 tables are only tracked for L1[0]
+        if l1_idx >= MAX_L1_ENTRIES || l1_idx != 0 {
             return None;
         }
 

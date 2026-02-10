@@ -7,6 +7,21 @@
 use core::panic::PanicInfo;
 
 // ============================================================================
+// Memory Layout Constants
+// ============================================================================
+
+/// Virtual base address for all user-space code
+/// This is the address where ELF code is loaded (not 0x0 to allow null pointer detection)
+pub const USER_VIRT_BASE: u64 = 0x400000;
+
+/// Convert a virtual address to physical address
+/// Used by device drivers for DMA operations
+#[inline]
+pub fn va_to_pa(va: u64, phys_base: u64) -> u64 {
+    (va - USER_VIRT_BASE) + phys_base
+}
+
+// ============================================================================
 // Memory Intrinsics
 // ============================================================================
 
@@ -1341,6 +1356,7 @@ pub mod msg {
     // Console server messages
     pub const MSG_READ: u64 = 0;
     pub const MSG_WRITE: u64 = 1;
+    pub const MSG_READ_NONBLOCK: u64 = 302;  // Non-blocking read - returns immediately
     pub const MSG_EXIT: u64 = 2;
     pub const MSG_SHM_READ: u64 = 9;
     pub const MSG_SHM_WRITE: u64 = 10;
@@ -1358,6 +1374,7 @@ pub mod msg {
     pub const VFS_WRITE: u64 = 103;
     pub const VFS_STAT: u64 = 104;
     pub const VFS_READDIR: u64 = 105;   // Read directory entries
+    pub const VFS_LSEEK: u64 = 106;     // Seek in file
     pub const VFS_READ_SHM: u64 = 110;  // Read via shared memory
     pub const VFS_WRITE_SHM: u64 = 111; // Write via shared memory
 
@@ -1389,6 +1406,7 @@ pub mod msg {
     pub const FB_CURSOR_SET: u64 = 407; // Set cursor: data[0]=col, data[1]=row
     pub const FB_CURSOR_GET: u64 = 408; // Get cursor: returns [col, row]
     pub const FB_REGISTER: u64 = 409;   // Fbdev->Console: register as ready for output forwarding
+    pub const FB_BLIT: u64 = 410;       // Blit from shm: data[0]=shm_id, data[1]=x|(y<<16), data[2]=w|(h<<16), data[3]=stride
 
     // Error codes
     pub const ERR_OK: i64 = 0;

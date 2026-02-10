@@ -1,13 +1,12 @@
 /* Linker script for user-space programs */
-/* Code is linked at offset 0 for simplicity with 2MB block mapping */
+/* Code is linked at 0x400000 to avoid stack overlap */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    /* User code loads at virtual address 0x00000000 */
-    /* The actual runtime address depends on the physical frame offset */
-    . = 0x00000000;
+    /* User code loads at virtual address 0x400000 */
+    . = 0x400000;
 
     .text : {
         *(.text._start)

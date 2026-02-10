@@ -79,9 +79,15 @@ fn exception_class_name(ec: u8) -> &'static str {
 // Alignment Fault Emulation for SIMD Instructions
 // ============================================================================
 
+/// Counter for alignment fault emulations
+static mut ALIGNMENT_FAULT_COUNT: u64 = 0;
+
 /// Try to emulate an unaligned memory access
 /// Returns true if emulation succeeded, false if not emulatable
 fn try_emulate_alignment_fault(ctx: &mut ExceptionContext) -> bool {
+    unsafe {
+        ALIGNMENT_FAULT_COUNT += 1;
+    }
     // Read the faulting instruction
     let instr_addr = ctx.elr as *const u32;
     let instr = unsafe { core::ptr::read_volatile(instr_addr) };
@@ -109,6 +115,12 @@ fn try_emulate_alignment_fault(ctx: &mut ExceptionContext) -> bool {
         return true;
     }
     if try_emulate_ldp_gpr(ctx, instr) {
+        return true;
+    }
+    if try_emulate_str_reg(ctx, instr) {
+        return true;
+    }
+    if try_emulate_ldr_reg(ctx, instr) {
         return true;
     }
 
@@ -793,6 +805,176 @@ fn try_emulate_ldp_gpr(ctx: &mut ExceptionContext, instr: u32) -> bool {
 
     if addressing_mode == 0b01 || addressing_mode == 0b11 {
         set_base_addr(ctx, rn, writeback_addr);
+    }
+
+    ctx.elr += 4;
+    true
+}
+
+/// Emulate STR (register offset) - GPR
+/// Encoding: size[31:30] 111 V[26]=0 00 opc[23:22]=00 1 Rm[20:16] option[15:13] S[12] 10 Rn[9:5] Rt[4:0]
+fn try_emulate_str_reg(ctx: &mut ExceptionContext, instr: u32) -> bool {
+    // Check encoding pattern
+    let bits_29_27 = (instr >> 27) & 0x7;
+    let v_bit = (instr >> 26) & 0x1;
+    let bits_25_24 = (instr >> 24) & 0x3;
+    let opc = (instr >> 22) & 0x3;
+    let bit_21 = (instr >> 21) & 0x1;
+    let bits_11_10 = (instr >> 10) & 0x3;
+
+    // STR (register): 111 V=0 00 opc=00 1 ... 10
+    if bits_29_27 != 0b111 || v_bit != 0 || bits_25_24 != 0b00 || opc != 0b00 || bit_21 != 1 || bits_11_10 != 0b10 {
+        return false;
+    }
+
+    let size = (instr >> 30) & 0x3;
+    let rm = ((instr >> 16) & 0x1F) as usize;
+    let option = (instr >> 13) & 0x7;
+    let s_bit = (instr >> 12) & 0x1;
+    let rn = ((instr >> 5) & 0x1F) as usize;
+    let rt = (instr & 0x1F) as usize;
+
+    // Get base address
+    let base_addr = get_base_addr(ctx, rn);
+
+    // Get offset register value
+    let rm_val = if rm == 31 { 0i64 } else { ctx.gpr[rm] as i64 };
+
+    // Apply extend/shift based on option
+    let offset = match option {
+        0b010 => {
+            // UXTW - zero-extend 32-bit, then shift
+            let extended = (rm_val as u32) as u64 as i64;
+            if s_bit == 1 { extended << size } else { extended }
+        }
+        0b011 => {
+            // LSL - no extend (or UXTX), then shift
+            if s_bit == 1 { rm_val << size } else { rm_val }
+        }
+        0b110 => {
+            // SXTW - sign-extend 32-bit, then shift
+            let extended = (rm_val as i32) as i64;
+            if s_bit == 1 { extended << size } else { extended }
+        }
+        0b111 => {
+            // SXTX - sign-extend 64-bit (no-op), then shift
+            if s_bit == 1 { rm_val << size } else { rm_val }
+        }
+        _ => return false, // Unsupported option
+    };
+
+    let write_addr = (base_addr + offset) as usize;
+    let value = if rt == 31 { 0u64 } else { ctx.gpr[rt] };
+
+    let dest = write_addr as *mut u8;
+    unsafe {
+        match size {
+            0b00 => {
+                // STRB
+                core::ptr::write_volatile(dest, value as u8);
+            }
+            0b01 => {
+                // STRH
+                let bytes = (value as u16).to_le_bytes();
+                for i in 0..2 { core::ptr::write_volatile(dest.add(i), bytes[i]); }
+            }
+            0b10 => {
+                // STR (32-bit)
+                let bytes = (value as u32).to_le_bytes();
+                for i in 0..4 { core::ptr::write_volatile(dest.add(i), bytes[i]); }
+            }
+            0b11 => {
+                // STR (64-bit)
+                let bytes = value.to_le_bytes();
+                for i in 0..8 { core::ptr::write_volatile(dest.add(i), bytes[i]); }
+            }
+            _ => return false,
+        }
+    }
+
+    ctx.elr += 4;
+    true
+}
+
+/// Emulate LDR (register offset) - GPR
+/// Encoding: size[31:30] 111 V[26]=0 00 opc[23:22]=01 1 Rm[20:16] option[15:13] S[12] 10 Rn[9:5] Rt[4:0]
+fn try_emulate_ldr_reg(ctx: &mut ExceptionContext, instr: u32) -> bool {
+    // Check encoding pattern
+    let bits_29_27 = (instr >> 27) & 0x7;
+    let v_bit = (instr >> 26) & 0x1;
+    let bits_25_24 = (instr >> 24) & 0x3;
+    let opc = (instr >> 22) & 0x3;
+    let bit_21 = (instr >> 21) & 0x1;
+    let bits_11_10 = (instr >> 10) & 0x3;
+
+    // LDR (register): 111 V=0 00 opc=01 1 ... 10
+    if bits_29_27 != 0b111 || v_bit != 0 || bits_25_24 != 0b00 || opc != 0b01 || bit_21 != 1 || bits_11_10 != 0b10 {
+        return false;
+    }
+
+    let size = (instr >> 30) & 0x3;
+    let rm = ((instr >> 16) & 0x1F) as usize;
+    let option = (instr >> 13) & 0x7;
+    let s_bit = (instr >> 12) & 0x1;
+    let rn = ((instr >> 5) & 0x1F) as usize;
+    let rt = (instr & 0x1F) as usize;
+
+    // Get base address
+    let base_addr = get_base_addr(ctx, rn);
+
+    // Get offset register value
+    let rm_val = if rm == 31 { 0i64 } else { ctx.gpr[rm] as i64 };
+
+    // Apply extend/shift based on option
+    let offset = match option {
+        0b010 => {
+            // UXTW - zero-extend 32-bit, then shift
+            let extended = (rm_val as u32) as u64 as i64;
+            if s_bit == 1 { extended << size } else { extended }
+        }
+        0b011 => {
+            // LSL - no extend (or UXTX), then shift
+            if s_bit == 1 { rm_val << size } else { rm_val }
+        }
+        0b110 => {
+            // SXTW - sign-extend 32-bit, then shift
+            let extended = (rm_val as i32) as i64;
+            if s_bit == 1 { extended << size } else { extended }
+        }
+        0b111 => {
+            // SXTX - sign-extend 64-bit (no-op), then shift
+            if s_bit == 1 { rm_val << size } else { rm_val }
+        }
+        _ => return false, // Unsupported option
+    };
+
+    let read_addr = (base_addr + offset) as usize;
+
+    let src = read_addr as *const u8;
+    let value: u64 = unsafe {
+        match size {
+            0b00 => core::ptr::read_volatile(src) as u64,
+            0b01 => {
+                let mut bytes = [0u8; 2];
+                for i in 0..2 { bytes[i] = core::ptr::read_volatile(src.add(i)); }
+                u16::from_le_bytes(bytes) as u64
+            }
+            0b10 => {
+                let mut bytes = [0u8; 4];
+                for i in 0..4 { bytes[i] = core::ptr::read_volatile(src.add(i)); }
+                u32::from_le_bytes(bytes) as u64
+            }
+            0b11 => {
+                let mut bytes = [0u8; 8];
+                for i in 0..8 { bytes[i] = core::ptr::read_volatile(src.add(i)); }
+                u64::from_le_bytes(bytes)
+            }
+            _ => return false,
+        }
+    };
+
+    if rt != 31 {
+        ctx.gpr[rt] = value;
     }
 
     ctx.elr += 4;
@@ -1750,6 +1932,36 @@ fn print_context(ctx: &ExceptionContext) {
 
 #[no_mangle]
 extern "C" fn handle_el1_sync(ctx: &mut ExceptionContext, _exc_type: u64) {
+    // Handle kernel data aborts that may be due to accessing user memory
+    // This happens when the kernel is handling a syscall and accesses a user
+    // buffer that hasn't been mapped yet (demand paging)
+    if ctx.is_data_abort() && ctx.is_translation_fault() {
+        let fault_addr = ctx.far as usize;
+
+        // Check if this is a user-space address in the mmap region
+        // (kernel code at EL1 can access user memory via TTBR0)
+        if fault_addr >= mmap::MMAP_BASE && fault_addr < mmap::MMAP_END {
+            // Try to handle as demand paging fault
+            let result = mmap::handle_page_fault(fault_addr);
+            if result == 0 {
+                // Page allocated successfully, resume kernel execution
+                return;
+            }
+            // Fall through to error handling if page fault handler failed
+        }
+
+        // Also handle faults in the heap region (below mmap base but above code)
+        // For MAP_FIXED mappings that may be placed in the heap region
+        const HEAP_MIN: usize = 0x0020_0000;
+        if fault_addr >= HEAP_MIN && fault_addr < mmap::MMAP_BASE {
+            let result = mmap::handle_page_fault(fault_addr);
+            if result == 0 {
+                return;
+            }
+        }
+    }
+
+    // Unhandled kernel exception - fatal error
     exception_println!();
     exception_println!("!!! KERNEL EXCEPTION !!!");
 

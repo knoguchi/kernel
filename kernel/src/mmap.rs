@@ -214,6 +214,21 @@ impl MmapState {
 ///
 /// Returns 0 on success (page allocated), or negative error code on failure.
 pub fn handle_page_fault(fault_addr: usize) -> i64 {
+    let current_id = match sched::current() {
+        Some(id) => id,
+        None => return -1,
+    };
+    handle_page_fault_for_task(fault_addr, current_id)
+}
+
+/// Handle a page fault for a specific task's mmap region
+///
+/// This is used when the kernel needs to access user memory belonging to a different
+/// task than the currently scheduled one (e.g., during IPC completion when copying
+/// data to a blocked caller's buffer).
+///
+/// Returns 0 on success (page allocated), or negative error code on failure.
+pub fn handle_page_fault_for_task(fault_addr: usize, task_id: sched::TaskId) -> i64 {
     // Allow faults in the extended mmap range (heap region + mmap region)
     // This supports MAP_FIXED at addresses below MMAP_BASE
     const HEAP_MIN: usize = 0x0020_0000; // Same as in sys_mmap
@@ -221,20 +236,15 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
         return -1; // Outside valid mmap range
     }
 
-    let current_id = match sched::current() {
-        Some(id) => id,
-        None => return -1,
-    };
-
     unsafe {
-        let task = &mut TASKS[current_id.0];
+        let task = &mut TASKS[task_id.0];
 
         // Find the mmap region containing this address
         let region = match task.mmap_state.find_region_mut(fault_addr) {
             Some(r) => r,
             None => {
                 crate::println!("[fault] t={} no region for {:#x}, have {} regions",
-                    current_id.0, fault_addr, task.mmap_state.regions.len());
+                    task_id.0, fault_addr, task.mmap_state.regions.len());
                 return -1;
             }
         };
@@ -287,6 +297,44 @@ pub fn handle_page_fault(fault_addr: usize) -> i64 {
 
         0 // Success
     }
+}
+
+/// Ensure a range of user memory is mapped for a specific task
+///
+/// This pre-faults all pages in the range, allocating them if needed.
+/// Call this before accessing user memory from kernel code when the memory
+/// belongs to a different task than the currently scheduled one.
+///
+/// # Arguments
+/// * `addr` - Start address of the user buffer
+/// * `len` - Length of the buffer in bytes
+/// * `task_id` - The task that owns this memory
+///
+/// # Returns
+/// 0 on success, negative error code on failure
+pub fn ensure_user_pages_mapped(addr: usize, len: usize, task_id: sched::TaskId) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+
+    let start_page = addr & !(PAGE_SIZE - 1);
+    let end_addr = addr + len;
+    let end_page = (end_addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    let mut page = start_page;
+    while page < end_page {
+        // Check if page needs to be allocated (in mmap region)
+        if page >= MMAP_BASE && page < MMAP_END {
+            let result = handle_page_fault_for_task(page, task_id);
+            // Ignore -1 (page already exists or not in mmap region)
+            if result < -1 {
+                return result; // Real error (e.g., ENOMEM)
+            }
+        }
+        page += PAGE_SIZE;
+    }
+
+    0
 }
 
 /// System call: mmap
@@ -363,7 +411,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset:
             return -12; // ENOMEM
         }
 
-        // Create the region (pages will be allocated on demand)
+        // Create the region (pages will be allocated on demand via page faults)
         let region = MmapRegion::new(vaddr, aligned_len, prot, flags);
         task.mmap_state.add_region(region);
 

@@ -1,5 +1,10 @@
 # Kenix
 
+<p align="center">
+  <img src="docs/doom.png" width="400" alt="DOOM title screen on Kenix">
+  <img src="docs/doom-game.png" width="400" alt="DOOM gameplay on Kenix">
+</p>
+
 A microkernel written in Rust for AArch64, featuring L4-style synchronous IPC,
 user-space device drivers, and a VFS layer with FAT32 support.
 
@@ -19,25 +24,27 @@ The kernel boots on QEMU virt and runs multiple user-space servers:
 alignment fault emulation for SIMD instructions, allowing unmodified musl-based
 binaries to run. Type commands at the `/ #` prompt.
 
-**Recent Fixes (2026-02-08):**
-- **Framebuffer output for shell:** Console writes now go through IPC to the console
-  server, which forwards to the framebuffer. The shell prompt and command output
-  appear on both UART and the graphical framebuffer window.
-- **Fixed sys_writev bypassing console server:** `writev()` was writing directly to
-  UART, bypassing the console server's framebuffer forwarding. Now properly routes
-  through IPC like `write()`.
-- **Fixed fbdev/shell race condition:** Init now waits for fbdev to complete
-  initialization before starting the shell, ensuring all output appears on FB.
-- Added blocking pipe support via deferred IPC replies. Pipe reads now block when
-  empty (instead of returning 0), enabling shell pipelines like `echo hello | cat`.
-- Added `sys_reply_to` syscall for replying to specific tasks (not just last caller),
-  enabling async/deferred reply patterns in user-space servers.
-- Fixed address space memory corruption where forked-then-execve'd processes would
-  corrupt the parent's page tables on exit. The `Drop` impl was treating 4KB pages
-  as 2MB blocks, freeing memory belonging to other tasks.
-- Fixed scheduler bug where the idle task was being added to the ready queue,
-  preventing proper parent wake-up after child exit.
-- Added relative path resolution to `execve` (`./ls` now works from any directory).
+**DOOM runs on Kenix! (2026-02-10)**
+The original DOOM (linuxdoom-1.10) has been ported to run on Kenix. Renders at
+320x200 scaled 2x on the framebuffer with keyboard input via non-blocking console IPC.
+
+**Recent Changes (2026-02-10):**
+- **DOOM port:** Classic DOOM runs with framebuffer graphics and keyboard input
+- **Non-blocking console read:** Added MSG_READ_NONBLOCK for game loops that poll input
+- **Arrow key support:** Terminal escape sequence parsing (ESC [ A/B/C/D)
+- **SYS_LSEEK:** File seeking with VFS integration
+- **Cross-task page faults:** Kernel can now fault in pages for blocked tasks during
+  IPC reply, fixing crashes when copying data to unmapped mmap regions
+- **64-bit defaults fix:** Fixed memory corruption in DOOM's config system caused by
+  writing 8-byte intptr_t values to 4-byte int locations on ARM64
+
+**Previous Fixes (2026-02-08):**
+- Framebuffer output for shell via console server IPC
+- Fixed sys_writev bypassing console server
+- Fixed fbdev/shell race condition with init synchronization
+- Blocking pipes via deferred IPC replies
+- Address space memory corruption fix for fork+execve
+- Relative path resolution in execve
 
 Tested features: IPC, shared memory, blocking pipes, file operations, process spawn/execve,
 fork/wait, mmap/munmap (anonymous and file-backed), clock_gettime, signal delivery,
@@ -81,6 +88,22 @@ make run-kernel-fb
 # Type commands like: echo hello, ls, cat /etc/passwd
 # Press Ctrl+A X to exit QEMU
 ```
+
+### Running DOOM
+
+```bash
+# Copy DOOM and WAD file to disk image (already done if using provided disk.img)
+mcopy -o -i disk.img user/doom/doom.elf ::/doom
+mcopy -o -i disk.img doom1.wad ::/doom1.wad
+
+# Run with framebuffer
+make run-kernel-fb
+
+# In shell:
+/ # /disk/doom -iwad /disk/doom1.wad
+```
+
+Controls: WASD/Arrows=move, F=fire, E/Space=use, Q=strafe, 1-7=weapons, ESC=menu
 
 ### Sample Output
 
@@ -277,6 +300,7 @@ sigaction(SIGINT, &sa, NULL);
 - [x] read() syscall
 - [x] write() syscall
 - [x] close() syscall
+- [x] lseek() syscall
 - [x] pipe() syscall (blocking pipes via pipeserv)
 - [x] dup/dup2/dup3 syscalls
 
